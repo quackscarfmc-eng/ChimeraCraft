@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "Vec3f(0.0f,0.0f,0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec3f"
+		}
+	},
+	"name" : "ND_cos_vector3",
+	"type" : "Map"
+}

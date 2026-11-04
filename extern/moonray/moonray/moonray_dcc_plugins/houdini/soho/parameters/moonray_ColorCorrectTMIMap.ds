@@ -1,0 +1,103 @@
+#include "$HFS/houdini/soho/parameters/CommonMacros.ds"
+{
+    name	parameters
+    parm {
+        name    "xn__inputsinput_control_06a"
+        label   "inputs:input"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "xn__inputsinput_zta"
+        label   "Input"
+        type    color
+        size    3
+        default { "1" "1" "1" }
+        help    "bind the input here"
+        disablewhen "{ xn__inputsinput_control_06a == block } { xn__inputsinput_control_06a == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "color3f" }
+    }
+    parm {
+        name    "xn__inputson_control_41a"
+        label   "inputs:on"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "xn__inputson_3oa"
+        label   "On"
+        type    toggle
+        default { "1" }
+        help    "enables/disables all color correct operations"
+        disablewhen "{ xn__inputson_control_41a == block } { xn__inputson_control_41a == none }"
+        parmtag { "usdvaluetype" "bool" }
+    }
+    parm {
+        name    "xn__inputsmix_control_r3a"
+        label   "inputs:mix"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "xn__inputsmix_qqa"
+        label   "Mix"
+        type    float
+        default { "1" }
+        help    "how much of the overall color correct to mix in"
+        disablewhen "{ xn__inputsmix_control_r3a == block } { xn__inputsmix_control_r3a == none }"
+        range   { 0 1 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__inputsTMI_control_r3a"
+        label   "inputs:TMI"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "xn__inputsTMI_qqa"
+        label   "TMI"
+        type    vector
+        size    3
+        default { "0" "0" "0" }
+        help    "T = Temperature where positive values push towards blue and negative towards red.   M = Magenta where positive values push towards magenta and negative towards green.  I = Intensity where negative values remove and positive values add energy "
+        disablewhen "{ xn__inputsTMI_control_r3a == block } { xn__inputsTMI_control_r3a == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "color3f" }
+    }
+}

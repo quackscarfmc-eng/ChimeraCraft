@@ -1,0 +1,63 @@
+{
+    "attributes" : 
+    {
+        "inAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Int"
+        },
+        "huelowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "huelow",
+            "type" : "Float"
+        },
+        "huehighAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "huehigh",
+            "type" : "Float"
+        },
+        "saturationlowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "saturationlow",
+            "type" : "Float"
+        },
+        "saturationhighAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "saturationhigh",
+            "type" : "Float"
+        },
+        "brightnesslowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "brightnesslow",
+            "type" : "Float"
+        },
+        "brightnesshighAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "brightnesshigh",
+            "type" : "Float"
+        },
+        "seedAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "seed",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_randomcolor_integer",
+    "type" : "Map"
+}

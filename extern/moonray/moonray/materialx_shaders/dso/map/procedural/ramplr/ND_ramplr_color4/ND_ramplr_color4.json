@@ -1,0 +1,42 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuelAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuel",
+            "type" : "Rgba"
+        },
+        "valuerAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuer",
+            "type" : "Rgba"
+        }
+    },
+    "name" : "ND_ramplr_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

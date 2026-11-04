@@ -1,0 +1,33 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuelAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuel",
+            "type" : "Rgb"
+        },
+        "valuerAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuer",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_ramplr_color3",
+    "type" : "Map"
+}

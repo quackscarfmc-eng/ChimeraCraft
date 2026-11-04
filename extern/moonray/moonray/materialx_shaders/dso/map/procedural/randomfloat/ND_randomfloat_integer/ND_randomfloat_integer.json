@@ -1,0 +1,35 @@
+{
+    "attributes" : 
+    {
+        "inAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Int"
+        },
+        "minAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "min",
+            "type" : "Float"
+        },
+        "maxAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "max",
+            "type" : "Float"
+        },
+        "seedAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "seed",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_randomfloat_integer",
+    "type" : "Map"
+}

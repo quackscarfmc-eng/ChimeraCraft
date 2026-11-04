@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+	    "indexAttr" : 
+	    {
+		    "default" : "0",
+		    "flags" : "FLAGS_BINDABLE",
+		    "name" : "index",
+		    "type" : "Int"
+	    },
+	    "spaceAttr" : 
+	    {
+		    "default" : 0,
+		    "enum" : 
+		    {
+			    "model" : 0,
+			    "object" : 1,
+			    "world" : 2
+		    },
+		    "flags" : "FLAGS_ENUMERABLE",
+		    "name" : "space",
+		    "type" : "Int"
+	    }
+    },
+    "name" : "ND_tangent_vector3",
+    "type" : "Map"
+}

@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Vec4f(0.0,0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Vec4f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "0.0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_multiply_vector4FA",
+	"type" : "Map"
+}

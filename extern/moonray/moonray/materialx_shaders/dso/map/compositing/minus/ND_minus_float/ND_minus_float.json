@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "bgAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bg",
+            "type" : "Float"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fgAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "fg",
+            "type" : "Float"
+        },
+        "mixAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mix",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_minus_float",
+    "type" : "Map"
+}

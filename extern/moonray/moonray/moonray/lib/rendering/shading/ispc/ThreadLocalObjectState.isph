@@ -1,0 +1,304 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file ThreadLocalObjectState.isph
+///
+/// Provide an ISPC interface to per thread data - e.g. timing stats
+#pragma once
+
+#include <moonray/rendering/shading/ispc/ShadingTLState.isph>
+#include <moonray/rendering/shading/ispc/State.isph>
+#include <scene_rdl2/scene/rdl2/rdl2.isph>
+
+struct Displacement;
+struct Map;
+struct NormalMap;
+struct Material;
+struct SceneObject;
+
+// keep in sync with scene_rdl2::util::InclusiveExclusiveAverage<int64>
+struct InclusiveExclusiveAverageInt64
+{
+    uniform uint32_t mCount;
+    uniform int64 mSum; // exclusive sum, not including child counts
+    uniform int64 mInclusiveSum; // includes child counts
+};
+
+// keep in sync with moonray::shading::ThreadLocalObjectState
+struct ThreadLocalObjectState
+{
+    InclusiveExclusiveAverageInt64 mShaderCallStat;
+    // sizeof(InclusiveExclusiveAverageInt64) == 24
+    // cache align is set to 64 on the c++ side - so manually pad to 64.
+    // As far as I can tell, ISPC has no alignment directive.
+    uniform int8 mPad[64 - 24];
+};
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform int64 * uniform shader,
+                          const uniform uint32_t threadIndex)
+{
+    // address of Shader::mThreadLocalObjectState
+    const uniform int64 * uniform ptr =
+        shader + SHADER_THREAD_LOCAL_OBJECT_STATE / 8;
+
+    // value of Shader::mThreadLocalObjectState
+    // might be null or non-null
+    uniform ThreadLocalObjectState * uniform tls =
+        (uniform ThreadLocalObjectState * uniform) *ptr;
+    if (tls) {
+        // non-null, offset to threadIndex
+        tls = tls + threadIndex;
+    }
+
+    return tls;
+}
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform SceneObject * uniform obj,
+                          const uniform uint32_t threadIndex)
+{
+    return getThreadLocalObjectState((const uniform int64 * uniform) obj,
+                                     threadIndex);
+
+}
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform Map * uniform map,
+                          const uniform int threadIndex)
+{
+    return getThreadLocalObjectState((const uniform int64 * uniform) map,
+                                     threadIndex);
+
+}
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform NormalMap * uniform map,
+                          const uniform int threadIndex)
+{
+    return getThreadLocalObjectState((const uniform int64 * uniform) map,
+                                     threadIndex);
+
+}
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform Material * uniform material,
+                          const uniform int threadIndex)
+{
+    return getThreadLocalObjectState((const uniform int64 * uniform) material,
+                                     threadIndex);
+
+}
+
+inline uniform ThreadLocalObjectState * uniform
+getThreadLocalObjectState(const uniform Displacement * uniform displacement,
+                          const uniform int threadIndex)
+{
+    return getThreadLocalObjectState((const uniform int64 * uniform) displacement,
+                                     threadIndex);
+}
+
+//===-------------------------------------------------------------------
+// Add to the shader count and the tick sums
+//===-------------------------------------------------------------------
+inline void
+addToSum(uniform InclusiveExclusiveAverageInt64 &stat, uniform int64 ticks, uniform int numItems)
+{
+    stat.mCount += numItems;
+    stat.mSum += ticks;
+    stat.mInclusiveSum += ticks;
+}
+
+inline void
+addTimeInShader(const uniform int64 * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    uniform ThreadLocalObjectState * uniform tlos =
+        getThreadLocalObjectState(object, tls->mThreadIdx);
+    if (tlos) {
+        addToSum(tlos->mShaderCallStat, end - start, numItems);
+    }
+}
+
+inline void
+addTimeInShader(const uniform Displacement * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    addTimeInShader((const uniform int64 * uniform) object, tls, start, end, numItems);
+}
+
+inline void
+addTimeInShader(const uniform Map * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    addTimeInShader((const uniform int64 * uniform) object, tls, start, end, numItems);
+}
+
+inline void
+addTimeInShader(const uniform NormalMap * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    addTimeInShader((const uniform int64 * uniform) object, tls, start, end, numItems);
+}
+
+inline void
+addTimeInShader(const uniform SceneObject * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    addTimeInShader((const uniform int64 * uniform) object, tls, start, end, numItems);
+}
+
+inline void
+addTimeInShader(const uniform Material * uniform object,
+                const uniform ShadingTLState * uniform tls,
+                const uniform int64 start, const uniform int64 end,
+                const uniform int numItems)
+{
+    addTimeInShader((const uniform int64 * uniform) object, tls, start, end, numItems);
+}
+
+//===-------------------------------------------------------------------
+// subtract the time spent in a child shader from the exclusive
+// tick sum of the parent
+//===-------------------------------------------------------------------
+inline void
+subFromSum(uniform InclusiveExclusiveAverageInt64 &stat, uniform int64 ticks)
+{
+    stat.mSum -= ticks;
+}
+
+inline void
+subtractTimeInChild(const uniform int64 * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    uniform ThreadLocalObjectState * uniform tlos =
+        getThreadLocalObjectState(parent, tls->mThreadIdx);
+    if (tlos) {
+        subFromSum(tlos->mShaderCallStat, endTime - startTime);
+    }
+}
+
+inline void
+subtractTimeInChild(const uniform Displacement * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    subtractTimeInChild((const uniform int64 * uniform) parent, tls, startTime, endTime);
+}
+
+inline void
+subtractTimeInChild(const uniform Map * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    subtractTimeInChild((const uniform int64 * uniform) parent, tls, startTime, endTime);
+}
+
+inline void
+subtractTimeInChild(const uniform NormalMap * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    subtractTimeInChild((const uniform int64 * uniform) parent, tls, startTime, endTime);
+}
+
+inline void
+subtractTimeInChild(const uniform SceneObject * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    subtractTimeInChild((const uniform int64 * uniform) parent, tls, startTime, endTime);
+}
+
+inline void
+subtractTimeInChild(const uniform Material * uniform parent,
+                    const uniform ShadingTLState * uniform tls,
+                    const uniform int64 startTime, const uniform int64 endTime)
+{
+    subtractTimeInChild((const uniform int64 * uniform) parent, tls, startTime, endTime);
+}
+
+//===-------------------------------------------------------------------
+// LogEvent Functionality
+//===-------------------------------------------------------------------
+
+extern "C" void CPP_logEvent(const uniform int64* uniform shader, uniform int event);
+
+inline void
+logEvent(const uniform int64 * uniform shader, uniform int eventIndex)
+{
+    CPP_logEvent(shader, eventIndex);
+}
+
+inline void
+logEvent(const uniform int64 * uniform shader, varying int eventIndex)
+{
+    foreach_active(lane) {
+        const uniform int eidx = extract(eventIndex, lane);
+        CPP_logEvent(shader, eidx);
+    }
+}
+
+// overloads
+inline void
+logEvent(const uniform Map * uniform shader, uniform int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) shader, eventIndex);
+}
+
+inline void
+logEvent(const uniform NormalMap * uniform shader, uniform int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) shader, eventIndex);
+}
+
+inline void
+logEvent(const uniform Material * uniform material, uniform int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) material, eventIndex);
+}
+
+inline void
+logEvent(const uniform SceneObject * uniform sceneObject, uniform int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) sceneObject, eventIndex);
+}
+
+inline void
+logEvent(const uniform SceneObject * uniform sceneObject, varying int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) sceneObject, eventIndex);
+}
+
+inline void
+logEvent(const uniform Displacement * uniform displacement, uniform int eventIndex)
+{
+    logEvent((const uniform int64 * uniform) displacement, eventIndex);
+}
+
+//===-------------------------------------------------------------------
+// get the inclusive time spent in a shader so far
+//===-------------------------------------------------------------------
+inline uniform int64
+getInclusiveTime(const uniform int64 * uniform object,
+                 const uniform ShadingTLState * uniform tls)
+{
+    uniform ThreadLocalObjectState * uniform tlos =
+        getThreadLocalObjectState(object, tls->mThreadIdx);
+    if (tlos) {
+        return tlos->mShaderCallStat.mInclusiveSum;
+    }
+    return 0;
+}
+

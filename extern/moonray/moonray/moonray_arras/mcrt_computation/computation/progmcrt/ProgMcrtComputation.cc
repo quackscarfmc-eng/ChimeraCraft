@@ -1,0 +1,704 @@
+// Copyright 2023-2025 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+#include "ProgMcrtComputation.h"
+
+#include <arras4_log/LogEventStream.h>
+#include <mcrt_computation/common/mcrt_logging/TimeStampDebugMsg.h>
+#include <mcrt_computation/engine/mcrt/RenderContextDriver.h>
+#include <mcrt_dataio/engine/mcrt/McrtControl.h>
+#include <mcrt_messages/CreditUpdate.h>
+#include <mcrt_messages/ProgressiveFeedback.h>
+#include <mcrt_messages/RDLMessage_LeftEye.h>
+#include <mcrt_messages/RDLMessage_RightEye.h>
+#include <mcrt_messages/ViewportMessage.h>
+#include <moonray/rendering/rndr/PathVisualizerManager.h>
+#include <moonray/rendering/rndr/RenderContext.h>
+#include <scene_rdl2/render/util/StrUtil.h>
+
+#include <algorithm>    // std::transform
+#include <cctype>       // std::tolower
+#include <filesystem>
+#include <thread>       // std::thread::hardware_concurrency()
+
+#include <sys/resource.h>
+
+// This directive is used only for development purpose.
+// This directive shows some debug messages to the stderr in order to make
+// shortest latency of message display to the ssh windows.
+// However this directive *** SHOULD BE COMMENTED OUT *** for release version.
+//#define DEVELOP_VER_MESSAGE
+
+//#define USE_RAAS_DEBUG_FILENAME
+
+#ifndef MOONRAY_EXEC_MODE_DEFAULT
+#define MOONRAY_EXEC_MODE_DEFAULT AUTO
+#endif
+
+// stringification helper macros
+#define QUOTE(str) #str
+#define EXPAND_AND_QUOTE(str) QUOTE(str)
+
+namespace mcrt_computation {
+
+COMPUTATION_CREATOR(ProgMcrtComputation);
+
+namespace {
+
+    // Configuration constants
+    const std::string sAllowCoreDump = "allowCoreDump";
+    const std::string sAutoAffinity = "auto_affinity";
+    const std::string sCpuAffinity = "cpu_affinity";
+    const std::string sConfigScene = "scene";
+    const std::string sConfigDsopath = "dsopath";
+    const std::string sConfigEnableDepthBuffer = "enableDepthBuffer";
+    const std::string sExecMode = "exec_mode";
+    const std::string sConfigFps = "fps";
+    const std::string sConfigFrameGating = "frameGating";
+    const std::string sConfigFastGeometry = "fastGeometry";
+    const std::string sInitialCredit = "initialCredit";
+    const std::string sConfigMachineId = "machineId";
+    const std::string sMemAffinity = "mem_affinity";
+    const std::string sConfigNumMachines = "numMachines";
+    const std::string sConfigPackTilePrecision = "packTilePrecision";
+    const std::string sRenderMode = "renderMode";
+    const std::string sSocketAffinity = "socket_affinity";
+
+    const std::string AOV_BEAUTY = "beauty";
+    const std::string AOV_DEPTH = "depth";
+
+    // KEY used to indicate that a RenderSetupMessage originated from an upstream computation, and not a client
+    // Used to get around the lack of message intents: http://jira.anim.dreamworks.com/browse/NOVADEV-985
+    const std::string RENDER_SETUP_KEY = "776CD313-6D4B-40A4-82D2-C61F2FD055A9";
+
+} // namespace
+
+ProgMcrtComputation::ProgMcrtComputation(arras4::api::ComputationEnvironment* env)
+    : Computation(env)
+    , mOptions()
+{
+#   ifdef USE_RAAS_DEBUG_FILENAME
+    // If this file exists, backend computation is waiting to connect the gdb session by an infinite waiting loop.
+    // After being removed or renamed to a different name, the backend computation ends the waiting loop and starts
+    // execution as usual.
+    const char* delayFilename = "/usr/pic1/<waitLoopControlFile>"; // Need to be changed to proper filename. 
+    std::cerr << ">>> ProgMcrtComputation.cc ProgMcrtComputation::ProgMcrtComputation() delayFilename:" << delayFilename << '\n';
+    if (delayFilename) {
+        std::cerr << ">> ProgMcrtComputation.cc debug wait loop START"
+                  << " delayFilename:" << delayFilename << std::endl;
+        while (std::filesystem::exists(delayFilename)) {
+            unsigned int const DELTA_TIME = 3;
+            sleep(DELTA_TIME);
+            std::cerr << ">> ProgMcrtComputation.cc sleep pid:" << (size_t)getpid() << std::endl;
+        }
+        std::cerr << ">> ProgMcrtComputation.cc debug wait loop END" << std::endl;
+    }
+#   endif // end USE_RAAS_DEBUG_FILENAME
+}
+
+arras4::api::Object
+ProgMcrtComputation::property(const std::string& name)
+{
+    if (name == arras4::api::PropNames::wantsHyperthreading) {
+        return true;
+    }
+    return arras4::api::Object();
+}
+
+arras4::api::Result
+ProgMcrtComputation::configure(const std::string& op,
+                               arras4::api::ObjectConstRef aConfig)
+{   
+#   ifdef DEVELOP_VER_MESSAGE
+    // Sometime we need hostname of computation to trackdown the issue.
+    std::cerr << ">> ProgMcrtComputation.cc hostname:" << mcrt_dataio::MiscUtil::getHostName() << '\n';
+    std::cerr << ">> ProgMcrtComputation.cc configure() -a-\n";
+#   endif // end DEVELOP_VER_MESSAGE
+
+    if (op == "start") {
+        onStart();
+        return arras4::api::Result::Success;
+    } else if (op == "stop") {
+        onStop();
+        return arras4::api::Result::Success;
+    } else if (op != "initialize") {
+        return arras4::api::Result::Unknown; 
+    }      
+
+    // Turn off the use of the depth buffer by default.
+    mOptions.setGeneratePixelInfo(false);
+
+    // Optionally, enable the depth buffer
+    if (aConfig[sConfigEnableDepthBuffer].isBool()) {
+        mOptions.setGeneratePixelInfo(aConfig[sConfigEnableDepthBuffer].asBool());
+    }
+
+    // Override defaults with settings from the config.
+    if (aConfig[sConfigScene].isString()) {
+        mOptions.setSceneFiles({aConfig[sConfigScene].asString()});
+    }
+    if (aConfig[sConfigDsopath].isString()) {
+        mOptions.setDsoPath(aConfig[sConfigDsopath].asString());
+    }
+    if (aConfig[sConfigFps].isNumeric()) {
+        mFps = aConfig[sConfigFps].asFloat();
+    }
+    if (aConfig[sConfigNumMachines].isIntegral()) {
+        mNumMachinesOverride = aConfig[sConfigNumMachines].asInt();
+    }
+    if (aConfig[sConfigMachineId].isIntegral()) {
+        mMachineIdOverride = aConfig[sConfigMachineId].asInt();
+    }  
+
+    // set the number of threads
+    if (aConfig[arras4::api::ConfigNames::maxThreads].isIntegral()) {
+        mOptions.setThreads(aConfig[arras4::api::ConfigNames::maxThreads].asInt());
+    }
+    else {
+        mOptions.setThreads(1);
+    }
+
+    if (aConfig[sConfigFrameGating].isBool()) {
+        mDispatchGatesFrame = aConfig[sConfigFrameGating].asBool();
+    }
+
+    if (aConfig[sConfigPackTilePrecision].isString()) {
+        if (aConfig[sConfigPackTilePrecision].asString() == "auto32") {
+            // auto switching UC8 and H16 for coarse pass, F32 for non-coarse pass
+            mPackTilePrecisionMode = PackTilePrecisionMode::AUTO32;
+            ARRAS_LOG_INFO("PackTile precision auto32 mode");
+        } else if (aConfig[sConfigPackTilePrecision].asString() == "auto16") {
+            // auto switching UC8 and H16 for coarse pass, H16 for non-coarse pass
+            mPackTilePrecisionMode = PackTilePrecisionMode::AUTO16;
+            ARRAS_LOG_INFO("PackTile precision auto16 mode");
+        } else if (aConfig[sConfigPackTilePrecision].asString() == "full32") {
+            // always use F32
+            mPackTilePrecisionMode = PackTilePrecisionMode::FULL32;
+            ARRAS_LOG_INFO("PackTile precision full32 mode");
+        } else if (aConfig[sConfigPackTilePrecision].asString() == "full16") {
+            // always use F16
+            mPackTilePrecisionMode = PackTilePrecisionMode::FULL16;
+            ARRAS_LOG_INFO("PackTile precision full16 mode");
+        }
+    }
+
+    if (aConfig[sConfigFastGeometry].isBool() &&
+        aConfig[sConfigFastGeometry].asBool()) {
+        mOptions.setFastGeometry();
+    }
+
+    // Affinity control
+    if (aConfig[sAutoAffinity].isString()) {
+        mOptions.setAutoAffinityDef(aConfig[sAutoAffinity].asString());
+    }
+    if (aConfig[sCpuAffinity].isString()) {
+        mOptions.setCpuAffinityDef(aConfig[sCpuAffinity].asString());
+    }
+    if (aConfig[sMemAffinity].isString()) {
+        mOptions.setMemAffinityDef(aConfig[sMemAffinity].asString());
+    }
+    if (aConfig[sSocketAffinity].isString()) {
+        mOptions.setSocketAffinityDef(aConfig[sSocketAffinity].asString());
+    }
+    /* useful debug dump
+    std::cerr << ">> ProgMcrtComputation.cc Affinity control {\n"
+              << "  mOptions.getAutoAffinityDef():" << mOptions.getAutoAffinityDef() << '\n'
+              << "  mOptions.getCpuAffinityDef():" << mOptions.getCpuAffinityDef() << '\n'
+              << "  mOptions.getSocketAffinityDef():" << mOptions.getSocketAffinityDef() << '\n'
+              << "  mOptions.getMemAffinityDef():" << mOptions.getMemAffinityDef() << '\n'
+              << "}\n";
+    */
+
+    struct rlimit rlim;
+    getrlimit(RLIMIT_CORE, &rlim);
+    if (aConfig[sAllowCoreDump].isBool() && aConfig[sAllowCoreDump].asBool()) {
+        // Turn on core dumps
+        rlim.rlim_cur = RLIM_INFINITY;
+    } else {
+        // Turn off core dumps (default)
+        rlim.rlim_cur = 0;
+    }
+    setrlimit(RLIMIT_CORE, &rlim);
+
+    if (mNumMachinesOverride <= 1) {
+        mOptions.setRenderMode(moonray::rndr::RenderMode::PROGRESSIVE);
+    } else {
+        // We use time-based checkpoint mode for multi-machine configuration.
+        // We have trouble stopping mcrt computation at render complete timing
+        // if we use PROGRESSIVE mode for many machine situations.
+        mOptions.setRenderMode(moonray::rndr::RenderMode::PROGRESS_CHECKPOINT);
+    }
+    if (aConfig[sRenderMode].isString()) {
+        if (aConfig[sRenderMode].asString() == "realtime") {
+            // We still keep multi-machine realtime mode but this does not work well
+            // due to the fact the current merge node is not tested well for realtime
+            // rendering. It might have performance issues.
+            mOptions.setRenderMode(moonray::rndr::RenderMode::REALTIME);
+        } else {
+            if (mNumMachinesOverride <= 1) {
+                ARRAS_LOG_INFO("Unrecognized render mode, setting to default Progressive Mode");
+            } else {
+                ARRAS_LOG_INFO("Unrecognized render mode, setting to default Checkpoint(timebased) Mode");
+            }
+        }
+    }
+
+    // Stringify this definition value
+    std::string execMode = EXPAND_AND_QUOTE(MOONRAY_EXEC_MODE_DEFAULT);
+    // Make it lowercase
+    std::transform(execMode.begin(), execMode.end(), execMode.begin(),
+        [] (unsigned char c) { return std::tolower(c); });
+
+    if (aConfig[sExecMode].isString()) {
+        // See moonray/lib/rendering/rndr/RenderOptions.cc
+        // 4 possible options : "auto", "vectorized", "scalar", "xpu"
+        execMode = aConfig[sExecMode].asString();
+    }
+    mOptions.setDesiredExecutionMode(execMode);
+
+    if (aConfig[sInitialCredit].isIntegral()) {
+        mInitialCredit = aConfig[sInitialCredit].asInt();
+    }
+
+    arras4::api::Object name = environment("computation.name");
+    if (name.isString()) {
+        mName = name.asString();
+    }
+    arras4::api::Object addr = environment("computation.address");
+    if (!addr.isNull()) {
+        mAddress.fromObject(addr);
+    }
+
+    std::string version("(unknown)");
+    const char* cversion = std::getenv("REZ_MCRT_COMPUTATION_VERSION");
+    if (cversion) version = cversion;
+    ARRAS_ATHENA_TRACE(0,
+                       arras4::log::Session(mAddress.session.toString())
+                       << "{trace:mcrt} version mcrt_computation-" << version
+                       << " host " << mcrt_dataio::MiscUtil::getHostName());
+
+    mSysUsage.getCpuUsage();  // do initial call for CPU usage monitor
+
+    return arras4::api::Result::Success;
+}
+
+ProgMcrtComputation::~ProgMcrtComputation()
+{
+}
+
+void
+ProgMcrtComputation::onStart()
+{
+    MNRY_ASSERT(mMachineIdOverride >= 0);
+
+    parserConfigureGenericMessage();
+
+    // Run global init (creates a RenderDriver) This *must* be called on the same thread we
+    // intend to call RenderContext::startFrame from.
+    moonray::rndr::initGlobalDriver(mOptions);
+
+    mRenderContextDriverManager.reset(new RenderContextDriverManager(mNumMachinesOverride,
+                                                                     mMachineIdOverride,
+                                                                     mSysUsage,
+                                                                     mSendBandwidthTracker,
+                                                                     &mLogging,
+                                                                     &mLogDebug_creditUpdateMessage,
+                                                                     mPackTilePrecisionMode,
+                                                                     &mRecvFeedbackFpsTracker,
+                                                                     &mRecvFeedbackBandwidthTracker));
+    mRenderContextDriverManager->
+        addDriver(&mOptions,
+                  &mRenderPrepCancel,
+                  &mFps,
+                  [&]() {}, // PostMainCallBack function
+                  [&](const bool reloadScn, const std::string& source) { // startFrameCallBack
+                      sendProgressMessage("renderPrep", reloadScn ? "start" : "restart", source);
+                      if (mRecLoad) mRecLoad->startLog(); // CPU load logger start
+                  },
+                  [&](const std::string& source) { // stopFrameCallBack
+                      sendProgressMessage("shading", "stop", source);
+                      if (mRecLoad) mRecLoad->stopLog(); // CPU load logger stop
+                  },
+                  [&](mcrt::ProgressiveFrame::Ptr msg, const std::string& source) { // sendInfoOnlyCallBack
+                      // send progressiveFrame message which only store statistical info
+                      send(msg, arras4::api::withSource(source));
+                      if (mCredit > 0) mCredit--;
+                  }
+                  ); // construct primary renderContextDriver
+
+    // reset current credit to initial credit. If this is >= 0, credit rate control will be enabled
+    // otherwise it is inactive
+    mCredit = mInitialCredit;
+
+    sendProgressMessage("ready", "start", "");
+}
+
+void
+ProgMcrtComputation::onStop()
+{
+    // Shutdown the renderer
+    mRenderContextDriverManager = nullptr;
+
+    moonray::rndr::cleanUpGlobalDriver();
+
+    if (mRecLoad) {
+        delete mRecLoad;
+        mRecLoad = 0x0;
+    }
+}
+
+void
+ProgMcrtComputation::onIdle()
+{
+    // RenderContextDriverManager can support multiple renderContextDriver. However at this moment,
+    // we only use primary renderContextDriver (i.e. driverId = 0).
+    RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+
+    if (driver->isPathVisualizerMode()) {
+        //
+        // Special operation for PathVisualizer
+        //
+        moonray::rndr::PathVisualizerManager* visMgrObsrPtr = driver->getRenderContext()->getPathVisualizerManager().get();
+        if (visMgrObsrPtr->isInRecordState()) {
+            return; // We are still middle of the PathVisualizer simulation stage.
+        } 
+        if (visMgrObsrPtr->isInStopRecordState()) { // We've finished PathVisualizer simulation stage.
+            driver->stopFramePublic(); // update render condition to STOP
+            driver->revertRenderMode(); // revert renderMode to previous mode
+            visMgrObsrPtr->requestDraw(); // set internal condition to REQUEST_DRAW
+            driver->startFramePublic(); // start regular rendering 
+        }
+        if (driver->needToRunGenLine()) { // We generate lines by arras-main-thread
+            visMgrObsrPtr->generateLines(); // internal condition updated GENERATE_LINES -> DRAW
+            driver->resetGenLine(); // reset generateLine condition
+        }
+    }
+
+    if (!driver->isEnoughSendInterval(mFps, mDispatchGatesFrame)) {
+        return; // Interval-wise, we are not ready to send data
+    }
+
+    if (mCredit != 0) {
+        driver->sendDelta([&](mcrt::ProgressiveFrame::Ptr msg, const std::string& source) {
+            // send progressiveFrame message with delta image and statistical info
+            // and also send progress message
+            sendProgressMessageStageShading(msg->mHeader.mStatus,
+                                            msg->mHeader.mProgress,
+                                            source);
+
+            send(msg, arras4::api::withSource(source));
+            if (mCredit > 0) mCredit--;
+
+            if (msg->mHeader.mStatus == mcrt::BaseFrame::Status::FINISHED) {
+                if (mRecLoad) mRecLoad->stopLog(); // CPU load logger stop
+            }
+
+            if (mOnMessageCache) {
+                processDeferredMessage(); // mOnMessageCache condition is updated inside
+            }
+        });
+    }
+
+    driver->applyUpdatesAndRestartRender([&]() -> TimingRecorder::TimingRecorderSingleFrameShPtr {
+        return mTimingRecorder.newFrame();
+    });
+}
+
+void
+ProgMcrtComputation::sendProgressMessage(const std::string& stage,
+                                         const std::string& event,
+                                         const std::string& source)
+{
+    mcrt::ProgressMessage::Ptr msg(new mcrt::ProgressMessage);
+    msg->object()["computationType"] = "progmcrt";
+    msg->object()["stage"] = stage;
+    msg->object()["event"] = event;
+    if (!source.empty()) {
+        msg->object()["source"] = source;
+    }
+
+    send(msg);
+
+    std::ostringstream ostr;
+    ostr << "{trace:mcrt}"
+         << " stage " << stage
+         << " " << event
+         << " " << mAddress.computation.toString();
+    if (!source.empty()) {
+        ostr << " " << source;
+    }
+
+    ARRAS_ATHENA_TRACE(0,
+                       arras4::log::Session(mAddress.session.toString())
+                       << ostr.str());
+}
+
+void
+ProgMcrtComputation::sendProgressMessageStageShading(const mcrt::BaseFrame::Status& status,
+                                                     const float progress,
+                                                     const std::string& source)
+{
+    const std::string stage = "shading";
+    std::string event = "";
+    switch (status) {
+    case mcrt::BaseFrame::Status::STARTED   : event = "start";    break;
+    case mcrt::BaseFrame::Status::RENDERING : event = "pending";  break;
+    case mcrt::BaseFrame::Status::FINISHED  : event = "complete"; break;
+    default : break;
+    }
+    const int traceLevel = (event == "pending") ? 1 : 0;
+    
+    mcrt::ProgressMessage::Ptr msg(new mcrt::ProgressMessage);
+    msg->object()["computationType"] = "progmcrt";
+    msg->object()["stage"] = stage;
+    msg->object()["event"] = event;
+    msg->object()["progress"] = progress;
+    msg->object()["source"] = source;
+
+    send(msg);
+
+    ARRAS_ATHENA_TRACE(traceLevel,
+                       arras4::log::Session(mAddress.session.toString())
+                       << "{trace:mcrt} stage " << stage << " " << event << " "
+                       << progress << " " << mAddress.computation.toString() << " "
+                       << source);
+}
+
+//------------------------------------------------------------------------------
+
+arras4::api::Result
+ProgMcrtComputation::onMessage(const arras4::api::Message& aMsg)
+{
+    if (mOnMessageCache) {
+        mDeferredMsgQueue.push(std::make_shared<arras4::api::Message>(aMsg));
+        ARRAS_LOG_DEBUG(">> ProgMcrtComputation.cc onMessage ===>> deferredMsgCache ON <<===");
+        return arras4::api::Result::Success;
+    }
+
+    return onMessageMain(aMsg);
+}
+
+arras4::api::Result
+ProgMcrtComputation::onMessageMain(const arras4::api::Message& aMsg)
+{
+    if (aMsg.classId() != mcrt::CreditUpdate::ID || mLogDebug_creditUpdateMessage) {
+        ARRAS_LOG_DEBUG("MCRT received message: %s", aMsg.describe().c_str());
+    }
+
+    if (aMsg.classId() == mcrt::GenericMessage::ID) {
+        // This is McrtControl + debugging message and
+        // we have to execute regardless of mDebugSuspendExecution condition
+        mcrt::GenericMessage::ConstPtr gm = aMsg.contentAs<mcrt::GenericMessage>();
+        if (gm) handleGenericMessage(gm);
+        return arras4::api::Result::Success;
+    }
+
+    // RenderContextDriverManager can support multiple renderContextDriver in order to quickly
+    // test multi-renderContext driver configuration for the future plan. However at this moment,
+    // we only use primary renderContextDriver (i.e. driverId = 0).
+    RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+    if (aMsg.classId() == mcrt::GeometryData::ID) {
+        McrtTimeStamp("onMessage/GeometryData {", "start onMessage/GeometryData");
+        driver->enqGeometryMessage(aMsg);
+        McrtTimeStamp("onMessage/GeometryData }", "finish onMessage/GeometryData");
+    } else if (aMsg.classId() == mcrt::RDLMessage::ID) {
+        McrtTimeStamp("onMessage/RDLMessage {", "start onMessage/RDLMessage");
+        driver->enqRdlMessage(aMsg, mTimingRecorder.getSec());
+        McrtTimeStamp("onMessage/RDLMessage }", "finish onMessage/RDLMessage");
+    } else if (aMsg.classId() == mcrt::RDLMessage_LeftEye::ID) {
+        driver->enqRdlMessage(aMsg, mTimingRecorder.getSec());
+    } else if (aMsg.classId() == mcrt::RDLMessage_RightEye::ID) {
+        driver->enqRdlMessage(aMsg, mTimingRecorder.getSec());
+    } else if (aMsg.classId() == mcrt::ViewportMessage::ID) { 
+        McrtTimeStamp("onMessage/ViewportMessage {", "start onMessage/ViewportMessage");
+        driver->enqViewportMessage(aMsg, mTimingRecorder.getSec());
+        McrtTimeStamp("onMessage/ViewportMessage }", "finish onMessage/ViewportMessage");
+
+    } else if (aMsg.classId() == mcrt::JSONMessage::ID) {
+        McrtTimeStamp("onMessage/JSONMessage {", "start onMessage/JSONMessage");
+        onJSONMessage(aMsg);
+        McrtTimeStamp("onMessage/JSONMessage }", "finish onMessage/JSONMessage");
+    } else if (aMsg.classId() == mcrt::ProgressiveFeedback::ID) {
+        driver->evalProgressiveFeedbackMessage(aMsg);
+
+    //------------------------------
+
+    } else if (aMsg.classId() == mcrt::CreditUpdate::ID) {
+        onCreditUpdate(aMsg);
+    } else {
+        std::cerr << ">> ProgMcrtComputation.cc onMessage ===>>> Unknown <<<===\n";
+        return arras4::api::Result::Unknown;
+    }
+
+    return arras4::api::Result::Success;
+}
+
+void
+ProgMcrtComputation::processDeferredMessage()
+{
+    // std::cerr << ">> ProgMcrtComputation.cc - - - - - - deferredMessage processed - - - - - -\n"; // for debug
+
+    mOnMessageCache = false; // We fall back to onMessage cache off mode
+
+    while (!mDeferredMsgQueue.empty()) {
+        std::shared_ptr<arras4::api::Message> msgPtr = mDeferredMsgQueue.front();
+        if (onMessageMain(*msgPtr) == arras4::api::Result::Success) {
+            // RenderContextDriverManager can support multiple renderContextDriver. However at this moment,
+            // we only use primary renderContextDriver (i.e. driverId = 0).
+            RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+
+            // We already know some updates are backlogged and we want to stop current render
+            // as soon as possible. However stop render involves blocking operation like busy
+            // wait loop for finish all MCRT threads and this is timing wise costly.
+            // So first of all, we set requestStop() call here (this is not a blocking call)
+            // There is some chance that all MCRT threads can be stopped during send.
+            driver->getRenderContext()->requestStop();
+        }
+        mDeferredMsgQueue.pop();
+
+        if (mOnMessageCache) {
+            // Backed to the onMessage cache mode. This happens if the latest processed message
+            // was forceRenderStart.
+            // std::cerr << ">> ProgMcrtComputation.cc - - - - - - >>> back to deferred mode <<< - - - - - -\n"; // for debug
+            return;
+        }
+    }
+    // std::cerr << ">> ProgMcrtComputation.cc - - - - - - deferredMessage processed ALL - - - - - -\n"; // for debug
+}
+
+void
+ProgMcrtComputation::parserConfigureGenericMessage()
+{
+    Parser& parser = mParserGenericMessage;
+    parser.description("genericMsg command");
+
+    // We set no error about unknown option condition
+    // Merge computation might send some generic message and we want to ignore them without error
+    parser.setErrorUnknownOption(false);
+
+    parser.opt("snapshot", "", "execute snapshot",
+               [&](Arg &) -> bool {
+                   // RenderContextDriverManager can support multiple renderContextDriver in order to quickly
+                   // test multi-renderContext driver configuration for the future plan.
+                   // However at this moment, we only use primary renderContextDriver (i.e. driverId = 0).
+                   mRenderContextDriverManager->getDriver(0)->setReceivedSnapshotRequest(true);
+                   return true;
+               });
+    parser.opt("fps", "<fps>", "set fps value",
+               [&](Arg &arg) -> bool {
+                   mFps = (arg++).as<float>(0);
+                   return true;
+               });
+    parser.opt("cmd", "<nodeId> ...command...", "mcrt debug command",
+               [&](Arg &arg) -> bool {
+                   int nodeId = (arg++).as<int>(0);
+                   Arg childArg = arg.childArg(std::string("cmd ") + std::to_string(nodeId));
+                   bool flag = true;
+                   if (nodeId == mMachineIdOverride || nodeId == -1) {
+                       RenderContextDriver *driver = mRenderContextDriverManager->getDriver(0);
+                       flag = driver->evalDebugCommand(childArg);
+                   }
+                   return flag;
+               });
+}
+
+void
+ProgMcrtComputation::handleGenericMessage(mcrt::GenericMessage::ConstPtr msg)
+{
+    mcrt_dataio::McrtControl mcrtControl(mMachineIdOverride);
+    if (mcrtControl.isCommand(msg->mValue)) { // McrtControl command test
+        //
+        // McrtControl command execution (from McrtMerge)
+        //
+        if (mcrtControl.
+            run(msg->mValue,
+                [&](uint32_t currSyncId) { // bool callBackRenderCompleteProcedure()
+                    // RenderContextDriverManager can support multiple renderContextDriver in order to
+                    // quickly test multi-renderContext driver configuration for the future plan.
+                    // However at this moment, we only use primary renderContextDriver (i.e. driverId = 0).
+                    RenderContextDriver *driver = mRenderContextDriverManager->getDriver(0);
+                    driver->evalRenderCompleteMultiMachine(currSyncId);
+                    return true;
+                },
+                [&](uint32_t currSyncId, float fraction) { // void callBackGlobalProgressUpdate()
+                    // RenderContextDriverManager can support multiple renderContextDriver in order to
+                    // quickly test multi-renderContext driver configuration for the future plan.
+                    // However at this moment, we only use primary renderContextDriver (i.e. driverId = 0).
+                    RenderContextDriver *driver = mRenderContextDriverManager->getDriver(0);
+                    driver->evalMultiMachineGlobalProgressUpdate(currSyncId, fraction);
+                },
+                [&]() { // void callBackForceRenderStart()
+                    mOnMessageCache = true;
+                    // std::cerr << ">> ProgMcrtComputation.cc mOnMessageCache=ON\n"; // for debug
+                })) {
+            // processed McrtControl command w/ OK condition
+        } else {
+            ARRAS_LOG_ERROR("McrtControl command failed");
+        }
+        return;
+    }
+
+    Arg arg(msg->mValue);
+    RenderContextDriver* driver = mRenderContextDriverManager->getDriver(0);
+    driver->setMessageHandlerToArg(arg); // setup message handler in order to send message to the downstream
+    if (!mParserGenericMessage.main(arg)) {
+        arg.msg("parserGenericMessage failed");
+    }
+}
+
+void
+ProgMcrtComputation::onJSONMessage(const arras4::api::Message& msg)
+{
+    mcrt::JSONMessage::ConstPtr jm = msg.contentAs<mcrt::JSONMessage>();
+    if (!jm) return;
+
+    const std::string messageID = jm->messageId();
+
+    // RenderContextDriverManager can support multiple renderContextDriver in order to quickly
+    // test multi-renderContext driver configuration for the future plan. However at this moment,
+    // we only use primary renderContextDriver (i.e. driverId = 0).
+    RenderContextDriver *driver = mRenderContextDriverManager->getDriver(0);
+
+    if (messageID == mcrt::RenderMessages::RENDER_CONTROL_ID) {
+        driver->enqRenderControlMessage(msg, mTimingRecorder.getSec());
+    } else if (messageID == mcrt::RenderMessages::PICK_MESSAGE_ID) {
+        driver->evalPickMessage(msg,
+                                [&](const arras4::api::MessageContentConstPtr &msg) {
+                                    send(msg);
+                                });
+    } else if (messageID == mcrt::RenderMessages::SET_ROI_OPERATION_ID) {
+        driver->enqROISetMessage(msg, mTimingRecorder.getSec());
+    } else if (messageID == mcrt::RenderMessages::SET_ROI_STATUS_OPERATION_ID) {
+        driver->enqROIResetMessage(msg, mTimingRecorder.getSec());
+    } else if (messageID == mcrt::RenderMessages::INVALIDATE_RESOURCES_ID) {
+        driver->evalInvalidateResources(msg);
+    } else if (messageID == mcrt::RenderMessages::RENDER_SETUP_ID) {
+        ARRAS_LOG_INFO("Render Setup");
+        driver->enqRenderSetupMessage(msg, mTimingRecorder.getSec());
+    } else if (messageID == mcrt::OutputRates::SET_OUTPUT_RATES_ID) {
+        driver->evalOutputRatesMessage(msg);
+
+    //------------------------------
+
+    } else if (messageID == mcrt::RenderMessages::LOGGING_CONFIGURATION_MESSAGE_ID) {
+        std::cerr << ">> ProgMcrtComputation.cc onJSONMessage ===>>> LOGGING_CONFIGURATION_MESSAGE_ID <<<===\n";
+        auto &payload = jm->messagePayload(); 
+        arras4::log::Logger::Level level =
+            static_cast<arras4::log::Logger::Level>(payload[Json::Value::ArrayIndex(0)].asInt());
+        arras4::log::Logger::instance().setThreshold(level);
+#if 0
+    } else if (messageID == SELECT_AOV_ID) {
+        // Handle AOV selection
+#endif
+    }
+}
+
+void 
+ProgMcrtComputation::onCreditUpdate(const arras4::api::Message& msg)
+{
+    if (mCredit >= 0) {
+        mcrt::CreditUpdate::ConstPtr c = msg.contentAs<mcrt::CreditUpdate>();
+        if (c) c->applyTo(mCredit,mInitialCredit);
+    }
+}
+
+} // namespace mcrt_computation

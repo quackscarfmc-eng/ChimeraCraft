@@ -1,0 +1,33 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuelAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuel",
+            "type" : "Vec3f"
+        },
+        "valuerAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuer",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_ramplr_vector3",
+    "type" : "Map"
+}

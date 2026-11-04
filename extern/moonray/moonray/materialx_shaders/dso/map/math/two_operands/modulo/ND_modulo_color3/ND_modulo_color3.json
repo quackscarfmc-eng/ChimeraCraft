@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Rgb(0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Rgb"
+		},
+		"in2Attr" : 
+		{
+			"default" : "Rgb(0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Rgb"
+		}
+	},
+	"name" : "ND_modulo_color3",
+	"type" : "Map"
+}

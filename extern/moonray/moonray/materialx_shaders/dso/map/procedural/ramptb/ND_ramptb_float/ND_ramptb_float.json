@@ -1,0 +1,33 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuebAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valueb",
+            "type" : "Float"
+        },
+        "valuetAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuet",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_ramptb_float",
+    "type" : "Map"
+}

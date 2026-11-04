@@ -1,0 +1,29 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"valueAttr" : 
+		{
+			"default" : "0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "value",
+			"type" : "Int"
+		}
+	},
+	"name" : "ND_constant_integer",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"default" : "0",
+			"name" : "out",
+			"type" : "Int"
+		}
+	},
+	"type" : "Map"
+}

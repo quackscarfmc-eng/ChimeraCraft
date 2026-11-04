@@ -1,0 +1,35 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Rgba(0.0,0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Rgba"
+		},
+		"in2Attr" : 
+		{
+			"default" : "0.0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_add_color4FA",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Rgba"
+                }
+        }
+}

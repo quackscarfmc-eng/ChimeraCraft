@@ -1,0 +1,42 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"highAttr" : 
+		{
+			"default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "high",
+			"type" : "Rgba"
+		},
+		"inAttr" : 
+		{
+			"default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Rgba"
+		},
+		"lowAttr" : 
+		{
+			"default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "low",
+			"type" : "Rgba"
+		}
+	},
+	"name" : "ND_clamp_color4",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"name" : "out",
+			"type" : "Rgba"
+		}
+	},
+	"type" : "Map"
+}

@@ -1,0 +1,28 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_floor_integer",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Int"
+                }
+        }
+}

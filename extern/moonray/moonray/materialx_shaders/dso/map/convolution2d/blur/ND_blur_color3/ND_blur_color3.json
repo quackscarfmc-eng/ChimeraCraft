@@ -1,0 +1,39 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "filtertypeAttr" : 
+        {
+            "default" : 0,
+            "enum" : 
+            {
+                "box" : 0,
+                "gaussian" : 1
+            },
+            "flags" : "FLAGS_BINDABLE| FLAGS_ENUMERABLE",
+            "name" : "filtertype",
+            "type" : "Int"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "sizeAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "size",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_blur_color3",
+    "type" : "Map"
+}

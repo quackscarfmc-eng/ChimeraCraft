@@ -1,0 +1,22 @@
+{
+    "attributes" : 
+    {
+	    "indexAttr" : 
+	    {
+		    "default" : "0",
+		    "flags" : "FLAGS_BINDABLE",
+		    "name" : "index",
+		    "type" : "Int"
+	    }
+    },
+    "name" : "ND_geomcolor_color4",
+    "type" : "Map",
+    "outputAttributes" :
+    {
+        "outAttr" :
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    }
+}

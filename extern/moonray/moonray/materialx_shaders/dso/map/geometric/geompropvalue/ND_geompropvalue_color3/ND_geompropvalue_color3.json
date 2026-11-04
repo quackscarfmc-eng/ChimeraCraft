@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "geompropAttr" : 
+        {
+            "label" : "geomprop",
+            "name" : "geomprop",
+            "type" : "String"
+        },
+        "defaultAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "label" : "default",
+            "name" : "default",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_geompropvalue_color3",
+    "type" : "Map"
+}

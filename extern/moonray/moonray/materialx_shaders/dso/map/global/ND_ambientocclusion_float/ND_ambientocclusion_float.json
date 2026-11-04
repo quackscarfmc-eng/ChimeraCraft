@@ -1,0 +1,28 @@
+{
+    "attributes" : 
+    {
+        "coneangleAttr" : 
+        {
+            "comment" : "Unit is degree.",
+            "default" : "90.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "coneangle",
+            "type" : "Float"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "maxdistanceAttr" : 
+        {
+            "default" : "1e+38f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "maxdistance",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_ambientocclusion_float",
+    "type" : "Map"
+}

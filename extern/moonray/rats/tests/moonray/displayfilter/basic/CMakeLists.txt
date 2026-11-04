@@ -1,0 +1,20 @@
+# Copyright 2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+add_subdirectory(blend)
+add_subdirectory(clamp)
+add_subdirectory(colorcorrect)
+add_subdirectory(constant)
+add_subdirectory(convolution)
+add_subdirectory(discretize)
+add_subdirectory(dof)
+add_subdirectory(halftone)
+add_subdirectory(image)
+add_subdirectory(op)
+add_subdirectory(over)
+add_subdirectory(ramp)
+add_subdirectory(remap)
+add_subdirectory(rgbtofloat)
+add_subdirectory(rgbtohsv)
+add_subdirectory(shadow)
+add_subdirectory(toon)

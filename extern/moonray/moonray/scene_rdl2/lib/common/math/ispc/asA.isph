@@ -1,0 +1,69 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "Col3.isph"
+#include "Col4.isph"
+#include "Color.isph"
+#include "Vec2.isph"
+#include "Vec3.isph"
+#include "Vec4.isph"
+
+#define MATH_DEFINE_ASA(TO, FROM)                           \
+inline uniform TO &asA##TO(uniform FROM &t)                 \
+{                                                           \
+    return (uniform TO &) t;                                \
+}                                                           \
+inline varying TO &asA##TO(varying FROM &t)                 \
+{                                                           \
+    return (varying TO &) t;                                \
+}                                                           \
+inline const uniform TO &asA##TO(const uniform FROM &t)     \
+{                                                           \
+    return (const uniform TO &) t;                          \
+}                                                           \
+inline const varying TO &asA##TO(const varying FROM &t)     \
+{                                                           \
+    return (const varying TO &) t;                          \
+}
+
+#define MATH_DEFINE_ASARRAY(TO, FROM)                       \
+inline uniform TO * uniform asArray(const uniform FROM &t)  \
+{                                                           \
+    return (uniform TO * uniform) &t;                       \
+}                                                           \
+inline varying TO * uniform asArray(const varying FROM &t)  \
+{                                                           \
+    return (varying  TO * uniform) &t;                      \
+}
+
+/// convert to Vec2f
+MATH_DEFINE_ASA(Vec2f, Vec3f)
+MATH_DEFINE_ASA(Vec2f, Vec4f)
+
+/// convert to Vec3f
+MATH_DEFINE_ASA(Vec3f, Vec4f)
+MATH_DEFINE_ASA(Vec3f, Col3f);
+
+/// convert to Col3f
+MATH_DEFINE_ASA(Col3f, Vec3f);
+MATH_DEFINE_ASA(Col3f, Col4f);
+
+/// convert to Color
+MATH_DEFINE_ASA(Color, Vec3f);
+MATH_DEFINE_ASA(Color, Col4f);
+
+/// convert to Vec4f
+MATH_DEFINE_ASA(Vec4f, Col4f);
+
+/// convert to Col4f
+MATH_DEFINE_ASA(Col4f, Vec4f);
+
+/// convert to float array
+MATH_DEFINE_ASARRAY(float, Vec2f);
+MATH_DEFINE_ASARRAY(float, Vec3f);
+MATH_DEFINE_ASARRAY(float, Vec4f);
+MATH_DEFINE_ASARRAY(float, Col3f);
+MATH_DEFINE_ASARRAY(float, Col4f);
+

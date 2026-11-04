@@ -1,0 +1,51 @@
+{
+    "attributes" : 
+    {
+        "color1Attr" : 
+        {
+            "comment" : "The first color used in the checkerboard pattern.",
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Color 1",
+            "name" : "color1",
+            "type" : "Rgb"
+        },
+        "color2Attr" : 
+        {
+            "comment" : "The second color used in the checkerboard pattern.",
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Color 2",
+            "name" : "color2",
+            "type" : "Rgb"
+        },
+        "texcoordAttr" : 
+        {
+            "comment" : "The input 2d space. Default is the first texture coordinates.",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Texture Coordinates",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "uvoffsetAttr" : 
+        {
+            "comment" : "The offset of the checkerboard pattern along each axis. Default is (0, 0).",
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "UV Offset",
+            "name" : "uvoffset",
+            "type" : "Vec2f"
+        },
+        "uvtilingAttr" : 
+        {
+            "comment" : "The tiling of the checkerboard pattern along each axis, with higher values producing smaller squares. Default is (8, 8).",
+            "default" : "Vec2f(8.0f, 8.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "UV Tiling",
+            "name" : "uvtiling",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_checkerboard_color3",
+    "type" : "Map"
+}

@@ -1,0 +1,29 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"valueAttr" : 
+		{
+			"default" : "Mat4f(1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "value",
+			"type" : "Mat4f"
+		}
+	},
+	"name" : "ND_constant_matrix44",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"default" : "Mat4f(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)\n",
+			"name" : "out",
+			"type" : "Mat4f"
+		}
+	},
+	"type" : "Map"
+}

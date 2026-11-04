@@ -1,0 +1,23 @@
+{
+	"attributes" : 
+	{
+		"inAttr" : 
+		{
+			"default" : "Vec2f(0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec2f"
+		}
+	},
+	"name" : "ND_convert_vector2_color4",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+			"name" : "out",
+			"type" : "Rgba"
+		}
+	},
+	"type" : "Map"
+}

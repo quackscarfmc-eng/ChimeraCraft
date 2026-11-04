@@ -1,0 +1,42 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "amountAttr" : 
+        {
+            "default" : "Vec4f(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Vec4f"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec4f"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "Vec4f(0.5f, 0.5f, 0.5f, 0.5f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "pivot",
+            "type" : "Vec4f"
+        }
+    },
+    "name" : "ND_contrast_vector4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Vec4f"
+        }
+    },
+    "type" : "Map"
+}

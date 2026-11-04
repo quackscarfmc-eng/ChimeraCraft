@@ -1,0 +1,42 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "amountAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Rgba"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgba"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "Rgba(0.5f, 0.5f, 0.5f, 0.5f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "pivot",
+            "type" : "Rgba"
+        }
+    },
+    "name" : "ND_contrast_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

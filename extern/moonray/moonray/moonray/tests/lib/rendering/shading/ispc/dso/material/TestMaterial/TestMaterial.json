@@ -1,0 +1,13 @@
+{
+    "name": "TestMaterial",
+    "type": "Material",
+    "attributes": {
+        "attrColor": {
+            "name": "color",
+            "label": "color",
+            "aliases": [ "color" ],
+            "type": "Rgb",
+            "flags": "FLAGS_BINDABLE"
+        }
+    }
+}

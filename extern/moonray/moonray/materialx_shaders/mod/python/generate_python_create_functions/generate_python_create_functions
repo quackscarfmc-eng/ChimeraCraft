@@ -1,0 +1,203 @@
+#! /usr/bin/env python3
+import scene_rdl2
+import os
+
+
+outfile = None
+
+def rdltype_to_usdtype(rdlType):
+    if rdlType == 'Bool':
+        return 'Sdf.ValueTypeNames.Bool'
+    elif rdlType == 'Int':
+        return 'Sdf.ValueTypeNames.Int'
+    elif rdlType == 'String':
+        return 'Sdf.ValueTypeNames.String'
+    elif rdlType == 'Float':
+        return 'Sdf.ValueTypeNames.Float'
+    elif rdlType == 'Vec2f':
+        return 'Sdf.ValueTypeNames.Float2'
+    elif rdlType == 'Vec3f':
+        return 'Sdf.ValueTypeNames.Float3'
+    elif rdlType == 'Vec4f':
+        return 'Sdf.ValueTypeNames.Float4'
+    elif rdlType == 'Rgb':
+        return 'Sdf.ValueTypeNames.Float3'
+    elif rdlType == 'Rgba':
+        return 'Sdf.ValueTypeNames.Float4'
+    elif rdlType == 'Mat3f':
+        return 'Sdf.ValueTypeNames.Matrix3d'
+    elif rdlType == 'Mat4f':
+        return 'Sdf.ValueTypeNames.Matrix4d'
+    elif rdlType == 'SceneObject':
+        return 'Sdf.ValueTypeNames.Token'
+    elif rdlType == 'BoolVector':
+        return 'Sdf.ValueTypeNames.BoolArray'
+    elif rdlType == 'IntVector':
+        return 'Sdf.ValueTypeNames.IntArray'
+    elif rdlType == 'StringVector':
+        return 'Sdf.ValueTypeNames.StringArray'
+    elif rdlType == 'FloatVector':
+        return 'Sdf.ValueTypeNames.FloatArray'
+    elif rdlType == 'Vec2fVector':
+        return 'Sdf.ValueTypeNames.Float2Array'
+    elif rdlType == 'Vec3fVector':
+        return 'Sdf.ValueTypeNames.Float3Array'
+    elif rdlType == 'Vec4fVector':
+        return 'Sdf.ValueTypeNames.Float4Array'
+    elif rdlType == 'RgbVector':
+        return 'Sdf.ValueTypeNames.Float3Array'
+    elif rdlType == 'RgbaVector':
+        return 'Sdf.ValueTypeNames.Float4Array'
+    elif rdlType == 'Mat3fVector':
+        return 'Sdf.ValueTypeNames.Matrix3dArray'
+    elif rdlType == 'Mat4fVector':
+        return 'Sdf.ValueTypeNames.Matrix4dArray'
+    elif rdlType == 'SceneObjectVector':
+        return 'Sdf.ValueTypeNames.TokenArray'
+
+def generateCreateFunction(cls, clsname, obj):
+    attrs = obj.getAttributeNamesAndTypes()
+
+    print('', flush=True, file=outfile)
+    print('#', flush=True, file=outfile)
+    print('# {}'.format(clsname), flush=True, file=outfile)
+    print('#', flush=True, file=outfile)
+    print('def create_{}( stage, path, name{}'.format(clsname, "):" if (len(attrs) == 0) else ","), flush=True, file=outfile)
+    for attr in attrs:
+        #print("    {} {}".format(attr,attrs[attr]), flush=True,file=outfile)
+        name = attr
+        if attr== 'in':
+            attrName = 'inAttr'
+        elif name == 'type':
+            attrName = 'typeAttr'
+        else:
+            attrName = name
+        if attr == list(attrs.keys())[-1]:
+            print('    {}=None):'.format(attrName), flush=True, file=outfile)
+        else:
+            print('    {}=None,'.format(attrName), flush=True, file=outfile)
+
+    print('', flush=True, file=outfile)
+    print('    shader = UsdShade.Shader.Define(stage, HandlePath(path,name))', flush=True, file=outfile)
+    print('    shader.CreateIdAttr(\'{}\')'.format(clsname), flush=True, file=outfile)
+    print('', flush=True, file=outfile)
+
+    for attr in attrs:
+        name = attr
+        if attr== 'in':
+            attrName = 'inAttr'
+        elif name == 'type':
+            attrName = 'typeAttr'
+        else:
+            attrName = name
+
+        rdlType = attrs[attr]
+        typeName = rdltype_to_usdtype(rdlType)
+        attrObj = cls.getAttribute(attr)
+
+        bindable = attrObj.isBindable()
+        enumerable = attrObj.isEnumerable()
+
+        if bindable:
+            bindableString = ', bindable=True'
+        else:
+            bindableString = ''
+
+        first = True
+        if enumerable:
+            enumValMap = attrObj.getEnumValMap()
+            print('    # Convert labels to numbers for enumeration of "{}"'.format(attrName), flush=True, file=outfile)
+            for value in enumValMap:
+                label = enumValMap[value]
+                if first:
+                    print('    if {} == \'{}\':'.format(attrName, label), flush=True, file=outfile)
+                    first = False
+                else:
+                    print('    elif {} == \'{}\':'.format(attrName, label), flush=True, file=outfile)
+                print('        {} = {}'.format(attrName, value), flush=True, file=outfile)
+
+        print('    HandleShaderAttribute(shader, "{}", {}, {}{})'.format(attr, attrName, typeName,bindableString),flush=True, file=outfile)
+        
+    displacementObj = obj.toDisplacement()
+    if displacementObj is not None:
+        print('    # This is a displacement shader, so we need to set the output type to "displacement"', flush=True, file=outfile)
+        rdlType = 'displacement'
+        typeName = 'Sdf.ValueTypeNames.Float3'
+        name = "out"
+    else:
+        materialObj = obj.toMaterial()
+        if materialObj is not None:
+            rdlType = 'material'
+            typeName = 'Sdf.ValueTypeNames.Token'
+            name = "out"
+        else:
+            normapMapObj = obj.toNormalMap()
+            if normapMapObj is not None:
+                rdlType = 'normalmap'
+                typeName = 'Sdf.ValueTypeNames.Float3'
+                name = "out"
+            else:
+                rdlType = obj.getOutputTypeName()
+                typeName = rdltype_to_usdtype(rdlType)
+                name = "out"
+
+    print('', flush=True, file=outfile)
+    print('    # Output type is {} ({})'.format(typeName,rdlType), flush=True, file=outfile)
+    print('    shader.CreateOutput(\'{}\', {})'.format(name, typeName), flush=True, file=outfile)
+    print('    return shader', flush=True, file=outfile)
+
+def printHeader():
+    print("import pxr", flush=True, file=outfile)
+    print("from pxr import Usd, UsdShade, Sdf", flush=True, file=outfile)
+    print("from materialx_shaders.test_utils import HandlePath, HandleShaderAttribute", flush=True, file=outfile)
+    print("", flush=True, file=outfile)
+
+def parseArgs():
+    import argparse
+    parser = argparse.ArgumentParser(description='Generate Python create functions for all scene classes')
+    parser.add_argument('--output', '-o', type=str, dest='outputFilename', default='shaders.py', help='The file to write the create functions to')
+    parser.add_argument('--prepend', '-p', type=str, dest='prependFilename', help='The file to prepend to the output file (should contain imports and utility functions)')
+    return parser.parse_args()
+
+def main():
+    args = parseArgs()
+    global outfile
+    dso_path = os.getenv('RDL2_DSO_PATH')
+    print("RDL2_DSO_PATH: {}".format(dso_path), flush=True)
+    outfile = open(args.outputFilename, 'w')
+
+    # copy the contents of the prepend file to the output file
+    if args.prependFilename is not None:
+        with open(args.prependFilename, 'r') as prependFile:
+            for line in prependFile:
+                print(line, end='', flush=True, file=outfile)
+
+    printHeader()
+
+    context = scene_rdl2.SceneContext()
+    # context.setProxyModeEnabled(True)
+    context.loadAllSceneClasses()
+    for clsname in context.getSceneClassNames():
+        print("# Generating create function for class {}".format(clsname), flush=True)
+        cls = context.getSceneClass(clsname)
+        obj = context.createSceneObject(clsname, clsname+"_obj")
+        mapObj = obj.toMap()
+        if mapObj is not None:
+            generateCreateFunction(cls, clsname, mapObj)
+            continue
+        normalMapObj = obj.toNormalMap()
+        if normalMapObj is not None:
+            generateCreateFunction(cls, clsname, obj)
+            continue
+        materialObj = obj.toMaterial()
+        if materialObj is not None:
+            generateCreateFunction(cls, clsname, materialObj)
+            continue
+        displacementMapObj = obj.toDisplacement()
+        if displacementMapObj is not None:
+            generateCreateFunction(cls, clsname, displacementMapObj)
+            continue
+        print("#class {} is not a map, material, or displacement shader".format(clsname), flush=True, file=outfile)
+    outfile.close()
+
+main()

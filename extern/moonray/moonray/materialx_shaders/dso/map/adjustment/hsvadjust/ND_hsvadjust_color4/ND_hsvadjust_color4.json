@@ -1,0 +1,35 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgba"
+        },
+        "amountAttr" :
+        {
+            "default" : "Rgba(0.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Rgba"
+        }
+    },
+    "name" : "ND_hsvadjust_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

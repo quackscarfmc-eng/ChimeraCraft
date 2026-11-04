@@ -1,0 +1,47 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "heightAttr" : 
+        {
+            "comment" : "Amount to offset the surface normal.",
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Height",
+            "name" : "height",
+            "type" : "Float"
+        },
+        "normalAttr" : 
+        {
+            "comment" : "Surface normal; defaults to the current world-space normal.",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Normal",
+            "name" : "normal",
+            "type" : "Vec3f"
+        },
+        "scaleAttr" : 
+        {
+            "comment" : "Scalar to adjust the height amount.",
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Scale",
+            "name" : "scale",
+            "type" : "Float"
+        },
+        "tangentAttr" : 
+        {
+            "comment" : "Surface tangent vector, defaults to the current world-space tangent vector.",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Tangent",
+            "name" : "tangent",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_bump_vector3",
+    "type" : "Map"
+}

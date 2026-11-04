@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "bgAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bg",
+            "type" : "Vec3f"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fgAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "fg",
+            "type" : "Vec3f"
+        },
+        "mixAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mix",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_mix_vector3_vector3",
+    "type" : "Map"
+}

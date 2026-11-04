@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Vec2f(0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Vec2f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "Vec2f(0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Vec2f"
+		}
+	},
+	"name" : "ND_modulo_vector2",
+	"type" : "Map"
+}

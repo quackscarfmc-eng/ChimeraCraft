@@ -1,0 +1,102 @@
+{
+    "attributes" : 
+    {
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position",
+            "type" : "Vec3f",
+            "comment" : "the input 3d space"
+        },
+        "freqAttr" : 
+        {
+            "default" : "Vec3f(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "freq",
+            "type" : "Vec3f",
+            "comment" : "adjusts the noise frequency, with higher values producing smaller noise shapes"
+        },
+        "offsetAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "offset",
+            "type" : "Vec3f",
+            "comment" : "shift the noise in 3d space"
+        },
+        "jitterAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "jitter",
+            "type" : "Float",
+            "comment" : "adjust uniformity of Worley noise; for other noise types jitters the results"
+        },
+        "outminAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outmin",
+            "type" : "Float",
+            "comment" : "the lowest values fit to the noise"
+        },
+        "outmaxAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outmax",
+            "type" : "Float",
+            "comment" : "the highest values fit to the noise"
+        },
+        "clampoutputAttr" : 
+        {
+            "default" : "true",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "clampoutput",
+            "type" : "Bool",
+            "comment" : "clamp the output to the min and max output values"
+        },
+        "octavesAttr" : 
+        {
+            "default" : "3",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "octaves",
+            "type" : "Int",
+            "comment" : "the number of octaves of Fractal noise to be generated"
+        },
+        "lacunarityAttr" : 
+        {
+            "default" : "2.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "lacunarity",
+            "type" : "Float",
+            "comment" : "the exponential scale between successive octaves of Fractal noise"
+        },
+        "diminishAttr" : 
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "diminish",
+            "type" : "Float",
+            "comment" : "the rate at which noise amplitude is diminished for each octave of Fractal noise"
+        },
+        "typeAttr" : 
+        {
+            "default" : "0",
+            "name" : "type",
+            "type" : "Int",
+		    "flags" : "FLAGS_ENUMERABLE",
+		    "enum" : 
+		    {
+			    "Perlin" : 0,
+			    "Cell" : 1,
+			    "Worley" : 2,
+			    "Fractal" : 3
+		    },
+            "comment" : "noise type: 0=Perlin, 1=Cell, 2=Worley, 3=Fractal"
+        }
+    },
+    "name" : "ND_unifiednoise3d_float",
+    "type" : "Map"
+}

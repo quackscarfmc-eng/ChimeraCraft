@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "bgAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bg",
+            "type" : "Rgb"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fgAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "fg",
+            "type" : "Rgb"
+        },
+        "mixAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mix",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_mix_color3_color3",
+    "type" : "Map"
+}

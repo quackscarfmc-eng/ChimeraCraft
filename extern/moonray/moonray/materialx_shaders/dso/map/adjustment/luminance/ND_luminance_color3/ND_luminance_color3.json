@@ -1,0 +1,27 @@
+{
+    "attributes" :
+    {
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "lumacoeffsAttr" :
+        {
+            "default" : "Rgb(0.2722287f, 0.6740818f, 0.0536895f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "lumacoeffs",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_luminance_color3",
+    "type" : "Map"
+}

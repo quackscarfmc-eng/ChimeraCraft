@@ -1,0 +1,113 @@
+{
+    "attributes" :
+    {
+        "defaultAttr" :
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "label" : "Default Color",
+            "name" : "default",
+            "type" : "Vec3f"
+        },
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fileAttr" :
+        {
+            "label" : "Filename",
+            "name" : "file",
+            "type" : "String"
+        },
+        "filtertypeAttr" :
+        {
+            "default" : 0,
+            "enum" :
+            {
+                "closest" : 0,
+                "cubic" : 2,
+                "linear" : 1
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Filter Type",
+            "name" : "filtertype",
+            "type" : "Int",
+            "comment" : "NOT SUPPORTED BY MOONRAY"
+        },
+        "frameendactionAttr" :
+        {
+            "default" : 0,
+            "enum" :
+            {
+                "clamp" : 1,
+                "constant" : 0,
+                "mirror" : 3,
+                "periodic" : 2
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Frame End Action",
+            "name" : "frameendaction",
+            "type" : "Int"
+        },
+        "frameoffsetAttr" :
+        {
+            "default" : "0",
+            "label" : "Frame Offset",
+            "name" : "frameoffset",
+            "type" : "Int"
+        },
+        "framerangeAttr" :
+        {
+            "label" : "Frame Range",
+            "name" : "framerange",
+            "type" : "String"
+        },
+        "layerAttr" :
+        {
+            "label" : "Layer",
+            "name" : "layer",
+            "type" : "String",
+            "comment" : "NOT SUPPORTED BY MOONRAY"
+        },
+        "texcoordAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Texture Coordinates",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "uaddressmodeAttr" :
+        {
+            "default" : 2,
+            "enum" :
+            {
+                "clamp" : 1,
+                "constant" : 0,
+                "mirror" : 3,
+                "periodic" : 2
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Address Mode U",
+            "name" : "uaddressmode",
+            "type" : "Int"
+        },
+        "vaddressmodeAttr" :
+        {
+            "default" : 2,
+            "enum" :
+            {
+                "clamp" : 1,
+                "constant" : 0,
+                "mirror" : 3,
+                "periodic" : 2
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Address Mode V",
+            "name" : "vaddressmode",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_image_vector3",
+    "type" : "Map"
+}

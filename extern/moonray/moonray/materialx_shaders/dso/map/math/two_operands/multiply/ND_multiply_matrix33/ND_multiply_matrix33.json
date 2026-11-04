@@ -1,0 +1,35 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Mat3f(1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Mat3f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "Mat3f(0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Mat3f"
+		}
+	},
+	"name" : "ND_multiply_matrix33",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Mat3f"
+                }
+        }
+}

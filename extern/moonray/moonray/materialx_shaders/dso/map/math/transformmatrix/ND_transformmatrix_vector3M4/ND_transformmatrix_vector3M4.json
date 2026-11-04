@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec3f"
+        },
+        "matAttr" : 
+        {
+            "default" : "Mat4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mat",
+            "type" : "Mat4f"
+        }
+    },
+    "name" : "ND_transformmatrix_vector3M4",
+    "type" : "Map"
+}

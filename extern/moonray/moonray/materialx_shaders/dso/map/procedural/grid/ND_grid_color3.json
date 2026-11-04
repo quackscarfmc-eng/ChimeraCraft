@@ -1,0 +1,41 @@
+{
+    "attributes" : 
+    {
+        "staggeredAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "staggered",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "thicknessAttr" : 
+        {
+            "default" : "0.05f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "thickness",
+            "type" : "Float"
+        },
+        "uvoffsetAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvoffset",
+            "type" : "Vec2f"
+        },
+        "uvtilingAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvtiling",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_grid_color3",
+    "type" : "Map"
+}

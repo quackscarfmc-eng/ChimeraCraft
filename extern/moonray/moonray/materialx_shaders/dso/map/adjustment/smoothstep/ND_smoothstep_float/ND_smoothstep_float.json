@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Float"
+        },
+        "lowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "low",
+            "type" : "Float"
+        },
+        "highAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "high",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_smoothstep_float",
+    "type" : "Map"
+}

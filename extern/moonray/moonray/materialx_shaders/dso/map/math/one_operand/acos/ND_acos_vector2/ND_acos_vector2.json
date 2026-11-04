@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "Vec2f(0.0f,0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec2f"
+		}
+	},
+	"name" : "ND_acos_vector2",
+	"type" : "Map"
+}

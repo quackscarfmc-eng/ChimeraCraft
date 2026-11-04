@@ -1,0 +1,163 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file ReferenceFrame.isph
+/// @brief Defines a local frame of reference in a global coordinate system
+
+#pragma once
+
+#include "Math.isph"
+#include "Vec3.isph"
+
+/**
+ * @struct ReferenceFrame
+ * @brief Right-handed orthonormal basis vectors, expressed in the client's
+ * coordinate system.
+ */
+struct ReferenceFrame
+{
+    Vec3f mX;
+    Vec3f mY;
+    Vec3f mZ;
+};
+
+//--------------------------------------------------------------------------------------------------
+// ReferenceFrame_init(frame, N)
+//--------------------------------------------------------------------------------------------------
+// Initialize a ReferenceFrame from a normal N which must be normalized
+
+// Building an Orthonormal Basis, Revisited
+// Duff, Tom et. al
+// Pixar
+// https://graphics.pixar.com/library/OrthonormalB/paper.pdf
+
+inline void ReferenceFrame_init(uniform ReferenceFrame& result, uniform Vec3f N)
+{
+    MNRY_ASSERT(isNormalized(N));
+    const uniform float sign = copysign(1.0f, N.z);
+    const uniform float a = -1.0f / (sign + N.z);
+    const uniform float b = N.x * N.y * a;
+    result.mX = Vec3f_ctor(1.0f + sign * N.x * N.x * a, sign * b, -sign * N.x);
+    result.mY = Vec3f_ctor(b, sign + N.y * N.y * a, -N.y);
+    result.mZ = N;
+}
+
+inline void ReferenceFrame_init(varying ReferenceFrame& result, varying Vec3f N)
+{
+    MNRY_ASSERT(isNormalized(N));
+    const varying float sign = copysign(1.0f, N.z);
+    const varying float a = -1.0f / (sign + N.z);
+    const varying float b = N.x * N.y * a;
+    result.mX = Vec3f_ctor(1.0f + sign * N.x * N.x * a, sign * b, -sign * N.x);
+    result.mY = Vec3f_ctor(b, sign + N.y * N.y * a, -N.y);
+    result.mZ = N;
+}
+
+//--------------------------------------------------------------------------------------------------
+// ReferenceFrame_init(frame, N, T)
+//--------------------------------------------------------------------------------------------------
+// Initialize a ReferenceFrame from a normal N and tangent vector T which must both be normalized
+
+inline void ReferenceFrame_init(uniform ReferenceFrame &frame, const uniform Vec3f N, const uniform Vec3f T)
+{
+    MNRY_ASSERT(isNormalized(N));
+    MNRY_ASSERT(isNormalized(T));
+    frame.mZ = N;
+    frame.mY = normalize(cross(N, T));
+    frame.mX = cross(frame.mY, frame.mZ);
+    MNRY_ASSERT(isNormalized(frame.mX));
+}
+
+inline void ReferenceFrame_init(varying ReferenceFrame &frame, const varying Vec3f N, const varying Vec3f T)
+{
+    MNRY_ASSERT(isNormalized(N));
+    MNRY_ASSERT(isNormalized(T));
+    frame.mZ = N;
+    frame.mY = normalize(cross(N, T));
+    frame.mX = cross(frame.mY, frame.mZ);
+    MNRY_ASSERT(isNormalized(frame.mX));
+}
+
+//--------------------------------------------------------------------------------------------------
+// ReferenceFrame ReferenceFrame_ctor(N)
+//--------------------------------------------------------------------------------------------------
+// Construct a ReferenceFrame from a normal N which must be normalized
+
+inline uniform ReferenceFrame ReferenceFrame_ctor(const uniform Vec3f N)
+{
+    uniform ReferenceFrame result;
+    ReferenceFrame_init(result, N);
+    return result;
+}
+
+inline varying ReferenceFrame ReferenceFrame_ctor(const varying Vec3f N)
+{
+    varying ReferenceFrame result;
+    ReferenceFrame_init(result, N);
+    return result;
+}
+
+//--------------------------------------------------------------------------------------------------
+// ReferenceFrame ReferenceFrame_ctor(N, T)
+//--------------------------------------------------------------------------------------------------
+// Construct a ReferenceFrame from a normal N and tangent vector T which must both be normalized
+
+inline uniform ReferenceFrame ReferenceFrame_ctor(const uniform Vec3f N, const uniform Vec3f T)
+{
+    uniform ReferenceFrame result;
+    ReferenceFrame_init(result, N, T);
+    return result;
+}
+
+inline varying ReferenceFrame ReferenceFrame_ctor(const varying Vec3f N, const varying Vec3f T)
+{
+    varying ReferenceFrame result;
+    ReferenceFrame_init(result, N, T);
+    return result;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Vec3f getN(frame)
+//--------------------------------------------------------------------------------------------------
+// Convention: in all bases, N is mapped onto Z
+
+inline uniform Vec3f getN(const uniform ReferenceFrame frame)
+{
+    return frame.mZ;
+}
+
+inline varying Vec3f getN(const varying ReferenceFrame frame)
+{
+    return frame.mZ;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Vec3f localToGlobal(frame, localVec)
+//--------------------------------------------------------------------------------------------------
+// Local-to-global transformation
+
+inline uniform Vec3f localToGlobal(const uniform ReferenceFrame frame, const uniform Vec3f v)
+{
+    return frame.mX * v.x + frame.mY * v.y + frame.mZ * v.z;
+}
+
+inline varying Vec3f localToGlobal(const varying ReferenceFrame frame, const varying Vec3f v)
+{
+    return frame.mX * v.x + frame.mY * v.y + frame.mZ * v.z;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Vec3f globalToLocal(frame, globalVec)
+//--------------------------------------------------------------------------------------------------
+// Global-to-local transformation
+
+inline uniform Vec3f globalToLocal(const uniform ReferenceFrame frame, const uniform Vec3f v)
+{
+    return Vec3f_ctor(dot(frame.mX, v), dot(frame.mY, v), dot(frame.mZ, v));
+}
+
+inline varying Vec3f globalToLocal(const varying ReferenceFrame frame, const varying Vec3f v)
+{
+    return Vec3f_ctor(dot(frame.mX, v), dot(frame.mY, v), dot(frame.mZ, v));
+}
+

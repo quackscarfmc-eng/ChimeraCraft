@@ -1,0 +1,35 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Mat4f(1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Mat4f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "0.0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_add_matrix44FA",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Mat4f"
+                }
+        }
+}

@@ -1,0 +1,69 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgba"
+        },
+        "inLowAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inlow",
+            "type" : "Rgba"
+        },
+        "inHighAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inhigh",
+            "type" : "Rgba"
+        },
+        "outLowAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outlow",
+            "type" : "Rgba"
+        },
+        "inHighAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outhigh",
+            "type" : "Rgba"
+        },
+        "gammaAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Rgba"
+        },
+        "doClampAttr" : 
+        {
+            "default" : 0,
+            "name" : "doclamp",
+            "type" : "Bool"
+        }
+    },
+    "name" : "ND_remap_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

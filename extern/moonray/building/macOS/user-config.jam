@@ -1,0 +1,6 @@
+using python : 3.9
+  : "/Library/Developer/CommandLineTools/usr/bin/python3"
+  : "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Headers"
+  : "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib"
+  ;
+using clang : : : <compileflags>-"arch arm64" <linkflags>"-arch arm64" ;

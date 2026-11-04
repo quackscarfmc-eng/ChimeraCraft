@@ -1,0 +1,397 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Vec2.isph
+/// @brief
+/// defines a 2 component x, y vector and its methods
+#pragma once
+
+#include "Constants.isph"
+#include "Math.isph"
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct Vec2f
+{
+    float x;
+    float y;
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constructors
+//--------------------------------------------------------------------------------------------------
+
+// Vec2f = {x, y}
+inline uniform Vec2f Vec2f_ctor(const uniform float x, const uniform float y)
+{
+    uniform Vec2f result;
+    result.x = x;
+    result.y = y;
+    return result;
+}
+
+// Vec2f = {x, y}
+inline varying Vec2f Vec2f_ctor(const varying float x, const varying float y)
+{
+    varying Vec2f result;
+    result.x = x;
+    result.y = y;
+    return result;
+}
+
+// Vec2f = {f, f}
+inline uniform Vec2f Vec2f_ctor(const uniform float f)
+{
+    return Vec2f_ctor(f, f);
+}
+
+// Vec2f = {f, f}
+inline varying Vec2f Vec2f_ctor(const varying float f)
+{
+    return Vec2f_ctor(f, f);
+}
+
+// Vec2f = {a[0], a[1]}
+inline uniform Vec2f Vec2f_ctor(const uniform float a[])
+{
+    return Vec2f_ctor(a[0], a[1]);
+}
+
+// Vec2f = {a[0], a[1]}
+inline varying Vec2f Vec2f_ctor(const varying float a[])
+{
+    return Vec2f_ctor(a[0], a[1]);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Arithmetic
+//--------------------------------------------------------------------------------------------------
+
+//  Vec2f = Vec2f + Vec2f
+inline uniform Vec2f operator+(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(v0.x+v1.x, v0.y+v1.y);
+}
+
+//  Vec2f = Vec2f + Vec2f
+inline varying Vec2f operator+(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(v0.x+v1.x, v0.y+v1.y);
+}
+
+//  Vec2f = Vec2f - Vec2f
+inline uniform Vec2f operator-(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(v0.x-v1.x, v0.y-v1.y);
+}
+
+//  Vec2f = Vec2f - Vec2f
+inline varying Vec2f operator-(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(v0.x-v1.x, v0.y-v1.y);
+}
+
+// Vec2f = -Vec2f
+// (IPSC doesn't currently support overloading of unary operators, so we define a function to negate a vector)
+inline uniform Vec2f neg(const uniform Vec2f v)
+{
+    return Vec2f_ctor(-v.x, -v.y);
+}
+
+// Vec2f = -Vec2f
+// (IPSC doesn't currently support overloading of unary operators, so we define a function to negate a vector)
+inline varying Vec2f neg(const varying Vec2f v)
+{
+    return Vec2f_ctor(-v.x, -v.y);
+}
+
+//  Vec2f = float * Vec2f
+inline uniform Vec2f operator*(const uniform float f, const uniform Vec2f v)
+{
+    return Vec2f_ctor(f*v.x, f*v.y);
+}
+
+//  Vec2f = float * Vec2f
+inline varying Vec2f operator*(const varying float f, const varying Vec2f v)
+{
+    return Vec2f_ctor(f*v.x, f*v.y);
+}
+
+//  Vec2f = Vec2f * float
+inline uniform Vec2f operator*(const uniform Vec2f v, const uniform float f)
+{
+    return f * v;
+}
+
+//  Vec2f = Vec2f * float
+inline varying Vec2f operator*(const varying Vec2f v, const varying float f)
+{
+    return f * v;
+}
+
+//  Vec2f = Vec2f * Vec2f
+inline uniform Vec2f operator*(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(v0.x*v1.x, v0.y*v1.y);
+}
+
+//  Vec2f = Vec2f * Vec2f
+inline varying Vec2f operator*(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(v0.x*v1.x, v0.y*v1.y);
+}
+
+//  Vec2f = float / Vec2f
+inline uniform Vec2f operator/(const uniform float f, const uniform Vec2f v)
+{
+    return Vec2f_ctor(f/v.x, f/v.y);
+}
+
+//  Vec2f = float / Vec2f
+inline varying Vec2f operator/(const varying float f, const varying Vec2f v)
+{
+    return Vec2f_ctor(f/v.x, f/v.y);
+}
+
+//  Vec2f = Vec2f / float
+inline uniform Vec2f operator/(const uniform Vec2f v, const uniform float f)
+{
+    return Vec2f_ctor(v.x/f, v.y/f);
+}
+
+//  Vec2f = Vec2f / float
+inline varying Vec2f operator/(const varying Vec2f v, const varying float f)
+{
+    return Vec2f_ctor(v.x/f, v.y/f);
+}
+
+//  Vec2f = Vec2f / Vec2f
+inline uniform Vec2f operator/(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(v0.x/v1.x, v0.y/v1.y);
+}
+
+//  Vec2f = Vec2f / Vec2f
+inline varying Vec2f operator/(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(v0.x/v1.x, v0.y/v1.y);
+}
+
+// Vec2f rcp(Vec2f)
+inline uniform Vec2f rcp(const uniform Vec2f v)
+{
+    return Vec2f_ctor(1.0f/v.x, 1.0f/v.y);
+}
+
+// Vec2f rcp(Vec2f)
+inline varying Vec2f rcp(const varying Vec2f v)
+{
+    return Vec2f_ctor(1.0f/v.x, 1.0f/v.y);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Equality
+//--------------------------------------------------------------------------------------------------
+
+// bool isEqual(Vec2f, Vec2f, tol)
+inline uniform bool isEqual(const uniform Vec2f v0, const uniform Vec2f v1, const uniform float tol)
+{
+    return isEqual(v0.x, v1.x, tol) && isEqual(v0.y, v1.y, tol);
+}
+
+// bool isEqual(Vec2f, Vec2f, tol)
+inline varying bool isEqual(const varying Vec2f v0, const varying Vec2f v1, const varying float tol)
+{
+    return isEqual(v0.x, v1.x, tol) && isEqual(v0.y, v1.y, tol);
+}
+
+// bool isEqual(Vec2f, Vec2f)
+inline uniform bool isEqual(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return isEqual(v0, v1, sEpsilon);
+}
+
+// bool isEqual(Vec2f, Vec2f)
+inline varying bool isEqual(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return isEqual(v0, v1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Vec2f, Vec2f, tol)
+inline uniform bool isEqualFixedEps(const uniform Vec2f v0, const uniform Vec2f v1, const uniform float tol)
+{
+    return isEqualFixedEps(v0.x, v1.x, tol) && isEqualFixedEps(v0.y, v1.y, tol);
+}
+
+// bool isEqualFixedEps(Vec2f, Vec2f, tol)
+inline varying bool isEqualFixedEps(const varying Vec2f v0, const varying Vec2f v1, const varying float tol)
+{
+    return isEqualFixedEps(v0.x, v1.x, tol) && isEqualFixedEps(v0.y, v1.y, tol);
+}
+
+// bool isEqualFixedEps(Vec2f, Vec2f)
+inline uniform bool isEqualFixedEps(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return isEqualFixedEps(v0, v1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Vec2f, Vec2f)
+inline varying bool isEqualFixedEps(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return isEqualFixedEps(v0, v1, sEpsilon);
+}
+
+// bool isZero(Vec2f, tol)
+inline uniform bool isZero(const uniform Vec2f v, const uniform float tol)
+{
+    return isZero(v.x, tol) && isZero(v.y, tol);
+}
+
+// bool isZero(Vec2f, tol)
+inline varying bool isZero(const varying Vec2f v, const varying float tol)
+{
+    return isZero(v.x, tol) && isZero(v.y, tol);
+}
+
+// bool isZero(Vec2f)
+inline uniform bool isZero(const uniform Vec2f v)
+{
+    return isZero(v, sEpsilon);
+}
+
+// bool isZero(Vec2f)
+inline varying bool isZero(const varying Vec2f v)
+{
+    return isZero(v, sEpsilon);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Common vector ops
+//--------------------------------------------------------------------------------------------------
+
+// Vec2f min(Vec2f, Vec2f)
+inline uniform Vec2f min(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(min(v0.x, v1.x), min(v0.y, v1.y));
+}
+
+// Vec2f min(Vec2f, Vec2f)
+inline varying Vec2f min(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(min(v0.x, v1.x), min(v0.y, v1.y));
+}
+
+// Vec2f max(Vec2f, Vec2f)
+inline uniform Vec2f max(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return Vec2f_ctor(max(v0.x, v1.x), max(v0.y, v1.y));
+}
+
+// Vec2f max(Vec2f, Vec2f)
+inline varying Vec2f max(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return Vec2f_ctor(max(v0.x, v1.x), max(v0.y, v1.y));
+}
+
+// Vec2f clamp(Vec2f, Vec2f lo, Vec2f hi)
+inline uniform Vec2f clamp(const uniform Vec2f v, const uniform Vec2f lo, const uniform Vec2f hi)
+{
+    return min(max(v, lo), hi);
+}
+
+// Vec2f clamp(Vec2f, Vec2f lo, Vec2f hi)
+inline varying Vec2f clamp(const varying Vec2f v, const varying Vec2f lo, const varying Vec2f hi)
+{
+    return min(max(v, lo), hi);
+}
+
+// Vec2f abs(Vec2f, Vec2f)
+inline uniform Vec2f abs(const uniform Vec2f v)
+{
+    return Vec2f_ctor(abs(v.x), abs(v.y));
+}
+
+// Vec2f abs(Vec2f, Vec2f)
+inline varying Vec2f abs(const varying Vec2f v)
+{
+    return Vec2f_ctor(abs(v.x), abs(v.y));
+}
+
+// Vec2f lerp(Vec2f, Vec2f, float)
+inline uniform Vec2f lerp(const uniform Vec2f v0, const uniform Vec2f v1, const uniform float t)
+{
+    return (1.0f - t) * v0 + t * v1;
+}
+
+// Vec2f lerp(Vec2f, Vec2f, float)
+inline varying Vec2f lerp(const varying Vec2f v0, const varying Vec2f v1, const varying float t)
+{
+    return (1.0f - t) * v0 + t * v1;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Length et al
+//--------------------------------------------------------------------------------------------------
+
+// float dot(Vec2f, Vec2f)
+inline uniform float dot(const uniform Vec2f v0, const uniform Vec2f v1)
+{
+    return v0.x*v1.x + v0.y*v1.y;
+}
+
+// float dot(Vec2f, Vec2f)
+inline varying float dot(const varying Vec2f v0, const varying Vec2f v1)
+{
+    return v0.x*v1.x + v0.y*v1.y;
+}
+
+// float lengthSqr(Vec2f)
+inline uniform float lengthSqr(const uniform Vec2f v)
+{
+    return dot(v, v);
+}
+
+// float lengthSqr(Vec2f)
+inline varying float lengthSqr(const varying Vec2f v)
+{
+    return dot(v, v);
+}
+
+// float length(Vec2f)
+inline uniform float length(const uniform Vec2f v)
+{
+    return sqrt(lengthSqr(v));
+}
+
+// float length(Vec2f)
+inline varying float length(const varying Vec2f v)
+{
+    return sqrt(lengthSqr(v));
+}
+
+// Vec2f normalize(Vec2f)
+inline uniform Vec2f normalize(const uniform Vec2f v)
+{
+    return v * (1.0f / length(v));
+}
+
+// Vec2f normalize(Vec2f)
+inline varying Vec2f normalize(const varying Vec2f v)
+{
+    return v * (1.0f / length(v));
+}
+
+// bool isNormalized(Vec2f)
+inline uniform bool isNormalized(const uniform Vec2f v)
+{
+    return isNormalizedLengthSqr(lengthSqr(v));
+}
+
+// bool isNormalized(Vec2f)
+inline varying bool isNormalized(const varying Vec2f v)
+{
+    return isNormalizedLengthSqr(lengthSqr(v));
+}
+

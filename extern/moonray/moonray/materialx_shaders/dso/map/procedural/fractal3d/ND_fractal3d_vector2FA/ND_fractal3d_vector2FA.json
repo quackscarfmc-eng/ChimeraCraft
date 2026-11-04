@@ -1,0 +1,47 @@
+{
+    "attributes" : 
+    {
+        "amplitudeAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amplitude",
+            "type" : "Float",
+            "comment" : "the center-to-peak amplitude of the fractal noise"
+        },
+        "octavesAttr" : 
+        {
+            "default" : "3",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "octaves",
+            "type" : "Int",
+            "comment" : "the number of octaves of Fractal noise to be generated"
+        },
+        "lacunarityAttr" : 
+        {
+            "default" : "2.0f",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "lacunarity",
+            "type" : "Float",
+            "comment" : "the exponential scale between successive octaves of Fractal noise"
+        },
+        "diminishAttr" : 
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "diminish",
+            "type" : "Float",
+            "comment" : "the rate at which noise amplitude is diminished for each octave of Fractal noise"
+        },
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position", 
+            "type" : "Vec3f",
+            "comment" : "the 3D position at which the fractal noise is evaluated"
+        }
+    },
+    "name" : "ND_fractal3d_vector2FA",
+    "type" : "Map"
+}

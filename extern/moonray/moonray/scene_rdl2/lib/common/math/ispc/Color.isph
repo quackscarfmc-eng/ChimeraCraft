@@ -1,0 +1,57 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Color.isph
+/// @brief
+/// implements a simple, syntantic alias of Color as a Col3f.
+#pragma once
+
+#include "Col3.isph"
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+// Color is a simple alias for Col3f
+typedef Col3f Color;
+
+//--------------------------------------------------------------------------------------------------
+// Constructors
+//--------------------------------------------------------------------------------------------------
+
+// Color = {f, f, f}
+inline uniform Color Color_ctor(const uniform float f)
+{
+    return Col3f_ctor(f);
+}
+
+// Color = {f, f, f}
+inline varying Color Color_ctor(const varying float f)
+{
+    return Col3f_ctor(f);
+}
+
+// Color = {r, g, b}
+inline uniform Color Color_ctor(const uniform float r, const uniform float g, const uniform float b)
+{
+    return Col3f_ctor(r, g, b);
+}
+
+// Color = {r, g, b}
+inline varying Color Color_ctor(const varying float r, const varying float g, const varying float b)
+{
+    return Col3f_ctor(r, g, b);
+}
+
+// Color = {a[0], a[1], a[2]}
+inline uniform Color Color_ctor(const uniform float a[])
+{
+    return Col3f_ctor(a);
+}
+
+// Color = {a[0], a[1], a[2]}
+inline varying Color Color_ctor(const varying float a[])
+{
+    return Col3f_ctor(a);
+}
+

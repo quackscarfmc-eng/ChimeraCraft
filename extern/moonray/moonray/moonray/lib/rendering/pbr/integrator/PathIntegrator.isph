@@ -1,0 +1,75 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+
+#pragma once
+
+#include "PathIntegrator.hh"
+
+#include <moonray/rendering/shading/ispc/bsdf/Bsdf.isph>
+
+struct BundledOcclRay;
+struct BsdfSlice;
+struct Color;
+struct Intersection;
+struct LightSet;
+struct PbrTLState;
+struct RayState;
+struct Rdl2LightSetList;
+struct Vec3f;
+
+// This is just a placeholder for now because
+// we do not do volume integration or shader evaluation
+// in ISPC.
+typedef int VolumeOverlapMode;
+
+struct PathIntegrator
+{
+    PATH_INTEGRATOR_MEMBERS;
+};
+
+inline uniform int
+PathIntegrator_getLightSampleCount(const uniform PathIntegrator * uniform this)
+{
+    return this->mLightSamples;
+}
+
+void computeRadianceBsdfMultiSampler(const uniform PathIntegrator * uniform this,
+                                     uniform PbrTLState * uniform pbrTls,
+                                     uniform ShadingTLState * uniform shadingTls,
+                                     const varying RayState * uniform rs,
+                                     const varying Intersection &isect,
+                                     const varying Bsdf &bsdf,
+                                     const varying BsdfSlice &slice,
+                                     varying bool doIndirect,
+                                     varying Flags indirectFlags,
+                                     const uniform LightSet &activeLightSet,
+                                     const varying Vec3f &cullingNormal,
+                                     varying float rayEpsilon,
+                                     varying float shadowRayEpsilon,
+                                     const varying Color &ssAov,
+                                     varying uint32_t &sequenceID,
+                                     const varying Rdl2LightSetList * uniform parentLobeLightSets);
+
+extern "C" void
+CPP_addOcclusionQueueEntries(           uniform PbrTLState *     uniform pbrTls,
+                                  const varying BundledOcclRay * uniform occlRays,
+                                        uniform uint32_t                 numOcclRays,
+                                  const uniform uint32_t *       uniform indices );
+
+extern "C" void
+CPP_addPresenceShadowsQueueEntries(      uniform PbrTLState *     uniform pbrTls,
+                                   const varying BundledOcclRay * uniform presenceShadowsRays,
+                                         uniform uint32_t                 numPresenceShadowsRays,
+                                   const uniform uint32_t *       uniform indices );
+
+extern "C" void
+CPP_addRayQueueEntries(       uniform PbrTLState *     uniform pbrTls,
+                        const varying RayState *       uniform rayStates,
+                              uniform uint32_t                 numRayStates,
+                        const uniform uint32_t *       uniform indices );
+
+extern "C" uniform bool
+CPP_isIntegratorAccumulatorRunning( uniform PbrTLState *uniform pbrTls );
+
+

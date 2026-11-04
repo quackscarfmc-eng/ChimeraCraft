@@ -1,0 +1,35 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Vec4f(0.0,0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Vec4f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "Vec4f(0.0,0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Vec4f"
+		}
+	},
+	"name" : "ND_multiply_vector4",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Vec4f"
+                }
+        }
+}

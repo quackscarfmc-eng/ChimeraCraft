@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+        "amountAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Vec2f"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_invert_vector2",
+    "type" : "Map"
+}

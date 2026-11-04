@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the Moonray Project
+
+add_subdirectory(ND_contrast_float)
+add_subdirectory(ND_contrast_vector2)
+add_subdirectory(ND_contrast_vector3)
+add_subdirectory(ND_contrast_vector4)
+add_subdirectory(ND_contrast_color3)
+add_subdirectory(ND_contrast_color4)
+add_subdirectory(ND_contrast_vector2FA)
+add_subdirectory(ND_contrast_vector3FA)
+add_subdirectory(ND_contrast_vector4FA)
+add_subdirectory(ND_contrast_color3FA)
+add_subdirectory(ND_contrast_color4FA)

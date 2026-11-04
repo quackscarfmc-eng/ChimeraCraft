@@ -1,0 +1,41 @@
+{
+    "attributes" : 
+    {
+        "sizeAttr" : 
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "size",
+            "type" : "Float"
+        },
+        "staggeredAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "staggered",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "uvoffsetAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvoffset",
+            "type" : "Vec2f"
+        },
+        "uvtilingAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvtiling",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_tiledcloverleafs_color3",
+    "type" : "Map"
+}

@@ -1,0 +1,42 @@
+{
+    "attributes" : 
+    {
+        "bgAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bg",
+            "type" : "Rgba"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fgAttr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "fg",
+            "type" : "Rgba"
+        },
+        "mixAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mix",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_overlay_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

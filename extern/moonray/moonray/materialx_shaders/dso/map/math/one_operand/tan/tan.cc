@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Contributors to the Moonray Project
+
+/// @file tan.cc
+
+#define OPERATION tan
+
+#include "../one_operand.cc"
+

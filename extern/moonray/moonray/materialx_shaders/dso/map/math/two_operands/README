@@ -1,0 +1,24 @@
+There are 115 shaders implemented by this one set of main source files. For
+this operations there are done on the component floats with the corresponding
+component on the second argument. The variants which end with FA use a single
+float to represent all of the components in the second argument.
+
+ND_<op>_<variant>
+
+                                             OP
+VARIANT    |add subtract multiply divide modulo atan2 power safepower min max
+float      | X | X      | X      | X    | X    | X   | X   | X       | X | X |
+vector2    | X | X      | X      | X    | X    | X   | X   | X       | X | X |
+vector3    | X | X      | X      | X    | X    | X   | X   | X       | X | X |
+vector4    | X | X      | X      | X    | X    | X   | X   | X       | X | X |
+color3     | X | X      | X      | X    | X    |     | X   | X       | X | X |
+color4     | X | X      | X      | X    | X    |     | X   | X       | X | X |
+matrix33   | X | X      | X      | X    |      |     |     |         |   |   |
+matrix44   | X | X      | X      | X    |      |     |     |         |   |   |
+vector2FA  | X | X      | X      | X    | X    |     | X   | X       | X | X |
+vector3FA  | X | X      | X      | X    | X    |     | X   | X       | X | X |
+vector4FA  | X | X      | X      | X    | X    |     | X   | X       | X | X |
+color3FA   | X | X      | X      | X    | X    |     | X   | X       | X | X |
+color4FA   | X | X      | X      | X    | X    |     | X   | X       | X | X |
+matrix33FA | X | X      |        |      |      |     |     |         |   |   |
+matrix44FA | X | X      |        |      |      |     |     |         |   |   |

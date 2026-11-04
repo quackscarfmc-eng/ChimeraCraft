@@ -1,0 +1,55 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "in1Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in1",
+            "type" : "Float"
+        },
+        "in2Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in2",
+            "type" : "Float"
+        },
+        "in3Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in3",
+            "type" : "Float"
+        },
+        "in4Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in4",
+            "type" : "Float"
+        },
+        "in5Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in5",
+            "type" : "Float"
+        },
+        "whichAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "which",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_switch_float",
+    "type" : "Map"
+}

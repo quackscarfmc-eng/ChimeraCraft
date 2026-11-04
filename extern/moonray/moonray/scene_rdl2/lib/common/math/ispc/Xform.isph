@@ -1,0 +1,439 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Xform.isph
+/// @brief
+/// defines the Xform3 types and methods
+/// @details
+/// An Xform3 is an affine function that contains a linear part (scale,
+/// rotation, shear) stored as a Mat3 and a non-linear translation stored
+/// as a Vec3.
+#pragma once
+
+#include "Mat3.isph"
+#include "Math.isph"
+#include "Quaternion.isph"
+#include "Vec3.isph"
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct Xform3f
+{
+    Mat3f l;
+    Vec3f p;
+};
+
+// Auxilliary type which stores a decomposed affine transformation (translate/rotate/scale)
+struct XformComponent3f
+{
+    Vec3f t;
+    Quaternion3f r;
+    Mat3f s; // <-- not sure why we need a matrix here
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constructors
+//--------------------------------------------------------------------------------------------------
+
+// Xform3f = {Mat3f, Vec3f}
+inline uniform Xform3f Xform3f_ctor(const uniform Mat3f l, const uniform Vec3f p)
+{
+    uniform Xform3f result;
+    result.l = l;
+    result.p = p;
+    return result;
+}
+
+// Xform3f = {Mat3f, Vec3f}
+inline varying Xform3f Xform3f_ctor(const varying Mat3f l, const varying Vec3f p)
+{
+    varying Xform3f result;
+    result.l = l;
+    result.p = p;
+    return result;
+}
+
+// Xform3f = {m00, ..., m22, t0, t1, t2}
+inline uniform Xform3f Xform3f_ctor(const uniform float m00, const uniform float m01, const uniform float m02,
+                                    const uniform float m10, const uniform float m11, const uniform float m12,
+                                    const uniform float m20, const uniform float m21, const uniform float m22,
+                                    const uniform float t0,  const uniform float t1,  const uniform float t2)
+{
+    return Xform3f_ctor( Mat3f_ctor(m00, m01, m02, m10, m11, m12, m20, m21, m22), Vec3f_ctor(t0, t1, t2) );
+}
+
+// Xform3f = {m00, ..., m22, t0, t1, t2}
+inline varying Xform3f Xform3f_ctor(const varying float m00, const varying float m01, const varying float m02,
+                                    const varying float m10, const varying float m11, const varying float m12,
+                                    const varying float m20, const varying float m21, const varying float m22,
+                                    const varying float t0,  const varying float t1,  const varying float t2)
+{
+    return Xform3f_ctor( Mat3f_ctor(m00, m01, m02, m10, m11, m12, m20, m21, m22), Vec3f_ctor(t0, t1, t2) );
+}
+
+// Xform3f = {Vec3f, Vec3f, Vec3f, Vec3f}
+inline uniform Xform3f Xform3f_ctor(const uniform Vec3f v0, const uniform Vec3f v1, const uniform Vec3f v2,
+                                    const uniform Vec3f t)
+{
+    return Xform3f_ctor(Mat3f_ctor(v0, v1, v2), t);
+}
+
+// Xform3f = {Vec3f, Vec3f, Vec3f, Vec3f}
+inline varying Xform3f Xform3f_ctor(const varying Vec3f v0, const varying Vec3f v1, const varying Vec3f v2,
+                                    const varying Vec3f t)
+{
+    return Xform3f_ctor(Mat3f_ctor(v0, v1, v2), t);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Accessors
+//--------------------------------------------------------------------------------------------------
+
+// Vec3f row0(Xform3f)
+inline uniform Vec3f row0(const uniform Xform3f xform)
+{
+    return xform.l.vx;
+}
+
+// Vec3f row0(Xform3f)
+inline varying Vec3f row0(const varying Xform3f xform)
+{
+    return xform.l.vx;
+}
+
+// Vec3f row1(Xform3f)
+inline uniform Vec3f row1(const uniform Xform3f xform)
+{
+    return xform.l.vy;
+}
+
+// Vec3f row1(Xform3f)
+inline varying Vec3f row1(const varying Xform3f xform)
+{
+    return xform.l.vy;
+}
+
+// Vec3f row2(Xform3f)
+inline uniform Vec3f row2(const uniform Xform3f xform)
+{
+    return xform.l.vz;
+}
+
+// Vec3f row2(Xform3f)
+inline varying Vec3f row2(const varying Xform3f xform)
+{
+    return xform.l.vz;
+}
+
+// Vec3f row3(Xform3f)
+inline uniform Vec3f row3(const uniform Xform3f xform)
+{
+    return xform.p;
+}
+
+// Vec row3(Xform3f)
+inline varying Vec3f row3(const varying Xform3f xform)
+{
+    return xform.p;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Arithmetic
+//--------------------------------------------------------------------------------------------------
+
+// Xform3f = Xform3f + Xform3f
+inline uniform Xform3f operator+(const uniform Xform3f xform0, const uniform Xform3f xform1)
+{
+    return Xform3f_ctor(xform0.l + xform1.l, xform0.p + xform1.p);
+}
+
+// Xform3f = Xform3f + Xform3f
+inline varying Xform3f operator+(const varying Xform3f xform0, const varying Xform3f xform1)
+{
+    return Xform3f_ctor(xform0.l + xform1.l, xform0.p + xform1.p);
+}
+
+// Xform3f = Xform3f - Xform3f
+inline uniform Xform3f operator-(const uniform Xform3f xform0, const uniform Xform3f xform1)
+{
+    return Xform3f_ctor(xform0.l - xform1.l, xform0.p - xform1.p);
+}
+
+// Xform3f = Xform3f - Xform3f
+inline varying Xform3f operator-(const varying Xform3f xform0, const varying Xform3f xform1)
+{
+    return Xform3f_ctor(xform0.l - xform1.l, xform0.p - xform1.p);
+}
+
+// Xform3f = float * Xform3f
+inline uniform Xform3f operator*(const uniform float f, const uniform Xform3f xform)
+{   
+    uniform Xform3f result = {f*xform.l, f*xform.p};
+    return result;
+}
+
+// Xform3f = float * Xform3f
+inline varying Xform3f operator*(const varying float f, const varying Xform3f xform)
+{   
+    varying Xform3f result = {f*xform.l, f*xform.p};
+    return result;
+}
+
+// Xform3f = Xform3f * Xform3f
+inline uniform Xform3f operator*(const uniform Xform3f xform0, const uniform Xform3f xform1)
+{   
+    uniform Xform3f result = {xform0.l * xform1.l, xform0.p * xform1.l + xform1.p};
+    return result;
+}
+
+// Xform3f = Xform3f * Xform3f
+inline varying Xform3f operator*(const varying Xform3f xform0, const varying Xform3f xform1)
+{   
+    varying Xform3f result = {xform0.l * xform1.l, xform0.p * xform1.l + xform1.p};
+    return result;
+}
+
+// Xform inverse(Xform3f)
+inline uniform Xform3f inverse(const uniform Xform3f xform)
+{
+    uniform Mat3f lInv = inverse(xform.l);
+    return Xform3f_ctor(lInv, neg(xform.p) * lInv);
+}
+
+// Xform inverse(Xform3f)
+inline varying Xform3f inverse(const varying Xform3f xform)
+{
+    varying Mat3f lInv = inverse(xform.l);
+    return Xform3f_ctor(lInv, neg(xform.p) * lInv);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Equality
+//--------------------------------------------------------------------------------------------------
+
+// bool isEqual(Xform3f, Xform3f, float);
+inline uniform bool isEqual(const uniform Xform3f xform0, const uniform Xform3f xform1, const uniform float tol)
+{
+    return isEqual(xform0.l, xform1.l, tol) && isEqual(xform0.p, xform1.p, tol);
+}
+
+// bool isEqual(Xform3f, Xform3f, float);
+// I don't believe you'd ever need to pass a "varying" tolerance
+inline varying bool isEqual(const varying Xform3f xform0, const varying Xform3f xform1, const varying float tol)
+{
+    return isEqual(xform0.l, xform1.l, tol) && isEqual(xform0.p, xform1.p, tol);
+}
+
+// bool isEqual(Xform3f, Xform3f);
+inline uniform bool isEqual(const uniform Xform3f xform0, const uniform Xform3f xform1)
+{
+    return isEqual(xform0, xform1, sEpsilon);
+}
+
+// bool isEqual(Xform3f, Xform3f);
+inline varying bool isEqual(const varying Xform3f xform0, const varying Xform3f xform1)
+{
+    return isEqual(xform0, xform1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Xform3f, Xform3f, float);
+inline uniform bool isEqualFixedEps(const uniform Xform3f xform0, const uniform Xform3f xform1, const uniform float tol)
+{
+    return isEqualFixedEps(xform0.l, xform1.l, tol) && isEqualFixedEps(xform0.p, xform1.p, tol);
+}
+
+// bool isEqualFixedEps(Xform3f, Xform3f, float);
+// I don't believe you'd ever need to pass a "varying" tolerance
+inline varying bool isEqualFixedEps(const varying Xform3f xform0, const varying Xform3f xform1, const varying float tol)
+{
+    return isEqualFixedEps(xform0.l, xform1.l, tol) && isEqualFixedEps(xform0.p, xform1.p, tol);
+}
+
+// bool isEqualFixedEps(Xform3f, Xform3f);
+inline uniform bool isEqualFixedEps(const uniform Xform3f xform0, const uniform Xform3f xform1)
+{
+    return isEqualFixedEps(xform0, xform1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Xform3f, Xform3f);
+inline varying bool isEqualFixedEps(const varying Xform3f xform0, const varying Xform3f xform1)
+{
+    return isEqualFixedEps(xform0, xform1, sEpsilon);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Transformations
+//--------------------------------------------------------------------------------------------------
+
+// Xform3f Xform3f_identity()
+// Note: we can only define the uniform version, since overloaded funcitons cannot differ by return type alone.
+// For the varying case, we rely on the compiler to convert to varying when the LHS of the assignment is varying.
+inline uniform Xform3f Xform3f_identity()
+{
+    return Xform3f_ctor(Mat3f_identity(), Vec3f_ctor(0.0f));
+}
+
+// setToIdentity(Xform3f)
+inline void setToIdentity(uniform Xform3f &xform)
+{
+    xform = Xform3f_identity();
+}
+
+// setToIdentity(Xform3f)
+inline void setToIdentity(varying Xform3f &xform)
+{
+    xform = Xform3f_identity();
+}
+
+// Xform3f Xform3f_translate(Vec3f)
+inline uniform Xform3f Xform3f_translate(const uniform Vec3f t)
+{
+    return Xform3f_ctor(Mat3f_identity(), t);
+}
+
+// Xform3f Xform3f_translate(Vec3f)
+inline varying Xform3f Xform3f_translate(const varying Vec3f t)
+{
+    return Xform3f_ctor(Mat3f_identity(), t);
+}
+
+// setToTranslation(Xform3f, Vec3f)
+inline void setToTranslation(uniform Xform3f &xform, const uniform Vec3f t)
+{
+    xform = Xform3f_translate(t);
+}
+
+// setToTranslation(Xform3f, Vec3f)
+inline void setToTranslation(varying Xform3f &xform, const varying Vec3f t)
+{
+    xform = Xform3f_translate(t);
+}
+
+// Xform3f Xform3f_rotate(Vec3f axis, float angle)
+inline uniform Xform3f Xform3f_rotate(const uniform Vec3f axis, const uniform float angle)
+{
+    return Xform3f_ctor(Mat3f_rotate(axis,angle), Vec3f_ctor(0.0f));
+}
+
+// Xform3f Xform3f_rotate(Vec3f axis, float angle)
+inline varying Xform3f Xform3f_rotate(const varying Vec3f axis, const varying float angle)
+{
+    return Xform3f_ctor(Mat3f_rotate(axis,angle), Vec3f_ctor(0.0f));
+}
+
+// setToRotation(Xform3f, Vec3f axis, float angle)
+inline void setToRotation(uniform Xform3f &xform, const uniform Vec3f axis, const uniform float angle)
+{
+    xform = Xform3f_rotate(axis, angle);
+}
+
+// setToRotation(Xform3f, Vec3f axis, float angle)
+inline void setToRotation(varying Xform3f &xform, const varying Vec3f axis, const varying float angle)
+{
+    xform = Xform3f_rotate(axis, angle);
+}
+
+// Xform3f Xform3f_scale(Vec3f)
+inline uniform Xform3f Xform3f_scale(const uniform Vec3f scale)
+{
+    return Xform3f_ctor(Mat3f_scale(scale), Vec3f_ctor(0.0f));
+}
+
+// Xform3f Xform3f_scale(Vec3f)
+inline varying Xform3f Xform3f_scale(const varying Vec3f scale)
+{
+    return Xform3f_ctor(Mat3f_scale(scale), Vec3f_ctor(0.0f));
+}
+
+// setToScale(Xform3f, Vec3f)
+inline void setToScale(uniform Xform3f &xform, const uniform Vec3f scale)
+{
+    xform = Xform3f_scale(scale);
+}
+
+// setToScale(Xform3f, Vec3f)
+inline void setToScale(varying Xform3f &xform, const varying Vec3f scale)
+{
+    xform = Xform3f_scale(scale);
+}
+
+// Xform3f lookAtPoint(Vec3f eye, Vec3f point, Vec3f up)
+inline uniform Xform3f lookAtPoint(const uniform Vec3f eye, const uniform Vec3f point, const uniform Vec3f up)
+{
+    const uniform Vec3f z = normalize(eye - point);
+    const uniform Vec3f u = normalize(cross(up, z));
+    const uniform Vec3f v = normalize(cross(z, u));
+    return Xform3f_ctor(u, v, z, eye);
+}
+
+// Xform3f lookAtPoint(Vec3f eye, Vec3f point, Vec3f up)
+inline varying Xform3f lookAtPoint(const varying Vec3f eye, const varying Vec3f point, const varying Vec3f up)
+{
+    const varying Vec3f z = normalize(eye - point);
+    const varying Vec3f u = normalize(cross(up, z));
+    const varying Vec3f v = normalize(cross(z, u));
+    return Xform3f_ctor(u, v, z, eye);
+}
+
+// Vec3f transformPoint(Xform3f, Vec3f)
+inline uniform Vec3f transformPoint(const uniform Xform3f xform, const uniform Vec3f point)
+{
+    return transform(xform.l, point) + xform.p;
+}
+
+// Vec3f transformPoint(Xform3f, Vec3f)
+inline varying Vec3f transformPoint(const varying Xform3f xform, const varying Vec3f point)
+{
+    return transform(xform.l, point) + xform.p;
+}
+
+// Vec3f transformVector(Xform3f, Vec3f)
+// Transform vec ignoring the translation part of xform
+inline uniform Vec3f transformVector(const uniform Xform3f xform, const uniform Vec3f vec)
+{
+    return transform(xform.l, vec);
+}
+
+// Vec3f transformVector(Xform3f, Vec3f)
+// Transform vec ignoring the translation part of xform
+inline varying Vec3f transformVector(const varying Xform3f xform, const varying Vec3f vec)
+{
+    return transform(xform.l, vec);
+}
+
+// Vec3f transformNormal(Xform3f, Vec3f)
+// Transform a Vec3 as a normal. We assume the xform matrix has already been inverted
+inline uniform Vec3f transformNormal(const uniform Xform3f xform, const uniform Vec3f normal)
+{
+    return transformNormal(xform.l, normal);
+}
+
+// Vec3f transformNormal(Xform3f, Vec3f)
+// Transform a Vec3 as a normal. We assume the xform matrix has already been inverted
+inline varying Vec3f transformNormal(const varying Xform3f xform, const varying Vec3f normal)
+{
+    return transformNormal(xform.l, normal);
+}
+
+// Xform3f slerp(XformComponent3f, XformComponent3f, float)
+inline uniform Xform3f slerp(const uniform XformComponent3f xform0, const uniform XformComponent3f xform1,
+                             uniform float u)
+{
+    const uniform Vec3f t = lerp(xform0.t, xform1.t, u);
+    const uniform Quaternion3f r = normalize(slerp(xform0.r, xform1.r, u));
+    const uniform Mat3f s = lerp(xform0.s, xform1.s, u);
+    return Xform3f_ctor(s * Mat3f_ctor(r), t);
+}
+
+// Xform3f slerp(XformComponent3f, XformComponent3f, float)
+inline varying Xform3f slerp(const varying XformComponent3f xform0, const varying XformComponent3f xform1,
+                             varying float u)
+{
+    const varying Vec3f t = lerp(xform0.t, xform1.t, u);
+    const varying Quaternion3f r = normalize(slerp(xform0.r, xform1.r, u));
+    const varying Mat3f s = lerp(xform0.s, xform1.s, u);
+    return Xform3f_ctor(s * Mat3f_ctor(r), t);
+}
+

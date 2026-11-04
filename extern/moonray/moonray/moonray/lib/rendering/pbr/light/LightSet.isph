@@ -1,0 +1,228 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+
+#pragma once
+
+#include "Light.isph"
+#include "LightSet.hh"
+#include "LightAccelerator.isph"
+
+#include <moonray/rendering/pbr/sampler/SequenceID.isph>
+#include <scene_rdl2/common/platform/Platform.isph>
+#include <scene_rdl2/common/math/ispc/Color.isph>
+
+//----------------------------------------------------------------------------
+
+struct PathVertex;
+
+// - pdf is the pdf of this sample for the intersected light
+// - Li is the emitted radiance of the intersected light
+//   in direction wi, and 0 if there is no light in that direction
+//   TODO: or if the intersected light is not in the subset
+struct LightContribution {
+    bool isInvalid;
+    const Light* light;
+    float distance;
+    float pdf;
+    Color Li;
+};
+
+
+///
+/// @struct LightSet LightSet.h <pbr/LightSet.isph>
+/// @brief A light set is a list of lights that should shine! This is distinct
+///        from an rdl2 LightSet in that lights which can't illuminate the point/
+///        normal we are shading won't get added to this set.
+///
+struct LightSet
+{
+    LIGHT_SET_MEMBERS;
+};
+
+
+
+//----------------------------------------------------------------------------
+
+inline void
+LightSet_init(uniform LightSet * uniform lightSet,
+        const uniform Light * const uniform * uniform lights,
+        uniform int lightCount,
+        const uniform LightFilterList * const uniform * uniform lightFilterLists)
+{
+    lightSet->mLights = lights;
+    lightSet->mLightCount = lightCount;
+    lightSet->mLightFilterLists = lightFilterLists;
+}
+
+
+inline uniform int LightSet_getLightCount(const uniform LightSet * uniform lightSet)
+{
+    return lightSet->mLightCount;
+}
+
+
+inline const uniform Light * uniform LightSet_getLight(
+        const uniform LightSet * uniform lightSet, uniform int index)
+{
+    return lightSet->mLights[index];
+}
+
+inline const uniform Light * varying LightSet_getLight(
+        const uniform LightSet * uniform lightSet, varying int index)
+{
+    return lightSet->mLights[index];
+}
+
+inline const uniform LightFilterList * uniform LightSet_getLightFilterList(
+        const uniform LightSet * uniform lightSet, uniform int index)
+{
+    return lightSet->mLightFilterLists[index];
+}
+
+inline const uniform LightFilterList * varying LightSet_getLightFilterList(
+        const uniform LightSet * uniform lightSet, varying int index)
+{
+    return lightSet->mLightFilterLists[index];
+}
+
+inline const uniform LightAccelerator * uniform 
+LightSet_getAccelerator(const uniform LightSet * uniform lightSet) 
+{ 
+    return lightSet->mAccelerator; 
+}
+
+inline const uniform int * uniform 
+LightSet_getLightIdMap(const uniform LightSet * uniform lightSet) 
+{ 
+    return lightSet->mAcceleratorLightIdMap; 
+}
+
+// Set the accelerator for this light set. The accelerator may contain more lights than the LightSet itself.
+// This is because the accelerator's light list is generated during render prep, and includes all of the original
+// lights specified in the rdl layer. The LightSet has some lights culled away during mcrt, so contains a subset
+// of those lights. We need to map the index of the lights in the LightAccelerator to the index of the light in
+// the LightSet. The lightIdMap does this. Lights that exist in the LightAccelerator but not in the LightSet are
+// mapped to -1.
+inline void LightSet_setAccelerator(uniform LightSet * uniform lightSet,
+        const uniform LightAccelerator * uniform accelerator,
+        const uniform int * uniform lightIdMap)
+{
+    lightSet->mAccelerator = accelerator;
+    lightSet->mAcceleratorLightIdMap = lightIdMap;
+}
+
+inline uniform int
+LightSet_getAccLightCount(const uniform LightSet * uniform lightSet)
+{
+    return LightAccelerator_getLightCount(lightSet->mAccelerator);
+}
+
+inline bool
+LightSet_lightIsActive(const uniform LightSet * uniform lightSet, uniform int i)
+{
+    return lightSet->mAcceleratorLightIdMap[i] != -1;
+}
+
+inline const uniform Light *
+LightSet_getLightFromAcc(const uniform LightSet * uniform lightSet, uniform int i)
+{
+    return LightAccelerator_getLight(lightSet->mAccelerator, i);
+}
+
+
+//----------------------------------------------------------------------------
+
+// Returns the index of a light chosen randomly from among those that
+// intersect the ray(P, wi), within maxDistance. It returns -1 if no light was
+// intersected.
+varying int LightSet_intersect(uniform PbrTLState * uniform pbrTls,
+        const uniform LightSet * uniform lightSet,
+        const varying Vec3f &P, const varying Vec3f &cullingNormal, const varying Vec3f &wi,
+        varying float time, varying float maxDistance,
+        varying bool includeRayTerminationLights, varying IntegratorSample1D &samples, varying int depth,
+        varying int visibilityMask, varying LightIntersection &chosenIsect, varying int &numHits,
+        varying intptr_t bsdfLobeLightSet,
+        const varying Rdl2LightSetList * uniform parentLobeLightSets);
+
+// Intersects the given ray (P, wi), choosing randomly among the lights in the
+// LightSet intersected by the ray. Fills up the LightContribution structure with the
+// results. randVar should be passed a random value in [0,1).
+void LightSet_intersectAndEval(uniform PbrTLState * uniform pbrTls,
+        const uniform LightSet * uniform lightSet,
+        uniform ShadingTLState * uniform tls,
+        const varying Vec3f &P, const varying Vec3f &cullingNormal, const varying Vec3f &wi,
+        const varying LightFilterRandomValues &filterR, varying float time,
+        const varying PathVertex * uniform pv,
+        uniform bool fromCamera, varying bool includeRayTerminationLights,
+        varying IntegratorSample1D &samples, varying int depth,
+        varying int visibilityMask, varying LightContribution &lCo, varying float rayDirFootprint,
+        varying intptr_t bsdfLobeLightSet,
+        const varying Rdl2LightSetList * uniform parentLobeLightSets);
+
+//----------------------------------------------------------------------------
+
+extern "C" uniform bool
+CPP_LobeLightSetContainsLight(uniform intptr_t lobeLightSet,
+                              uniform intptr_t rdlLight);
+
+inline
+varying bool lobeLightSetContains(varying intptr_t lobeLightSet,
+                                  uniform intptr_t rdlLight)
+{
+    varying bool containsVarying = false;
+    foreach_active(lane) {
+        uniform intptr_t lightSetPtr = extract(lobeLightSet, lane);
+        uniform bool contains = CPP_LobeLightSetContainsLight(lightSetPtr, rdlLight);
+        if (contains) {
+            containsVarying = insert(containsVarying, lane, true);
+        }
+    }
+    return containsVarying;
+}
+
+inline
+varying bool allLightSetsContain(const varying Rdl2LightSetList * uniform parentLobeLightSets,
+                                 uniform intptr_t rdlLight)
+{
+    varying bool containsVarying = true;
+    foreach_active(lane) {
+        uniform int numLightSets = extract(parentLobeLightSets->mNumLightSets, lane);
+
+        for (uniform int lsi = 0; lsi < numLightSets; lsi++) {
+            uniform uint32_t lightSetPtrLo = extract(parentLobeLightSets->mLightSetsPtrLo[lsi], lane);
+            uniform uint32_t lightSetPtrHi = extract(parentLobeLightSets->mLightSetsPtrHi[lsi], lane);
+            uniform intptr_t lightSetPtr = (((intptr_t) lightSetPtrHi) << 32) | (intptr_t) lightSetPtrLo;
+            uniform bool contains = CPP_LobeLightSetContainsLight(lightSetPtr, rdlLight);
+            if (!contains) {
+                containsVarying = insert(containsVarying, lane, false);
+                break;
+            }
+        }
+    }
+    return containsVarying;
+}
+
+inline
+void copyRdl2LightSetList(const varying Rdl2LightSetList * uniform srcList,
+                          varying Rdl2LightSetList * uniform dstList)
+{
+    varying int numLightSets = srcList->mNumLightSets;
+    dstList->mNumLightSets = numLightSets;
+    for (varying int lsi = 0; lsi < numLightSets; lsi++) {
+        dstList->mLightSetsPtrLo[lsi] = srcList->mLightSetsPtrLo[lsi];
+        dstList->mLightSetsPtrHi[lsi] = srcList->mLightSetsPtrHi[lsi];
+    }
+}
+
+inline
+void appendLobeLightSet(varying Rdl2LightSetList * uniform dstList,
+                        varying intptr_t lobeLightSet)
+{
+    varying int numLightSets = dstList->mNumLightSets;
+    if (lobeLightSet != 0 && numLightSets < MAX_LIGHTSET_LIST_LIGHTSETS) {
+        dstList->mLightSetsPtrLo[numLightSets] = (uint32_t)(lobeLightSet);
+        dstList->mLightSetsPtrHi[numLightSets] = (uint32_t)(lobeLightSet >> 32);
+        dstList->mNumLightSets++;
+    }
+}

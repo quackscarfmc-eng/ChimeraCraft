@@ -1,0 +1,35 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec4f"
+        },
+        "matAttr" : 
+        {
+            "default" : "Mat4f(1.0, 0.0, 0.0, 0.0,   0.0, 1.0, 0.0, 0.0,   0.0, 0.0, 1.0, 0.0,   0.0, 0.0, 0.0, 1.0)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mat",
+            "type" : "Mat4f"
+        }
+    },
+    "name" : "ND_transformmatrix_vector4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Vec4f"
+        }
+    },
+    "type" : "Map"
+}

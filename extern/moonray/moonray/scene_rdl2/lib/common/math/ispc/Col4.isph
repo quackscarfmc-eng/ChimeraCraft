@@ -1,0 +1,245 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Col4.isph
+/// @brief
+/// defines the 4-channel rgba Col4 types and methods
+#pragma once
+
+#include "Constants.isph"
+#include "Math.isph"
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct Col4f
+{
+    float r;
+    float g;
+    float b;
+    float a;
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constructors
+//--------------------------------------------------------------------------------------------------
+
+// Col4f = {r, g, b, a}
+inline uniform Col4f Col4f_ctor(const uniform float r, const uniform float g,
+                                const uniform float b, const uniform float a)
+{
+    uniform Col4f result;
+    result.r = r;
+    result.g = g;
+    result.b = b;
+    result.a = a;
+    return result;
+}
+
+// Col4f = {r, g, b, a}
+inline varying Col4f Col4f_ctor(const varying float r, const varying float g,
+                                const varying float b, const varying float a)
+{
+    varying Col4f result;
+    result.r = r;
+    result.g = g;
+    result.b = b;
+    result.a = a;
+    return result;
+}
+
+// Col4f = {f, f, f, f}
+inline uniform Col4f Col4f_ctor(const uniform float f)
+{
+    return Col4f_ctor(f, f, f, f);
+}
+
+// Col4f = {f, f, f, f}
+inline varying Col4f Col4f_ctor(const varying float f)
+{
+    return Col4f_ctor(f, f, f, f);
+}
+
+// Col4f = {a[0], a[1], a[2], a[3]}
+inline uniform Col4f Col4f_ctor(const uniform float a[])
+{
+    return Col4f_ctor(a[0], a[1], a[2], a[3]);
+}
+
+// Col4f = {a[0], a[1], a[2], a[3]}
+inline varying Col4f Col4f_ctor(const varying float a[])
+{
+    return Col4f_ctor(a[0], a[1], a[2], a[3]);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Arithmetic
+//--------------------------------------------------------------------------------------------------
+
+// Col4f = Col4f + Col4f
+inline uniform Col4f operator+(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return Col4f_ctor(c0.r+c1.r, c0.g+c1.g, c0.b+c1.b, c0.a+c1.a);
+}
+
+// Col4f = Col4f + Col4f
+inline varying Col4f operator+(const varying Col4f c0, const varying Col4f c1)
+{
+    return Col4f_ctor(c0.r+c1.r, c0.g+c1.g, c0.b+c1.b, c0.a+c1.a);
+}
+
+// Col4f = Col4f - Col4f
+inline uniform Col4f operator-(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return Col4f_ctor(c0.r-c1.r, c0.g-c1.g, c0.b-c1.b, c0.b-c1.b);
+}
+
+// Col4f = Col4f - Col4f
+inline varying Col4f operator-(const varying Col4f c0, const varying Col4f c1)
+{
+    return Col4f_ctor(c0.r-c1.r, c0.g-c1.g, c0.b-c1.b, c0.b-c1.b);
+}
+
+// Col4f = Col4f * Col4f
+inline uniform Col4f operator*(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return Col4f_ctor(c0.r*c1.r, c0.g*c1.g, c0.b*c1.b, c0.a*c1.a);
+}
+
+// Col4f = Col4f * Col4f
+inline varying Col4f operator*(const varying Col4f c0, const varying Col4f c1)
+{
+    return Col4f_ctor(c0.r*c1.r, c0.g*c1.g, c0.b*c1.b, c0.a*c1.a);
+}
+
+// Col4f = float * Col4f
+inline uniform Col4f operator*(const uniform float f, const uniform Col4f c)
+{
+    return Col4f_ctor(f) * c;
+}
+
+// Col4f = float * Col4f
+inline varying Col4f operator*(const varying float f, const varying Col4f c)
+{
+    return Col4f_ctor(f) * c;
+}
+
+// Col4f = Col4f * float
+inline uniform Col4f operator*(const uniform Col4f c, const uniform float f)
+{
+    return f * c;
+}
+
+// Col4f = Col4f * float
+inline varying Col4f operator*(const varying Col4f c, const varying float f)
+{
+    return f * c;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Equality
+//--------------------------------------------------------------------------------------------------
+
+// bool isEqual(Col4f, Col4f, tol)
+inline uniform bool isEqual(const uniform Col4f c0, const uniform Col4f c1, const uniform float tol)
+{
+    return isEqual(c0.r, c1.r, tol) && isEqual(c0.g, c1.g, tol) && isEqual(c0.b, c1.b, tol) && isEqual(c0.a, c1.a, tol);
+}
+
+// bool isEqual(Col4f, Col4f, tol)
+inline varying bool isEqual(const varying Col4f c0, const varying Col4f c1, const varying float tol)
+{
+    return isEqual(c0.r, c1.r, tol) && isEqual(c0.g, c1.g, tol) && isEqual(c0.b, c1.b, tol) && isEqual(c0.a, c1.a, tol);
+}
+
+// bool isEqual(Col4f, Col4f)
+inline uniform bool isEqual(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return isEqual(c0, c1, sEpsilon);
+}
+
+// bool isEqual(Col4f, Col4f)
+inline varying bool isEqual(const varying Col4f c0, const varying Col4f c1)
+{
+    return isEqual(c0, c1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Col4f, Col4f, tol)
+inline uniform bool isEqualFixedEps(const uniform Col4f c0, const uniform Col4f c1, const uniform float tol)
+{
+    return isEqualFixedEps(c0.r, c1.r, tol) && isEqualFixedEps(c0.g, c1.g, tol) &&
+           isEqualFixedEps(c0.b, c1.b, tol) && isEqualFixedEps(c0.a, c1.a, tol);
+}
+
+// bool isEqualFixedEps(Col4f, Col4f, tol)
+inline varying bool isEqualFixedEps(const varying Col4f c0, const varying Col4f c1, const uniform float tol)
+{
+    return isEqualFixedEps(c0.r, c1.r, tol) && isEqualFixedEps(c0.g, c1.g, tol) &&
+           isEqualFixedEps(c0.b, c1.b, tol) && isEqualFixedEps(c0.a, c1.a, tol);
+}
+
+// bool isEqualFixedEps(Col4f, Col4f)
+inline uniform bool isEqualFixedEps(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return isEqualFixedEps(c0, c1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Col4f, Col4f)
+inline varying bool isEqualFixedEps(const varying Col4f c0, const varying Col4f c1)
+{
+    return isEqualFixedEps(c0, c1, sEpsilon);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Common math ops
+//--------------------------------------------------------------------------------------------------
+
+// Col4f min(Col4f, Col4f)
+inline uniform Col4f min(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return Col4f_ctor(min(c0.r, c1.r), min(c0.g, c1.g), min(c0.b, c1.b), min(c0.a, c1.a));
+}
+
+// Col4f min(Col4f, Col4f)
+inline varying Col4f min(const varying Col4f c0, const varying Col4f c1)
+{
+    return Col4f_ctor(min(c0.r, c1.r), min(c0.g, c1.g), min(c0.b, c1.b), min(c0.a, c1.a));
+}
+
+// Col4f max(Col4f, Col4f)
+inline uniform Col4f max(const uniform Col4f c0, const uniform Col4f c1)
+{
+    return Col4f_ctor(max(c0.r, c1.r), max(c0.g, c1.g), max(c0.b, c1.b), max(c0.a, c1.a));
+}
+
+// Col4f max(Col4f, Col4f)
+inline varying Col4f max(const varying Col4f c0, const varying Col4f c1)
+{
+    return Col4f_ctor(max(c0.r, c1.r), max(c0.g, c1.g), max(c0.b, c1.b), max(c0.a, c1.a));
+}
+
+// Col4f clamp(Col4f c, float lo, float hi)
+inline uniform Col4f clamp(const uniform Col4f c, const uniform float lo, const uniform float hi)
+{
+    return min(max(c, Col4f_ctor(lo)), Col4f_ctor(hi));
+}
+
+// Col4f clamp(Col4f c, float lo, float hi)
+inline varying Col4f clamp(const varying Col4f c, const uniform float lo, const uniform float hi)
+{
+    return min(max(c, Col4f_ctor(lo)), Col4f_ctor(hi));
+}
+
+// Col4f lerp(Col4f, Col4f, float)
+inline uniform Col4f lerp(const uniform Col4f c0, const uniform Col4f c1, const uniform float t)
+{
+    return (1.0f - t) * c0 + t * c1;
+}
+
+// Col4f lerp(Col4f, Col4f, float)
+inline varying Col4f lerp(const varying Col4f c0, const varying Col4f c1, const varying float t)
+{
+    return (1.0f - t) * c0 + t * c1;
+}
+

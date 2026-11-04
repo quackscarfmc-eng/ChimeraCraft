@@ -1,0 +1,35 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "geompropAttr" : 
+        {
+            "label" : "geomprop",
+            "name" : "geomprop",
+            "type" : "String"
+        },
+        "defaultAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "label" : "default",
+            "name" : "default",
+            "type" : "Rgba"
+        }
+    },
+    "name" : "ND_geompropvalue_color4",
+    "type" : "Map",
+    "outputAttributes" :
+    {
+        "outAttr" :
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    }
+}

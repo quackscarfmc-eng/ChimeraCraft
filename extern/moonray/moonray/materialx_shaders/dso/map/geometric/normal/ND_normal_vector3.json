@@ -1,0 +1,20 @@
+{
+    "attributes" : 
+    {
+	    "spaceAttr" : 
+	    {
+		    "default" : 0,
+		    "enum" : 
+		    {
+			    "model" : 0,
+			    "object" : 1,
+			    "world" : 2
+		    },
+		    "flags" : "FLAGS_ENUMERABLE",
+		    "name" : "space",
+		    "type" : "Int"
+	    }
+    },
+    "name" : "ND_normal_vector3",
+    "type" : "Map"
+}

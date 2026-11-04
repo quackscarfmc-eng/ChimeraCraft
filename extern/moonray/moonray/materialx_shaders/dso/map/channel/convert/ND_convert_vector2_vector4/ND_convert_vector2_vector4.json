@@ -1,0 +1,23 @@
+{
+	"attributes" : 
+	{
+		"inAttr" : 
+		{
+			"default" : "Vec2f(0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec2f"
+		}
+	},
+	"name" : "ND_convert_vector2_vector4",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"default" : "Vec4f(0.0f, 0.0f, 0.0f,0.0f)",
+			"name" : "out",
+			"type" : "Vec4f"
+		}
+	},
+	"type" : "Map"
+}

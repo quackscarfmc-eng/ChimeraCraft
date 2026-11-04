@@ -1,0 +1,15 @@
+There are 57 single operand shaders implemented by this one set of main
+source files. For this operations there are done on the component floats.
+The 3 starred cases (*) take a float in but produce an integer.
+
+ND_<op>_<variant>
+
+                                             OP
+VARIANT    |floor ceil round absval sign sin cos tan asin acos sqrt ln
+integer    | *X  | *X | *X  |      |    |   |   |   |    |    |    |
+float      |  X  |  X |  X  |  X   | X  | X | X | X |  X |  X |  X | X
+vector2    |  X  |  X |  X  |  X   | X  | X | X | X |  X |  X |  X | X
+vector3    |  X  |  X |  X  |  X   | X  | X | X | X |  X |  X |  X | X
+vector4    |  X  |  X |  X  |  X   | X  | X | X | X |  X |  X |  X | X
+color3     |  X  |  X |  X  |  X   | X  |   |   |   |    |    |    |
+color4     |  X  |  X |  X  |  X   | X  |   |   |   |    |    |    |

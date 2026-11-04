@@ -1,0 +1,23 @@
+{
+    "attributes" : 
+    {
+        "jitterAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "jitter",
+            "type" : "Float",
+            "comment" : "controls how much random jitter to apply to the feature positions to compute the Worley noise"
+        },
+        "texcoordAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord", 
+            "type" : "Vec2f",
+            "comment" : "the 2D texture coordinate at which the noise is evaluated"
+        }
+    },
+    "name" : "ND_worleynoise2d_float",
+    "type" : "Map"
+}

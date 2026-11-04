@@ -1,0 +1,20 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Mat4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Mat4f"
+        }
+    },
+    "name" : "ND_determinant_matrix44",
+    "type" : "Map"
+}

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the Moonray Project
+
+add_subdirectory(ND_safepower_float)
+add_subdirectory(ND_safepower_vector2)
+add_subdirectory(ND_safepower_vector3)
+add_subdirectory(ND_safepower_vector4)
+add_subdirectory(ND_safepower_color3)
+add_subdirectory(ND_safepower_color4)
+add_subdirectory(ND_safepower_vector2FA)
+add_subdirectory(ND_safepower_vector3FA)
+add_subdirectory(ND_safepower_vector4FA)
+add_subdirectory(ND_safepower_color3FA)
+add_subdirectory(ND_safepower_color4FA)

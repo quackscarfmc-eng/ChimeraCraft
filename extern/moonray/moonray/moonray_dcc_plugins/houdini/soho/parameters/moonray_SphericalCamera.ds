@@ -1,0 +1,443 @@
+#include "$HFS/houdini/soho/parameters/CommonMacros.ds"
+{
+    name	parameters
+    group {
+        name    "folder"
+        label   "Frustum"
+
+        parm {
+            name    "xn__moonraynear_control_16a"
+            label   "moonray:near"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "add"           "![BUTTONS_set_add]Add if Exists"
+                "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "near"
+            label   "Near"
+            type    float
+            default { "1" }
+            help    "Near clipping plane"
+            disablewhen "{ xn__moonraynear_control_16a == block } { xn__moonraynear_control_16a == none }"
+            range   { 0 10 }
+            parmtag { "usdvaluetype" "float" }
+        }
+        parm {
+            name    "xn__moonrayfar_control_f5a"
+            label   "moonray:far"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "add"           "![BUTTONS_set_add]Add if Exists"
+                "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "far"
+            label   "Far"
+            type    float
+            default { "10000" }
+            help    "Far clipping plane"
+            disablewhen "{ xn__moonrayfar_control_f5a == block } { xn__moonrayfar_control_f5a == none }"
+            range   { 0 10 }
+            parmtag { "usdvaluetype" "float" }
+        }
+    }
+
+    group {
+        name    "folder2"
+        label   "Motion Blur"
+
+        parm {
+            name    "xn__shutteropen_control_16a"
+            label   "shutter:open"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "add"           "![BUTTONS_set_add]Add if Exists"
+                "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "xn__shutteropen_0ta"
+            label   "Mb Shutter Open"
+            type    float
+            default { "-0.25" }
+            help    "Frame at which the shutter opens, i.e., the beginning of the motion blur interval."
+            disablewhen "{ xn__shutteropen_control_16a == block } { xn__shutteropen_control_16a == none }"
+            range   { 0 10 }
+            parmtag { "usdvaluetype" "float" }
+        }
+        parm {
+            name    "xn__shutterclose_control_o8a"
+            label   "shutter:close"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "add"           "![BUTTONS_set_add]Add if Exists"
+                "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "xn__shutterclose_nva"
+            label   "Mb Shutter Close"
+            type    float
+            default { "0.25" }
+            help    "Frame at which the shutter closes, i.e., the end of the motion blur interval."
+            disablewhen "{ xn__shutterclose_control_o8a == block } { xn__shutterclose_control_o8a == none }"
+            range   { 0 10 }
+            parmtag { "usdvaluetype" "float" }
+        }
+        parm {
+            name    "xn__moonraymb_shutter_bias_control_ypb"
+            label   "moonray:mb_shutter_bias"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "add"           "![BUTTONS_set_add]Add if Exists"
+                "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "mb_shutter_bias"
+            label   "Mb Shutter Bias"
+            type    float
+            default { "0" }
+            help    "Biases the motion blur samples toward one end of the shutter interval."
+            disablewhen "{ xn__moonraymb_shutter_bias_control_ypb == block } { xn__moonraymb_shutter_bias_control_ypb == none }"
+            range   { 0 10 }
+            parmtag { "usdvaluetype" "float" }
+        }
+    }
+
+    group {
+        name    "folder3"
+        label   "Render Masks"
+
+        parm {
+            name    "xn__moonraypixel_sample_map_control_lrb"
+            label   "moonray:pixel_sample_map"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "pixel_sample_map"
+            label   "Pixel Sample Map"
+            type    string
+            default { "" }
+            help    "Map indicating the number of pixel samples that should be used per pixel (in uniform sampling mode). This is a multiplier on the global pixel sample count specified in SceneVariables. If the provided map has incompatible dimensions, it will be resized."
+            disablewhen "{ xn__moonraypixel_sample_map_control_lrb == block } { xn__moonraypixel_sample_map_control_lrb == none }"
+            parmtag { "usdvaluetype" "string" }
+        }
+    }
+
+    group {
+        name    "folder4"
+        label   "Medium"
+
+        parm {
+            name    "xn__moonraymedium_material_control_ypb"
+            label   "moonray:medium_material"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "medium_material"
+            label   "Medium Material"
+            type    oppath
+            default { "" }
+            help    "The material the camera is 'inside'. If no medium_geometry is specified, ALL rays will have this initial index of refraction applied. "
+            disablewhen "{ xn__moonraymedium_material_control_ypb == block } { xn__moonraymedium_material_control_ypb == none }"
+            parmtag { "oprelative" "." }
+            parmtag { "usdvaluetype" "<class 'pxr.Usd.Relationship'>" }
+        }
+        parm {
+            name    "xn__moonraymedium_geometry_control_ypb"
+            label   "moonray:medium_geometry"
+            type    string
+            default { "none" }
+            menujoin {
+                "set"           "![BUTTONS_set_or_create]Set or Create"
+                "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+                "block"         "![BUTTONS_set_block]Block"
+                "none"          "![BUTTONS_set_nothing]Do Nothing"
+            }
+            parmtag { "sidefx::look" "icon" }
+        }
+        parm {
+            name    "medium_geometry"
+            label   "Medium Geometry"
+            type    oppath
+            default { "" }
+            help    "The geometry the camera is 'inside' to which you'd like the medium_material applied. (The use case for this is typically partially-submerged cameras)"
+            disablewhen "{ xn__moonraymedium_geometry_control_ypb == block } { xn__moonraymedium_geometry_control_ypb == none }"
+            parmtag { "oprelative" "." }
+            parmtag { "usdvaluetype" "<class 'pxr.Usd.Relationship'>" }
+        }
+    }
+
+    parm {
+        name    "xn__moonraymin_latitude_control_2kb"
+        label   "moonray:min_latitude"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "min_latitude"
+        label   "Min Latitude"
+        type    float
+        default { "-90" }
+        help    "Latitude corresponding to the bottom of the image"
+        disablewhen "{ xn__moonraymin_latitude_control_2kb == block } { xn__moonraymin_latitude_control_2kb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonraymax_latitude_control_2kb"
+        label   "moonray:max_latitude"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "max_latitude"
+        label   "Max Latitude"
+        type    float
+        default { "90" }
+        help    "Latitude corresponding to the top of the image"
+        disablewhen "{ xn__moonraymax_latitude_control_2kb == block } { xn__moonraymax_latitude_control_2kb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonraylatitude_zoom_offset_control_3xb"
+        label   "moonray:latitude_zoom_offset"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "latitude_zoom_offset"
+        label   "Latitude Zoom Offset"
+        type    float
+        default { "0" }
+        help    "Attribute for controlling the latitude of the center of zoom when the focal length is changed. By default, zooming will center around the mean of the min and max latitudes, but this behavior can be modified by supplying a non-zero offset which will be added to the mean and will reposition the zoom center."
+        disablewhen "{ xn__moonraylatitude_zoom_offset_control_3xb == block } { xn__moonraylatitude_zoom_offset_control_3xb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonraymin_longitude_control_pmb"
+        label   "moonray:min_longitude"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "min_longitude"
+        label   "Min Longitude"
+        type    float
+        default { "-180" }
+        help    "Longitude corresponding to the left of the image"
+        disablewhen "{ xn__moonraymin_longitude_control_pmb == block } { xn__moonraymin_longitude_control_pmb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonraymax_longitude_control_pmb"
+        label   "moonray:max_longitude"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "max_longitude"
+        label   "Max Longitude"
+        type    float
+        default { "180" }
+        help    "Longitude corresponding to the right of the image"
+        disablewhen "{ xn__moonraymax_longitude_control_pmb == block } { xn__moonraymax_longitude_control_pmb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonraylongitude_zoom_offset_control_qzb"
+        label   "moonray:longitude_zoom_offset"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "longitude_zoom_offset"
+        label   "Longitude Zoom Offset"
+        type    float
+        default { "0" }
+        help    "Attribute for controlling the longitude of the center of zoom when the focal length is changed. By default, zooming will center around the mean of the min and max longitudes, but this behavior can be modified by supplying a non-zero offset which will be added to the mean and will reposition the zoom center."
+        disablewhen "{ xn__moonraylongitude_zoom_offset_control_qzb == block } { xn__moonraylongitude_zoom_offset_control_qzb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "focalLength_control"
+        label   "focalLength"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "focalLength"
+        label   "Focal"
+        type    float
+        default { "30" }
+        help    "Focal length"
+        disablewhen "{ focalLength_control == block } { focalLength_control == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+    parm {
+        name    "xn__moonrayinside_out_control_thb"
+        label   "moonray:inside_out"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "inside_out"
+        label   "Inside Out"
+        type    toggle
+        default { "0" }
+        help    "Set to true if the rendered image is to be mapped onto the outside of a sphere, e.g. the Las Vegas Sphere."
+        disablewhen "{ xn__moonrayinside_out_control_thb == block } { xn__moonrayinside_out_control_thb == none }"
+        parmtag { "usdvaluetype" "bool" }
+    }
+    parm {
+        name    "xn__moonrayoffset_radius_control_pmb"
+        label   "moonray:offset_radius"
+        type    string
+        default { "none" }
+        menujoin {
+            "set"           "![BUTTONS_set_or_create]Set or Create"
+            "setexisting"   "![BUTTONS_set_if_exists]Set if Exists"
+            "add"           "![BUTTONS_set_add]Add if Exists"
+            "multiply"      "![BUTTONS_set_multiply]Multiply if Exists"
+            "block"         "![BUTTONS_set_block]Block"
+            "none"          "![BUTTONS_set_nothing]Do Nothing"
+        }
+        parmtag { "sidefx::look" "icon" }
+    }
+    parm {
+        name    "offset_radius"
+        label   "Offset Radius"
+        type    float
+        default { "0" }
+        help    "If using the [\"inside_out\"] attribute, set this value to a radius large enough to encompass all the geometry you wish to capture."
+        disablewhen "{ xn__moonrayoffset_radius_control_pmb == block } { xn__moonrayoffset_radius_control_pmb == none }"
+        range   { 0 10 }
+        parmtag { "usdvaluetype" "float" }
+    }
+}

@@ -1,0 +1,1 @@
+All participants agree to abide by LF Projects Code of Conduct (as defined in the [charter](https://github.com/AcademySoftwareFoundation/foundation/blob/main/project_charters/moonray_charter.pdf)) available at https://lfprojects.org/policies/code-of-conduct/

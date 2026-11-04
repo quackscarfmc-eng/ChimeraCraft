@@ -1,0 +1,11 @@
+# Copyright 2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+# A rect light reflected in a mirror with 0.5 presence.
+# Tests that reflective objects with presence render correcty.
+
+add_rats_test(
+    INPUTS scene.rdla
+    CANONICALS scene.exr
+)
+

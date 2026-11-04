@@ -1,0 +1,26 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "geompropAttr" : 
+        {
+            "label" : "geomprop",
+            "name" : "geomprop",
+            "type" : "String"
+        },
+        "defaultAttr" : 
+        {
+            "default" : "false",
+            "label" : "default",
+            "name" : "default",
+            "type" : "Bool"
+        }
+    },
+    "name" : "ND_geompropvalue_boolean",
+    "type" : "Map"
+}

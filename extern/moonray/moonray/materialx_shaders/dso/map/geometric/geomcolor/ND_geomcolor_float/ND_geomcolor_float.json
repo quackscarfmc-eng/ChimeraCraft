@@ -1,0 +1,14 @@
+{
+    "attributes" : 
+    {
+	    "indexAttr" : 
+	    {
+		    "default" : "0",
+		    "flags" : "FLAGS_BINDABLE",
+		    "name" : "index",
+		    "type" : "Int"
+	    }
+    },
+    "name" : "ND_geomcolor_float",
+    "type" : "Map"
+}

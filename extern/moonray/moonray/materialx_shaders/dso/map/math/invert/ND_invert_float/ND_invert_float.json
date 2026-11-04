@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+        "amountAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_invert_float",
+    "type" : "Map"
+}

@@ -1,0 +1,46 @@
+#include "$HFS/houdini/soho/parameters/CommonMacros.ds"
+{
+    name	parameters
+    parm {
+        name    "category"
+        label   "Category"
+        type    buttonstrip
+        default { "0" }
+        menu {
+            "Shader"        "Shader"
+            "Light"         "Light"
+            "Camera"        "Camera"
+            "Light Filter"  "Light Filter"
+            "Geometry"      "Geometry"
+        }
+    }
+    parm {
+        name    "primtype"
+        label   "Primitive Type"
+        type    string
+        default { "" }
+        menureplace {
+            [ "" ]
+            [ "        parm = hou.pwd().parm(\"category\")" ]
+            [ "        selected = parm.eval()" ]
+            [ "        tokens = parm.parmTemplate().menuItems()" ]
+            [ "        menulist = []" ]
+            [ "        token = tokens[selected]" ]
+            [ "        if token == \"Shader\":" ]
+            [ "            menulist = ['AttributeMap', 'AttributeMap', 'AxisAngleMap', 'AxisAngleMap', 'BaseVolume', 'BaseVolume', 'BlendMap', 'BlendMap', 'CheckerboardMap', 'CheckerboardMap', 'ClampMap', 'ClampMap', 'ColorCorrectContrastMap', 'ColorCorrectContrastMap', 'ColorCorrectGainOffsetMap', 'ColorCorrectGainOffsetMap', 'ColorCorrectGammaMap', 'ColorCorrectGammaMap', 'ColorCorrectHsvMap', 'ColorCorrectHsvMap', 'ColorCorrectHueShiftMap', 'ColorCorrectHueShiftMap', 'ColorCorrectLegacyMap', 'ColorCorrectLegacyMap', 'ColorCorrectMap', 'ColorCorrectMap', 'ColorCorrectSaturationMap', 'ColorCorrectSaturationMap', 'ColorCorrectTMIMap', 'ColorCorrectTMIMap', 'CombineDisplacement', 'CombineDisplacement', 'CombineNormalMap', 'CombineNormalMap', 'ConstantColorMap', 'ConstantColorMap', 'ConstantScalarMap', 'ConstantScalarMap', 'CurvatureMap', 'CurvatureMap', 'CutoutVolume', 'CutoutVolume', 'DebugMap', 'DebugMap', 'DeformationMap', 'DeformationMap', 'DirectionalMap', 'DirectionalMap', 'DistortNormalMap', 'DistortNormalMap', 'DwaAdjustMaterial', 'DwaAdjustMaterial', 'DwaBaseMaterial', 'DwaBaseMaterial', 'DwaColorCorrectMaterial', 'DwaColorCorrectMaterial', 'DwaEmissiveMaterial', 'DwaEmissiveMaterial', 'DwaFabricMaterial', 'DwaFabricMaterial', 'DwaLayerMaterial', 'DwaLayerMaterial', 'DwaMetalMaterial', 'DwaMetalMaterial', 'DwaMixMaterial', 'DwaMixMaterial', 'DwaRefractiveMaterial', 'DwaRefractiveMaterial', 'DwaSkinMaterial', 'DwaSkinMaterial', 'DwaSolidDielectricMaterial', 'DwaSolidDielectricMaterial', 'DwaSwitchMaterial', 'DwaSwitchMaterial', 'DwaToonMaterial', 'DwaToonMaterial', 'DwaTwoSidedMaterial', 'DwaTwoSidedMaterial', 'DwaVelvetMaterial_v2', 'DwaVelvetMaterial_v2', 'ExtraAovMap', 'ExtraAovMap', 'FloatToRgbMap', 'FloatToRgbMap', 'GradientMap', 'GradientMap', 'HairColorCorrectMaterial', 'HairColorCorrectMaterial', 'HairColorPresetsMap', 'HairColorPresetsMap', 'HairColumnMap', 'HairColumnMap', 'HairDiffuseMaterial', 'HairDiffuseMaterial', 'HairLayerMaterial', 'HairLayerMaterial', 'HairMap', 'HairMap', 'HairMaterial_v3', 'HairMaterial_v3', 'HairToonMaterial', 'HairToonMaterial', 'HsvToRgbMap', 'HsvToRgbMap', 'ImageMap', 'ImageMap', 'ImageNormalMap', 'ImageNormalMap', 'LODMap', 'LODMap', 'LayerMap', 'LayerMap', 'LayerMap_v2', 'LayerMap_v2', 'ListMap', 'ListMap', 'MultiChannelToFloatMap', 'MultiChannelToFloatMap', 'NoiseMap_v2', 'NoiseMap_v2', 'NoiseWorleyMap_v2', 'NoiseWorleyMap_v2', 'NoiseWorleyMap_v3', 'NoiseWorleyMap_v3', 'NormalDisplacement', 'NormalDisplacement', 'NormalToRgbMap', 'NormalToRgbMap', 'OpMap', 'OpMap', 'OpSqrtMap', 'OpSqrtMap', 'OpenVdbMap', 'OpenVdbMap', 'OpenVdbMap_v2', 'OpenVdbMap_v2', 'ProjectCameraMap', 'ProjectCameraMap', 'ProjectCameraMap_v2', 'ProjectCameraMap_v2', 'ProjectCameraNormalMap', 'ProjectCameraNormalMap', 'ProjectCylindricalMap', 'ProjectCylindricalMap', 'ProjectPlanarMap', 'ProjectPlanarMap', 'ProjectPlanarNormalMap', 'ProjectPlanarNormalMap', 'ProjectSphericalMap', 'ProjectSphericalMap', 'ProjectTriplanarMap', 'ProjectTriplanarMap', 'ProjectTriplanarMap_v2', 'ProjectTriplanarMap_v2', 'ProjectTriplanarNormalMap', 'ProjectTriplanarNormalMap', 'ProjectTriplanarNormalMap_v2', 'ProjectTriplanarNormalMap_v2', 'ProjectTriplanarUdimMap', 'ProjectTriplanarUdimMap', 'RampMap', 'RampMap', 'RandomMap', 'RandomMap', 'RandomNormalMap', 'RandomNormalMap', 'RaySwitchMaterial', 'RaySwitchMaterial', 'RemapMap', 'RemapMap', 'RgbToFloatMap', 'RgbToFloatMap', 'RgbToHsvMap', 'RgbToHsvMap', 'RgbToLabMap', 'RgbToLabMap', 'RgbToNormalMap', 'RgbToNormalMap', 'SwitchColorMap', 'SwitchColorMap', 'SwitchDisplacement', 'SwitchDisplacement', 'SwitchFloatMap', 'SwitchFloatMap', 'SwitchMaterial', 'SwitchMaterial', 'SwitchNormalMap', 'SwitchNormalMap', 'ToonMap', 'ToonMap', 'TransformNormalMap', 'TransformNormalMap', 'TransformSpaceMap', 'TransformSpaceMap', 'TwoSidedMap', 'TwoSidedMap', 'UVTransformMap', 'UVTransformMap', 'VectorDisplacement', 'VectorDisplacement', 'WireframeMap', 'WireframeMap']" ]
+            [ "        elif token == \"Light\":" ]
+            [ "            menulist = ['CylinderLight', 'CylinderLight', 'DiskLight', 'DiskLight', 'DistantLight', 'DistantLight', 'EnvLight', 'EnvLight', 'MeshLight', 'MeshLight', 'PortalLight', 'PortalLight', 'RectLight', 'RectLight', 'SphereLight', 'SphereLight', 'SpotLight', 'SpotLight']" ]
+            [ "        elif token == \"Camera\":" ]
+            [ "            menulist = ['BakeCamera', 'BakeCamera', 'DomeMaster3DCamera', 'DomeMaster3DCamera', 'FisheyeCamera', 'FisheyeCamera', 'OrthographicCamera', 'OrthographicCamera', 'PerspectiveCamera', 'PerspectiveCamera', 'SphericalCamera', 'SphericalCamera']" ]
+            [ "        elif token == \"Light Filter\":" ]
+            [ "            menulist = ['BarnDoorLightFilter', 'BarnDoorLightFilter', 'ColorRampLightFilter', 'ColorRampLightFilter', 'CombineLightFilter', 'CombineLightFilter', 'CookieLightFilter', 'CookieLightFilter', 'CookieLightFilter_v2', 'CookieLightFilter_v2', 'DecayLightFilter', 'DecayLightFilter', 'IntensityLightFilter', 'IntensityLightFilter', 'RodLightFilter', 'RodLightFilter', 'VdbLightFilter', 'VdbLightFilter']" ]
+            [ "        elif token == \"Geometry\":" ]
+            [ "            menulist = ['BoxGeometry', 'BoxGeometry', 'RdlCurveGeometry', 'RdlCurveGeometry', 'RdlInstancerGeometry', 'RdlInstancerGeometry', 'RdlMeshGeometry', 'RdlMeshGeometry', 'RdlPointGeometry', 'RdlPointGeometry', 'SphereGeometry', 'SphereGeometry', 'UsdGeometry', 'UsdGeometry', 'UsdInstanceGeometry', 'UsdInstanceGeometry', 'VdbGeometry', 'VdbGeometry']" ]
+            [ "        return menulist" ]
+            [ "        " ]
+            language python
+        }
+        parmtag { "script_callback" "hou.phm().wrapper(hou.pwd()).load_ds()" }
+        parmtag { "script_callback_language" "python" }
+    }
+}

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the Moonray Project
+
+add_subdirectory(acescg_to_lin_rec709)
+add_subdirectory(adobergb_to_lin_rec709)
+add_subdirectory(g18_rec709_to_lin_rec709)
+add_subdirectory(g22_ap1_to_lin_rec709)
+add_subdirectory(g22_rec709_to_lin_rec709)
+add_subdirectory(lin_adobergb_to_lin_rec709)
+add_subdirectory(lin_displayp3_to_lin_rec709)
+add_subdirectory(rec709_display_to_lin_rec709)
+add_subdirectory(srgb_displayp3_to_lin_rec709)
+add_subdirectory(srgb_texture_to_lin_rec709)

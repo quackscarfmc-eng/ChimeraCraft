@@ -1,0 +1,23 @@
+{
+    "attributes" : 
+    {
+        "jitterAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "jitter",
+            "type" : "Float",
+            "comment" : "controls how much random jitter to apply to the feature positions to compute the Worley noise"
+        },
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position", 
+            "type" : "Vec3f",
+            "comment" : "the 3D position at which the noise is evaluated"
+        }
+    },
+    "name" : "ND_worleynoise3d_vector2",
+    "type" : "Map"
+}

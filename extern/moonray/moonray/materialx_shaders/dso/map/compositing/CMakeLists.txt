@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Contributors to the Moonray Project
+
+add_subdirectory(burn)
+add_subdirectory(difference)
+add_subdirectory(disjointover)
+add_subdirectory(dodge)
+add_subdirectory(in)
+add_subdirectory(inside)
+add_subdirectory(mask)
+add_subdirectory(matte)
+add_subdirectory(minus)
+add_subdirectory(mix)
+add_subdirectory(out)
+add_subdirectory(outside)
+add_subdirectory(over)
+add_subdirectory(overlay)
+add_subdirectory(plus)
+add_subdirectory(premult)
+add_subdirectory(screen)
+add_subdirectory(unpremult)

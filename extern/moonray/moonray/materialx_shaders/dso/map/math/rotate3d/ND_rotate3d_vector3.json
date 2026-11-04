@@ -1,0 +1,35 @@
+{
+    "attributes" :
+    {
+        "amountAttr" :
+        {
+            "comment" : "the amount to rotate, specified in degrees, with positive values rotating the incoming vector counterclockwise",
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "axisAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "axis",
+            "type" : "Vec3f"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_rotate3d_vector3",
+    "type" : "Map"
+}

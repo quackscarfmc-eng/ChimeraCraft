@@ -1,0 +1,29 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"valueAttr" : 
+		{
+			"default" : "0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "value",
+			"type" : "Bool"
+		}
+	},
+	"name" : "ND_constant_boolean",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"default" : "0",
+			"name" : "out",
+			"type" : "Bool"
+		}
+	},
+	"type" : "Map"
+}

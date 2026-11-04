@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Contributors to the Moonray Project
+
+/// @file "MtlxHextile.isph"
+
+// Adapted from MtlX standard libs
+
+#pragma once
+
+#include <moonray/rendering/shading/ispc/MapApi.isph>
+#include <scene_rdl2/common/math/ispc/Vec2.isph>
+#include <scene_rdl2/common/math/ispc/Vec3.isph>
+#include <scene_rdl2/scene/rdl2/rdl2.isph>
+#include <scene_rdl2/common/platform/IspcUtil.isph>
+
+
+varying Vec3f
+HextileComputeBlendWeights(const varying Vec3f& luminanceWeights,
+                           const varying Vec3f& tileWeights,
+                           const varying float falloff);
+
+
+struct HextileData
+{
+    varying Vec2f coords[3];
+    varying Vec3f weights;
+    varying Vec3f rotations;
+    varying Vec2f ddx[3];
+    varying Vec2f ddy[3];
+};
+
+// Morten S. Mikkelsen, Practical Real-Time Hex-Tiling, Journal of Computer Graphics
+// Techniques (JCGT), vol. 11, no. 2, 77-94, 2022
+// http://jcgt.org/published/0011/03/05/
+
+void
+HextileCoord(const varying Vec2f& coord,
+             const varying float rotation,
+             const varying Vec2f& rotationRange,
+             const varying float scale,
+             const varying Vec2f& scaleRange,
+             const varying float offset,
+             const varying Vec2f& offsetRange,
+             const varying const Vec2f& dCoordDx,
+             const varying Vec2f& dCoordDy,
+                   varying HextileData& me);
+
+
+inline varying Vec2f
+lerp(const varying Vec2f& a,
+     const varying Vec2f& b,
+     const varying Vec2f& t)
+{
+    return Vec2f_ctor(lerp(a.x, b.x, t.x),
+                      lerp(a.y, b.y, t.y));
+}
+
+inline varying Vec3f
+lerp(const varying Vec3f& a,
+     const varying Vec3f& b,
+     const varying Vec3f& t)
+{
+    return Vec3f_ctor(lerp(a.x, b.x, t.x),
+                      lerp(a.y, b.y, t.y),
+                      lerp(a.z, b.z, t.z));
+}
+
+
+inline varying Vec2f
+mat2mult(const varying Vec2f& v,
+         float m00, float m01, float m10, float m11)
+{
+    return Vec2f_ctor(m00 * v.x + m10 * v.y,
+                      m01 * v.x + m11 * v.y);
+}
+

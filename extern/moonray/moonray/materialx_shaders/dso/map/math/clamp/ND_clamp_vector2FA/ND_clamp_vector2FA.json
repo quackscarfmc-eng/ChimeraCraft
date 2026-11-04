@@ -1,0 +1,34 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"highAttr" : 
+		{
+			"default" : "1.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "high",
+			"type" : "Float"
+		},
+		"inAttr" : 
+		{
+			"default" : "Vec2f(0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec2f"
+		},
+		"lowAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "low",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_clamp_vector2FA",
+	"type" : "Map"
+}
