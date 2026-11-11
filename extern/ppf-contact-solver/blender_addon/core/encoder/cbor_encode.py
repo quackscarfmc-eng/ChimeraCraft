@@ -1,0 +1,87 @@
+# File: blender_addon/core/encoder/cbor_encode.py
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+"""CBOR upload encoder.
+
+Used by ``encode_obj`` (mesh.py) and ``encode_param`` (params.py).
+Output wraps the producer dict in the schema-version envelope
+``{version, kind, payload}`` defined by
+``crates/ppf-cts-formats/src/envelope.rs`` and consumed by the Rust
+server.
+
+cbor2 is imported lazily so addon load doesn't fail on installs where
+the wheel hasn't been pulled in yet (e.g. the test rig, which sideloads
+the addon and bypasses the manifest's wheels list). Production users
+get cbor2 via ``blender_manifest.toml``; the rig prepares it through
+``debug/orchestrator.py``'s ``warmup_addon_install``.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+SCHEMA_VERSION = 2
+
+
+def _numpy_default(encoder, value):
+    """cbor2 fallback for non-natively-encodable types.
+
+    The producer dicts contain numpy arrays (vert / face / edge /
+    transform) and numpy scalars (np.float32(...) for sim params).
+    cbor2 doesn't know either, so we route through ``.tolist()`` /
+    ``.item()`` to get plain Python types — which is also what the
+    Rust serde schema decodes into (Vec<[f32; N]>, primitives).
+
+    Tuples are already CBOR-encodable as arrays without help, so we
+    don't override them here.
+    """
+    if isinstance(value, np.ndarray):
+        encoder.encode(value.tolist())
+        return
+    if isinstance(value, np.generic):
+        encoder.encode(value.item())
+        return
+    raise TypeError(
+        f"CBOR encoder cannot serialize {type(value).__name__} "
+        f"(value: {value!r})"
+    )
+
+
+def dumps_envelope(kind: str, payload) -> bytes:
+    """Wrap ``payload`` in the schema-version envelope and emit CBOR bytes.
+
+    Args:
+        kind: payload type tag, e.g. ``"Scene"`` or ``"Param"``. Must
+            match the consumer's expected kind or it'll be rejected.
+        payload: producer dict (data tree from ``_build_obj_data`` or
+            ``_build_param_dict``). Numpy arrays and scalars inside
+            are converted via ``_numpy_default``.
+
+    Returns:
+        CBOR-encoded bytes ready for ``upload_atomic``.
+    """
+    from ..module import get_cbor2
+
+    cbor2 = get_cbor2()
+
+    envelope = {"version": SCHEMA_VERSION, "kind": kind, "payload": payload}
+    return cbor2.dumps(envelope, default=_numpy_default)
+
+
+def payload_digest(encoded: bytes) -> str:
+    """The fingerprint of an encoded payload: its BLAKE2b digest (32 bytes),
+    in hex.
+
+    The upload and every drift check (Run, Resume, MCP) hash the whole
+    payload, which a Fluid Flow's volume can make hundreds of megabytes.
+    BLAKE2b runs at about 0.8 GB/s in every build of Blender measured
+    (2026-10-06), while SHA-256 there depends on the CPU's SHA instructions
+    reaching Blender's bundled Python: 2.2 GB/s on dev-head's x86 and 0.08
+    GB/s in Blender 5.2 on an Apple M2, where 365 MB took 4.8 s per check.
+    The server stores the digest as an opaque string, so only this function
+    has to agree with itself.
+    """
+    import hashlib
+
+    return hashlib.blake2b(encoded, digest_size=32).hexdigest()

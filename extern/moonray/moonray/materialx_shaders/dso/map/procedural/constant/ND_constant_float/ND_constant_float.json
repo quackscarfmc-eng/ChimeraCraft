@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"valueAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "value",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_constant_float",
+	"type" : "Map"
+}

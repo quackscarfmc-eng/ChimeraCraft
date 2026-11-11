@@ -1,0 +1,201 @@
+# File: scenarios/bl_rust_binary_protocol.py
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+#
+# Lock in the launcher to Rust-binary handshake. Distinct from
+# bl_connect_linux_native in that it (a) asserts the binary on disk is the
+# Rust port (target/release/ppf-cts-server, not the retired server.py)
+# and (b) reads the binary's --version output to verify the reported
+# PROTOCOL_VERSION matches what the addon negotiates against. The
+# in-Blender driver still goes through the LOCAL connect path so the
+# whole chain (launcher exec, TCP handshake, addon transition) is
+# exercised.
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import subprocess
+
+from . import _driver_lib as dl
+from . import _runner as r
+from . import REPO_ROOT_POSIX
+
+
+NEEDS_BLENDER = True
+# Launcher -> Rust-binary handshake + --version; backend-agnostic.
+BACKENDS = ("real",)
+# Linux runs the Rust binary directly via the LOCAL backend. macOS
+# usually goes through SSH/Docker; Windows uses bl_connect_win_native
+# which probes ppf-cts-server.exe at a different code path.
+PLATFORMS = ("linux",)
+
+
+def _load_expected_protocol() -> str:
+    """Read PROTOCOL_VERSION from the addon's canonical source.
+
+    Mirrors the pattern in ``server_smoke.py`` so the scenario never
+    pins a literal version of its own. The Rust binary's
+    ``PROTOCOL_VERSION`` is required to match this same string at
+    runtime (the addon refuses to handshake otherwise), so reading
+    the Python side is sufficient.
+    """
+    path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "core", "protocol.py")
+    )
+    spec = importlib.util.spec_from_file_location("_protocol_for_rust_binary", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.PROTOCOL_VERSION
+
+
+EXPECTED_PROTOCOL = _load_expected_protocol()
+
+
+_DRIVER_TEMPLATE = """
+import sys, time, traceback
+try:
+    facade = __import__(pkg + ".core.facade", fromlist=["engine", "tick"])
+    client = __import__(pkg + ".core.client", fromlist=["communicator"])
+    groups = __import__(pkg + ".models.groups", fromlist=["get_addon_data"])
+    root = groups.get_addon_data(bpy.context.scene)
+    SOLVER_ROOT = <<LOCAL_PATH_REPR>>
+    SERVER_PORT = <<SERVER_PORT>>
+
+    com = client.communicator
+    connect_platform_native(com, pkg, root.ssh_state, SOLVER_ROOT, SERVER_PORT)
+
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        facade.tick()
+        s = facade.engine.state
+        if s.phase.name == "ONLINE":
+            break
+        time.sleep(0.2)
+
+    s = facade.engine.state
+    result["phase"] = s.phase.name
+    result["server"] = s.server.name
+    result["solver"] = s.solver.name
+    result["connected"] = bool(com.is_connected())
+    result["version_ok"] = bool(s.version_ok)
+except Exception as exc:
+    result["errors"].append(f"driver: {type(exc).__name__}: {exc}")
+    result["errors"].append(traceback.format_exc())
+"""
+
+
+def build_driver(ctx: r.ScenarioContext) -> str:
+    repo_root = REPO_ROOT_POSIX
+    return (
+        dl.BUILD_FAILURE_LIB
+        + _DRIVER_TEMPLATE
+        .replace("<<LOCAL_PATH_REPR>>", repr(repo_root))
+        .replace("<<SERVER_PORT>>", str(ctx.server_port))
+    )
+
+
+def _binary_path() -> str:
+    """Resolve the production server binary on this host.
+
+    ASKED OF THE ORCHESTRATOR, not spelled out. `target/release` is one of
+    several directories a build lands in, and it is not the one a CPU build or
+    a multi-backend build uses; the orchestrator already resolves which
+    directory this host's server comes from, by the frontend's own rule, and
+    drives that binary. Naming a path here instead reported "not built" on a
+    host that had built one.
+    """
+    import orchestrator
+
+    name = "ppf-cts-server.exe" if os.name == "nt" else "ppf-cts-server"
+    return os.path.join(orchestrator.server_build_dir(), name)
+
+
+def _probe_protocol_version(binary: str, timeout: float = 10.0) -> str | None:
+    """Run ``ppf-cts-server --version`` and extract the protocol token.
+
+    The clap-generated output is a single line shaped
+    ``ppf-cts-server <crate-version> (protocol v<X>, schema v<Y>)``.
+    We grep for the ``protocol v...`` substring rather than parsing
+    positionally so a future version-line tweak doesn't false-fail.
+    """
+    try:
+        out = subprocess.run(
+            [binary, "--version"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    blob = (out.stdout or "") + (out.stderr or "")
+    m = re.search(r"protocol\s+v?([\w.\-]+)", blob)
+    return m.group(1) if m else None
+
+
+def run(ctx: r.ScenarioContext) -> dict:
+    import blender_harness as bh
+
+    binary = _binary_path()
+    if not os.path.isfile(binary):
+        return r.failed(
+            [f"Rust solver binary not built: {binary}"],
+            notes=[
+                "build with `cargo build --release -p ppf-cts-server` "
+                "before running this scenario",
+            ],
+        )
+
+    reported = _probe_protocol_version(binary)
+    if reported is None:
+        return r.failed(
+            [f"could not parse `{binary} --version` output for "
+             f"protocol token"],
+        )
+    if reported != EXPECTED_PROTOCOL:
+        return r.failed(
+            [f"binary reports protocol v{reported}; "
+             f"expected v{EXPECTED_PROTOCOL}"],
+            notes=["update EXPECTED_PROTOCOL or revert the version bump"],
+        )
+
+    bspec = ctx.artifacts.get("blender_spec")
+    proc = ctx.artifacts.get("blender_proc")
+    if bspec is None or proc is None:
+        return r.failed(["no Blender process attached to context"])
+
+    try:
+        result = bh.wait_for_result(bspec, proc, timeout=max(ctx.timeout, 90.0))
+    except TimeoutError as e:
+        return r.failed(
+            [str(e)],
+            notes=[
+                f"stdout (tail): {r.log_tail(bspec.stdout_path)!r}",
+                f"stderr (tail): {r.log_tail(bspec.stderr_path)!r}",
+            ],
+        )
+
+    violations: list[str] = list(result.get("errors") or [])
+    if not result.get("scenario_done"):
+        violations.append("driver did not run to completion")
+    if not result.get("connected"):
+        violations.append("addon never reached connected=True")
+    if result.get("phase") != "ONLINE":
+        violations.append(
+            f"phase did not reach ONLINE: {result.get('phase')!r}"
+        )
+    if not result.get("version_ok"):
+        violations.append(
+            "addon set version_ok=False: protocol negotiation rejected the "
+            "server response (binary reported "
+            f"v{reported}, addon expected v{EXPECTED_PROTOCOL})"
+        )
+
+    notes = [
+        f"binary={binary} (protocol v{reported})",
+        f"phase={result.get('phase')}, server={result.get('server')}, "
+        f"solver={result.get('solver')}, version_ok={result.get('version_ok')}",
+    ]
+    if violations:
+        return r.failed(violations, notes=notes)
+    return r.passed(notes=notes)

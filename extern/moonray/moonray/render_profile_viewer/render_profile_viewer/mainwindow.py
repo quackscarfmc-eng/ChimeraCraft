@@ -1,0 +1,3135 @@
+# Copyright 2023-2024 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+from PyQt5 import QtWidgets, QtCore, QtChart, QtGui
+from PyQt5.QtGui import QImage, QColor, QTextCharFormat
+import os
+import numpy as np
+import OpenImageIO as oiio
+import fnmatch
+import glob
+import json
+import sys
+import shutil
+import argparse
+import subprocess
+import copy
+import re
+import datetime
+import tempfile
+
+try:
+    from render_profile_viewer._version import __version__
+except ModuleNotFoundError:
+    __version__ = 'test'
+
+def load_exr_as_qimage(file_path, gamma=2.2):
+    # Open the EXR file
+    input_file = oiio.ImageInput.open(file_path)
+    if not input_file:
+        raise RuntimeError(f"Could not open {file_path}")
+
+    # Read the image data
+    spec = input_file.spec()
+    image = input_file.read_image()
+    input_file.close()
+
+    # Convert the image to numpy array and normalize to 0-255 range
+    image_array = np.array(image, dtype=np.float64)
+
+    # Replace NaN/Inf with 0 and clamp negatives before gamma correction
+    image_array = np.nan_to_num(image_array, nan=0.0, posinf=1.0, neginf=0.0)
+    image_array = np.clip(image_array, 0.0, None)
+
+    # Apply gamma correction
+    image_array = np.power(image_array, 1/gamma)
+
+    image_array = np.clip(image_array * 255, 0, 255).astype(np.uint8)
+
+    # If the image has an alpha channel, drop it
+    if image_array.shape[2] == 4:
+        image_array = image_array[:, :, :3]
+
+    # Ensure the array is contiguous in memory
+    image_array = np.ascontiguousarray(image_array)
+
+    # Create QImage from the numpy array
+    height, width, channels = image_array.shape
+    bytes_per_line = channels * width
+    q_image = QImage(image_array.tobytes(), width, height, bytes_per_line, QImage.Format_RGB888)
+
+    return (q_image, width, height)
+
+def get_seconds_from_time(time_string):
+    hours = float(time_string.split(':')[-3])
+    minutes = float(time_string.split(':')[-2])
+    seconds = float(time_string.split(':')[-1])
+    return seconds + minutes * 60.0 + hours * 3600.0
+
+
+def get_gigabytes_from_size(size_string, size_unit):
+    if size_unit == "GB":
+        return float(size_string)
+    elif size_unit == "MB":
+        return float(size_string) / 1024
+    elif size_unit == "KB":
+        return float(size_string) / 1024 / 1024
+
+
+# noinspection PyUnresolvedReferences
+class RenderProfileChartView(QtChart.QChartView):
+
+    stat_signal = QtCore.pyqtSignal(str)
+    annotation_changed_signal = QtCore.pyqtSignal(list)
+
+    stat_colors = dict()
+
+    stat_colors_values = {
+                   # Render prep
+                   "Checkout license":                      (50, 50, 50),
+                   "Loading scene":                         (50, 50, 80),
+                   "Initialize renderer":                   (50, 80, 50),
+                   "Generating procedurals":                (80, 50, 50),
+                   "Tessellation":                          (120, 120, 50),
+                   "Building BVH":                          (120, 50, 50),
+                   "Building GPU BVH":                      (50, 50, 120),
+
+                   # Scalar
+                   "Render driver overhead":                (118, 130, 201),
+                   "Adaptive tree query":                   (75, 100, 200),
+                   "Adaptive tree exclusive lock":          (75, 150, 200),
+                   "Render driver serial time":             (74, 206, 223),
+                   "Integration":                           (245, 121, 111),
+                   "Subsurface integration":                (139, 94, 21),
+                   "Volume integration":                    (146, 114, 202),
+                   "Shading (excl. OIIO)":                  (253, 180, 74),
+                   "Texturing (OIIO)":                      (150, 95, 175),
+                   "Primary ray generation":                (185, 185, 185),
+                   "Init Intersection":                     (171, 211, 126),
+                   "Embree intersection rays":              (97, 179, 244),
+                   "Embree occlusion rays":                 (253, 209, 78),
+                   "Embree volume rays":                    (246, 166, 37),
+                   "Compute ray derivatives":               (141, 161, 171),
+                   "Adaptive tree rebuild":                 (84, 182, 231),
+                   "Add sample handler":                    (88, 91, 113),
+                   "AOVs":                                  (160, 84, 78),
+                   "MISSING TIME":                          (127, 197, 130),
+
+                   # Vector and GPU Only
+                   "RayState allocs":                       (218, 228, 114),
+                   "Ray handler (excl. embree)":            (253, 239, 115),
+                   "Shade handler (excl. isect+shading)":   (237, 95, 143),
+                   "Queuing logic (incl. sorting)":         (74, 179, 169),
+                   "Occl query handler (excl. embree)":     (253, 135, 97),
+                   "TLS allocs (excl. RayStates)":          (76, 192, 245),
+                   "Post integration (SOA->AOS/queuing)":   (183, 101, 197),
+
+                   # GPU Only
+                   "GPU occlusion rays":                    (50, 50, 50),
+                   "GPU intersection rays":                 (70, 70, 70),
+                   # pixel samples
+                   "pixel_samples":                         (200, 50, 100),
+                   # memory
+                   "Geometry memory":                       (100, 200, 50),
+                   "BVH memory":                            (50, 100, 200),
+                   "MCRT memory":                           (200, 50, 100)}
+
+    improvements_color = QtGui.QColor(0, 200, 0)
+    regression_color = QtGui.QColor(200, 0, 0)
+    fallback_color = QtGui.QColor(200, 0, 200)
+    crash_color = QtGui.QColor(255, 0, 0)
+    missing_color = QtGui.QColor(200, 0, 0)
+    scalar_color = QtGui.QColor(255, 0, 0)
+    vector_color = QtGui.QColor(0, 255, 0)
+    xpu_color = QtGui.QColor(0, 0, 255)
+
+
+    memory_stats = ["Geometry memory",
+                    "BVH memory",
+                    "MCRT memory"]
+
+    render_prep_stats = ["Checkout license",
+                         "Loading scene",
+                         "Initialize renderer",
+                         "Generating procedurals",
+                         "Tessellation",
+                         "Building BVH",
+                         "Building GPU BVH"]
+
+    scalar_stats = ["Render driver overhead",
+                    "Adaptive tree query",
+                    "Adaptive tree exclusive lock",
+                    "Render driver serial time",
+                    "Integration",
+                    "Subsurface integration",
+                    "Volume integration",
+                    "Shading (excl. OIIO)",
+                    "Texturing (OIIO)",
+                    "Primary ray generation",
+                    "Init Intersection",
+                    "Embree intersection rays",
+                    "Embree occlusion rays",
+                    "Embree volume rays",
+                    "Compute ray derivatives",
+                    "Adaptive tree rebuild",
+                    "Add sample handler",
+                    "AOVs",
+                    "MISSING TIME"]
+
+    vector_stats = ["RayState allocs",
+                    "Ray handler (excl. embree)",
+                    "Shade handler (excl. isect+shading)",
+                    "Queuing logic (incl. sorting)",
+                    "Occl query handler (excl. embree)",
+                    "TLS allocs (excl. RayStates)",
+                    "Post integration (SOA->AOS/queuing)"]
+
+    xpu_stats = ["GPU occlusion rays",
+                 "GPU intersection rays"]
+
+    def __init__(self):
+        super().__init__()
+
+        self.stat_colors.clear()
+        for stat_name in self.stat_colors_values.keys():
+            stat_color = QtGui.QColor(int(self.stat_colors_values[stat_name][0]),
+                                      int(self.stat_colors_values[stat_name][1]),
+                                      int(self.stat_colors_values[stat_name][2]))
+            self.stat_colors[stat_name] = stat_color
+
+        self.series = QtChart.QStackedBarSeries()
+
+        self.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        self.max_y = 0.0
+
+        # Annotations: list of {week, y, note} dicts
+        self.annotations = []
+        self._annotation_scatter = None
+        # Mapping from category index to week key, built during update_chart
+        self._category_week_keys = []
+        self._scatter_to_annotation = []
+
+    def keyPressEvent(self, event):
+        keymap = {
+            QtCore.Qt.Key_Up: lambda: self.chart().scroll(0, 20),
+            QtCore.Qt.Key_W: lambda: self.chart().scroll(0, 20),
+            QtCore.Qt.Key_Down: lambda: self.chart().scroll(0, -20),
+            QtCore.Qt.Key_S: lambda: self.chart().scroll(0, -20),
+            QtCore.Qt.Key_Right: lambda: self.chart().scroll(20, 0),
+            QtCore.Qt.Key_D: lambda: self.chart().scroll(20, 0),
+            QtCore.Qt.Key_Left: lambda: self.chart().scroll(-20, 0),
+            QtCore.Qt.Key_A: lambda: self.chart().scroll(-20, 0),
+            QtCore.Qt.Key_Equal: self.chart().zoomIn,
+            QtCore.Qt.Key_E: self.chart().zoomIn,
+            QtCore.Qt.Key_Minus: self.chart().zoomOut,
+            QtCore.Qt.Key_Q: self.chart().zoomOut,
+            QtCore.Qt.Key_Home: self.chart().zoomReset,
+            QtCore.Qt.Key_R: self.chart().zoomReset
+        }
+        callback = keymap.get(event.key())
+        if callback:
+            callback()
+
+    def hover_bar_series(self, status, index, barset):
+        if status:
+            host_name = barset.property('host_name')
+
+            pixel_samples = 0.0
+            pixel_samples_list = barset.property('pixel_samples')
+            if pixel_samples_list and index < len(pixel_samples_list):
+                pixel_samples = pixel_samples_list[index]
+
+            visible_time = 0.0
+            visible_time_list = barset.property('visible_time')
+            if visible_time_list and index < len(visible_time_list):
+                visible_time = visible_time_list[index]
+
+            total_render_prep_time = 0.0
+            total_render_prep_time_list = barset.property('total_render_prep_time')
+            if total_render_prep_time_list and index < len(total_render_prep_time_list):
+                total_render_prep_time = total_render_prep_time_list[index]
+
+            total_mcrt_time = 0.0
+            total_mcrt_time_list = barset.property('total_mcrt_time')
+            if total_mcrt_time_list and index < (len(total_mcrt_time_list)):
+                total_mcrt_time = total_mcrt_time_list[index]
+
+            total_time = total_render_prep_time + total_mcrt_time
+
+            visible_time = '%0.2fs' % visible_time
+            total_render_prep_time = '%0.2fs' % total_render_prep_time
+            total_mcrt_time = '%0.2fs' % total_mcrt_time
+            total_time = '%0.2fs' % total_time
+
+            self.stat_signal.emit(f"{barset.label()}={barset.at(index)}    "
+                                  f"visible time={visible_time}    "
+                                  f"total render prep time={total_render_prep_time}    "
+                                  f"total MCRT time={total_mcrt_time}    "
+                                  f"total time={total_time}    "
+                                  f"test pixel samples={pixel_samples}    "
+                                  f"host_name = {host_name[index]}")
+        else:
+            self.stat_signal.emit("")
+
+    @staticmethod
+    def get_stat(stats_dict, extra_stats_dict, stat_name, test_type, week):
+        stat_value = 0
+        if stats_dict[week][test_type]:
+            if stat_name in stats_dict[week][test_type]:
+                stat_value = stats_dict[week][test_type][stat_name]
+            for extra_stat in extra_stats_dict.keys():
+                if stats_dict[week][test_type] == "missing":
+                    extra_stats_dict[extra_stat].append(0)
+                elif extra_stat in stats_dict[week][test_type]:
+                    extra_stats_dict[extra_stat].append(stats_dict[week][test_type][extra_stat])
+        return stat_value
+
+    def process_test_type_for_week(self,
+                                   test_type,
+                                   week, week_index,
+                                   stat_name, stats_dict, prev_stats_dict, extra_stats_dict,
+                                   show_regressions, show_improvements,
+                                   regressions_threshold, improvements_threshold,
+                                   main_bar_set, regressions_bar_set,
+                                   improvements_bar_set,
+                                   fallback_bar_set, fallback,
+                                   crash_bar_set, crash,
+                                   missing_bar_set, missing):
+
+        stat = self.get_stat(stats_dict, extra_stats_dict, stat_name, test_type, week)
+        if week_index > 0 and prev_stats_dict[test_type] != 0 and (show_regressions or show_improvements):
+            stat_ratio = stat / prev_stats_dict[test_type]
+            if missing:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            elif fallback:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(stat)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            elif crash:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(stat)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            elif stat_ratio > regressions_threshold and show_regressions:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(stat)
+            elif stat_ratio < improvements_threshold and show_improvements:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(stat)
+                regressions_bar_set.append(0)
+            else:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(stat)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+        else:
+            if missing:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            elif fallback:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(stat)
+                crash_bar_set.append(0)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            elif crash:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(stat)
+                main_bar_set.append(0)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+            else:
+                missing_bar_set.append(0)
+                fallback_bar_set.append(0)
+                crash_bar_set.append(0)
+                main_bar_set.append(stat)
+                improvements_bar_set.append(0)
+                regressions_bar_set.append(0)
+        prev_stats_dict[test_type] = stat
+
+    def add_line_series(self,
+                        chart,
+                        x_axis,
+                        y_axis,
+                        stats_dict,
+                        type_visibility_list):
+        scalar_pen = QtGui.QPen()
+        scalar_pen.setWidth(3)
+        scalar_pen.setColor(self.scalar_color)
+        scalar_line_series = QtChart.QLineSeries()
+        scalar_line_series.setPen(scalar_pen)
+
+        vector_pen = QtGui.QPen()
+        vector_pen.setWidth(3)
+        vector_pen.setColor(self.vector_color)
+        vector_line_series = QtChart.QLineSeries()
+        vector_line_series.setPen(vector_pen)
+
+        xpu_pen = QtGui.QPen()
+        xpu_pen.setWidth(3)
+        xpu_pen.setColor(self.xpu_color)
+        xpu_line_series = QtChart.QLineSeries()
+        xpu_line_series.setPen(xpu_pen)
+
+        x = 0
+        for week_index, week in enumerate(stats_dict.keys()):
+            for test_type in ['scalar', 'vector', 'xpu']:
+                if test_type in stats_dict[week] and \
+                   stats_dict[week][test_type] and \
+                   test_type in type_visibility_list:
+
+                    if stats_dict[week][test_type] == "missing":
+                        visible_time = 0
+                    else:
+                        visible_time = float(stats_dict[week][test_type]['visible_time'])
+
+                    if test_type == 'scalar':
+                        scalar_line_series.append(x, visible_time)
+                    if test_type == 'vector':
+                        vector_line_series.append(x, visible_time)
+                    if test_type == 'xpu':
+                        xpu_line_series.append(x, visible_time)
+                    x += 1
+        chart.addSeries(scalar_line_series)
+        chart.addSeries(vector_line_series)
+        chart.addSeries(xpu_line_series)
+
+        scalar_line_series.attachAxis(x_axis)
+        scalar_line_series.attachAxis(y_axis)
+        vector_line_series.attachAxis(x_axis)
+        vector_line_series.attachAxis(y_axis)
+        xpu_line_series.attachAxis(x_axis)
+        xpu_line_series.attachAxis(y_axis)
+
+    def set_annotations(self, annotations):
+        """Set the annotations list for the current chart."""
+        # Deep copy to decouple view state from persisted state
+        self.annotations = copy.deepcopy(annotations) if annotations else []
+
+    def _draw_annotations(self, chart, x_axis, y_axis):
+        """Draw annotation dots on the chart.
+
+        Each annotation is anchored to a week key and appears once per week
+        at the position of the first matching category (so only one dot is
+        shown even when multiple test types are visible for that week).
+        """
+        if not self.annotations or not self._category_week_keys:
+            self._annotation_scatter = None
+            self._scatter_to_annotation = []
+            return
+
+        self._annotation_scatter = QtChart.QScatterSeries()
+        self._annotation_scatter.setName("Annotations")
+        self._annotation_scatter.setMarkerSize(14)
+        self._annotation_scatter.setColor(QtGui.QColor(255, 255, 0))
+        self._annotation_scatter.setBorderColor(QtGui.QColor(0, 0, 0))
+
+        # Build a lookup of week_key -> first category index
+        week_to_first_cat = {}
+        for cat_idx, week_key in enumerate(self._category_week_keys):
+            if week_key not in week_to_first_cat:
+                week_to_first_cat[week_key] = cat_idx
+
+        self._scatter_to_annotation = []
+        y_max = y_axis.max()
+        for ann_idx, ann in enumerate(self.annotations):
+            cat_idx = week_to_first_cat.get(ann['week'])
+            if cat_idx is not None:
+                # Clamp y so the dot stays within the visible chart area
+                y = min(ann['y'], y_max) if y_max > 0 else ann['y']
+                self._annotation_scatter.append(cat_idx, y)
+                self._scatter_to_annotation.append(ann_idx)
+
+        if self._annotation_scatter.count() == 0:
+            self._annotation_scatter = None
+            self._scatter_to_annotation = []
+            return
+
+        self._annotation_scatter.hovered.connect(self._hover_annotation)
+        chart.addSeries(self._annotation_scatter)
+        self._annotation_scatter.attachAxis(x_axis)
+        self._annotation_scatter.attachAxis(y_axis)
+
+    def _hover_annotation(self, point, state):
+        """Show annotation note as tooltip and in status bar on hover."""
+        if state and self._annotation_scatter and self._scatter_to_annotation:
+            for i in range(self._annotation_scatter.count()):
+                p = self._annotation_scatter.at(i)
+                if abs(p.x() - point.x()) < 0.01 and abs(p.y() - point.y()) < 0.01:
+                    ann_idx = self._scatter_to_annotation[i]
+                    ann = self.annotations[ann_idx]
+                    self.stat_signal.emit(f"Annotation: {ann['note']}")
+                    QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), ann['note'])
+                    return
+        if not state:
+            self.stat_signal.emit("")
+            QtWidgets.QToolTip.hideText()
+
+    def _snap_to_week(self, chart_x):
+        """Snap a chart x coordinate to the nearest category's week key.
+
+        Returns the week key string, or None if no categories exist.
+        """
+        if not self._category_week_keys:
+            return None
+        idx = max(0, min(round(chart_x), len(self._category_week_keys) - 1))
+        return self._category_week_keys[idx]
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click on the chart to add an annotation."""
+        if event.button() == QtCore.Qt.LeftButton and self.chart():
+            scene_pos = self.mapToScene(event.pos())
+            chart_pos = self.chart().mapToValue(scene_pos)
+
+            week_key = self._snap_to_week(chart_pos.x())
+            if week_key is None:
+                super().mouseDoubleClickEvent(event)
+                return
+
+            note, ok = QtWidgets.QInputDialog.getText(
+                self, "Add Annotation", "Enter annotation note:")
+            if ok and note.strip():
+                annotation = {
+                    'week': week_key,
+                    'y': round(chart_pos.y(), 2),
+                    'note': note.strip()
+                }
+                self.annotations.append(annotation)
+                self.annotation_changed_signal.emit(list(self.annotations))
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        """Right-click context menu for annotation management."""
+        if not self.chart():
+            return super().contextMenuEvent(event)
+
+        scene_pos = self.mapToScene(event.pos())
+        chart_pos = self.chart().mapToValue(scene_pos)
+
+        clicked_week = self._snap_to_week(chart_pos.x())
+
+        # Find the closest annotation at this week within the y tolerance
+        nearest_ann = None
+        nearest_idx = -1
+        nearest_dist = float('inf')
+        y_tol = max(self.max_y * 0.05, 0.1)
+        for i, ann in enumerate(self.annotations):
+            if ann['week'] == clicked_week:
+                dy = abs(ann['y'] - chart_pos.y())
+                if dy < y_tol and dy < nearest_dist:
+                    nearest_dist = dy
+                    nearest_ann = ann
+                    nearest_idx = i
+
+        menu = QtWidgets.QMenu(self)
+
+        edit_action = None
+        delete_action = None
+        add_action = menu.addAction("Add annotation here")
+
+        if nearest_ann:
+            label = nearest_ann['note']
+            if len(label) > 40:
+                label = label[:40] + "..."
+            edit_action = menu.addAction(f'Edit: "{label}"')
+            delete_action = menu.addAction("Delete this annotation")
+
+        clear_action = None
+        if self.annotations:
+            menu.addSeparator()
+            clear_action = menu.addAction("Clear all annotations")
+
+        action = menu.exec_(event.globalPos())
+        if action is None:
+            return
+
+        if action == add_action:
+            week_key = clicked_week
+            if week_key is None:
+                return
+            note, ok = QtWidgets.QInputDialog.getText(
+                self, "Add Annotation", "Enter annotation note:")
+            if ok and note.strip():
+                annotation = {
+                    'week': week_key,
+                    'y': round(chart_pos.y(), 2),
+                    'note': note.strip()
+                }
+                self.annotations.append(annotation)
+                self.annotation_changed_signal.emit(list(self.annotations))
+        elif nearest_ann and action == edit_action:
+            note, ok = QtWidgets.QInputDialog.getText(
+                self, "Edit Annotation", "Edit annotation note:",
+                QtWidgets.QLineEdit.Normal, nearest_ann['note'])
+            if ok and note.strip():
+                self.annotations[nearest_idx]['note'] = note.strip()
+                self.annotation_changed_signal.emit(list(self.annotations))
+        elif nearest_ann and action == delete_action:
+            self.annotations.pop(nearest_idx)
+            self.annotation_changed_signal.emit(list(self.annotations))
+        elif clear_action and action == clear_action:
+            self.annotations.clear()
+            self.annotation_changed_signal.emit(list(self.annotations))
+
+    @staticmethod
+    def check_host_type(stats_dict, week, test_type, host_visibility_list):
+        if len(host_visibility_list) == 0:
+            return True
+
+        if 'host_name' not in stats_dict[week][test_type]:
+            return True
+
+        host_name = stats_dict[week][test_type]['host_name']
+
+        for host_type in host_visibility_list:
+            if host_name.startswith(host_type):
+                return True
+
+        return False
+
+    def update_chart(self,
+                     test_name,
+                     stats_dict,
+                     show_pixel_samples=False,
+                     show_memory=False,
+                     show_host_names=False,
+                     type_visibility_list=None,
+                     host_visibility_list=None,
+                     stat_visibility_list=None,
+                     resize=False,
+                     explicit_height=0,
+                     font_size=11,
+                     show_regressions=False,
+                     regressions_threshold=110.0,
+                     show_improvements=False,
+                     improvements_threshold=90.0,
+                     dark_theme=False,
+                     show_line_series=False,
+                     divide_by_ps=False,
+                     show_fallback=False,
+                     show_crash=False,
+                     label_angle=90):
+
+        regressions_threshold = (100.0 + regressions_threshold) / 100.0
+        improvements_threshold = (100.0 - improvements_threshold) / 100.0
+
+        chart = QtChart.QChart()
+        chart.setTitle(test_name)
+
+        if dark_theme:
+            chart.setTheme(QtChart.QChart.ChartThemeDark)
+
+        title_font = chart.titleFont()
+        title_font.setPointSize(font_size)
+        chart.setTitleFont(title_font)
+
+        if len(stats_dict) == 0:
+            self.setChart(chart)
+            self._category_week_keys = []
+            self._annotation_scatter = None
+            self._scatter_to_annotation = []
+            return
+
+        stacked_bar_series = QtChart.QStackedBarSeries()
+        stacked_bar_series.hovered.connect(self.hover_bar_series)
+
+        if show_pixel_samples:
+            stat_names = ['pixel_samples']
+        else:
+            stat_names = self.stat_colors.keys()
+
+        categories = list()
+        self._category_week_keys = []
+        _seen_categories = set()
+
+        def _track_category(label, week_key):
+            """Append to categories and track the week for each unique category."""
+            categories.append(label)
+            if label not in _seen_categories:
+                _seen_categories.add(label)
+                self._category_week_keys.append(week_key)
+
+        for stat_name in stat_names:
+           if not stat_visibility_list or (not show_pixel_samples and stat_name not in stat_visibility_list):
+                continue
+
+           main_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               main_bar_set.setColor(self.stat_colors[stat_name])
+
+           regressions_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               regressions_bar_set.setColor(self.stat_colors[stat_name])
+           overlay_pen = regressions_bar_set.pen()
+           overlay_pen.setWidth(5)
+           overlay_pen.setColor(self.regression_color)
+           regressions_bar_set.setPen(overlay_pen)
+
+           improvements_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               improvements_bar_set.setColor(self.stat_colors[stat_name])
+           overlay_pen = improvements_bar_set.pen()
+           overlay_pen.setWidth(5)
+           overlay_pen.setColor(self.improvements_color)
+           improvements_bar_set.setPen(overlay_pen)
+
+           fallback_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               fallback_bar_set.setColor(self.stat_colors[stat_name])
+           overlay_pen = fallback_bar_set.pen()
+           overlay_pen.setWidth(5)
+           overlay_pen.setColor(self.fallback_color)
+           fallback_bar_set.setPen(overlay_pen)
+
+           crash_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               crash_bar_set.setColor(self.stat_colors[stat_name])
+           overlay_pen = crash_bar_set.pen()
+           overlay_pen.setWidth(5)
+           overlay_pen.setColor(self.crash_color)
+           crash_bar_set.setPen(overlay_pen)
+
+           missing_bar_set = QtChart.QBarSet(stat_name)
+           if stat_name in self.stat_colors:
+               missing_bar_set.setColor(self.stat_colors[stat_name])
+
+           extra_stats_dict = dict()
+           extra_stats_dict['visible_time'] = list()
+           extra_stats_dict['total_render_prep_time'] = list()
+           extra_stats_dict['total_mcrt_time'] = list()
+           extra_stats_dict['pixel_samples'] = list()
+           extra_stats_dict['host_name'] = list()
+
+           prev_stats_dict = dict()
+           prev_stats_dict['scalar'] = 0
+           prev_stats_dict['vector'] = 0
+           prev_stats_dict['xpu'] = 0
+
+           for week_index, week in enumerate(stats_dict.keys()):
+               for test_type in ['scalar', 'vector', 'xpu']:
+                   if test_type in stats_dict[week] and test_type in type_visibility_list:
+
+                       if not stats_dict[week][test_type]:
+                           continue
+
+                       # Check for missing week
+                       missing = False
+                       if stats_dict[week][test_type] == "missing":
+                           missing = True
+
+                       # Check for host type
+                       if not self.check_host_type(stats_dict, week, test_type, host_visibility_list):
+                           continue
+
+                       # Categories (bottom of chart)
+                       if missing:
+                           _track_category(f"MISSING! - {week} ({test_type})", week)
+                       elif show_host_names:
+                           host_name = 'Unknown'
+                           if 'host_name' in stats_dict[week][test_type]:
+                               host_name = stats_dict[week][test_type]['host_name'].split('.')[0]
+                           if show_fallback and \
+                              'fallback' in stats_dict[week][test_type] and \
+                              'fallback_mode' in stats_dict[week][test_type]:
+
+                               _track_category(f"{host_name}: {week} "
+                                                 f"({test_type} -> {stats_dict[week][test_type]['fallback_mode']})", week)
+                           else:
+                               _track_category(f"{host_name}: {week} ({test_type})", week)
+                       else:
+                           if show_fallback and \
+                              'fallback' in stats_dict[week][test_type] and \
+                              'fallback_mode' in stats_dict[week][test_type]:
+
+                               _track_category(f"{week} "
+                                                 f"({test_type} -> {stats_dict[week][test_type]['fallback_mode']})", week)
+                           else:
+                               _track_category(f"{week} ({test_type})", week)
+
+                       # Check for fallback
+                       fallback = False
+                       if show_fallback and 'fallback' in stats_dict[week][test_type]:
+                           fallback = stats_dict[week][test_type]['fallback']
+
+                       # Check for crash
+                       crash = False
+                       if show_crash and 'crash' in stats_dict[week][test_type]:
+                           crash = stats_dict[week][test_type]['crash']
+
+                       self.process_test_type_for_week(test_type,
+                                                       week, week_index,
+                                                       stat_name, stats_dict, prev_stats_dict, extra_stats_dict,
+                                                       show_regressions, show_improvements,
+                                                       regressions_threshold, improvements_threshold,
+                                                       main_bar_set, regressions_bar_set, improvements_bar_set,
+                                                       fallback_bar_set, fallback,
+                                                       crash_bar_set, crash,
+                                                       missing_bar_set, missing)
+
+           for bar_set in [main_bar_set, regressions_bar_set, improvements_bar_set, fallback_bar_set, crash_bar_set, missing_bar_set]:
+               for extra_stat in extra_stats_dict:
+                   bar_set.setProperty(extra_stat, extra_stats_dict[extra_stat])
+               stacked_bar_series.append(bar_set)
+
+        chart.addSeries(stacked_bar_series)
+
+        x_axis = QtChart.QBarCategoryAxis()
+        x_axis.append(categories)
+        x_axis.setLabelsAngle(label_angle)
+        if show_host_names:
+            x_axis.setTitleText("Host: Date (Type)")
+        else:
+            x_axis.setTitleText("Date (Type)")
+        title_font = x_axis.titleFont()
+        title_font.setPointSize(font_size)
+        x_axis.setTitleFont(title_font)
+        labels_font = x_axis.labelsFont()
+        labels_font.setPointSize(int(font_size * 0.75))
+        x_axis.setLabelsFont(labels_font)
+        chart.addAxis(x_axis, QtCore.Qt.AlignBottom)
+        stacked_bar_series.attachAxis(x_axis)
+
+        y_axis = QtChart.QValueAxis()
+        if divide_by_ps:
+            y_axis.setTitleText("Time per pixel sample (seconds)")
+        elif show_pixel_samples:
+            y_axis.setTitleText("Pixel Samples (millions)")
+        elif show_memory:
+            y_axis.setTitleText("Memory (GB)")
+        else:
+            y_axis.setTitleText("Time (seconds)")
+        labels_font = y_axis.labelsFont()
+        labels_font.setPointSize(font_size)
+        y_axis.setLabelsFont(labels_font)
+        title_font = y_axis.titleFont()
+        title_font.setPointSize(font_size)
+        y_axis.setTitleFont(title_font)
+        chart.addAxis(y_axis, QtCore.Qt.AlignLeft)
+        stacked_bar_series.attachAxis(y_axis)
+
+        if not resize:
+            # Set the saved size
+            y_axis.setMax(self.max_y)
+
+        if explicit_height == 0:
+            self.max_y = y_axis.max()
+        else:
+            self.max_y = explicit_height
+            y_axis.setMax(self.max_y)
+
+        chart.legend().setVisible(False)
+
+        if show_line_series:
+            self.add_line_series(chart,
+                                 x_axis,
+                                 y_axis,
+                                 stats_dict,
+                                 type_visibility_list)
+
+        # Draw user annotations on top of everything
+        self._draw_annotations(chart, x_axis, y_axis)
+
+        # Set the fully-built chart in one step to avoid visual flicker
+        self.setChart(chart)
+
+
+class ImageTabWidget(QtWidgets.QTabWidget):
+    """
+    Custom tab widget to use mouse wheel for zooming images
+    """
+    def __init__(self, image_size_spin_box, update_callback, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.image_size_spin_box = image_size_spin_box
+        self.update_callback = update_callback
+
+        # Fix to avoid extra tab creation
+        self.zoom_timer = QtCore.QTimer()
+        self.zoom_timer.setSingleShot(True)
+        self.zoom_timer.timeout.connect(self.reenable_updates)
+
+    def wheelEvent(self, event):
+        self.image_size_spin_box.blockSignals(True)
+
+        delta = event.angleDelta().y()
+        step = self.image_size_spin_box.singleStep()
+        if delta > 0:
+            self.image_size_spin_box.setValue(self.image_size_spin_box.value() + step)
+        else:
+            self.image_size_spin_box.setValue(self.image_size_spin_box.value() - step)
+
+        self.zoom_timer.start(100)
+        event.accept()
+
+    def reenable_updates(self):
+        self.image_size_spin_box.blockSignals(False)
+        self.update_callback()
+
+class CustomTabBar(QtWidgets.QTabBar):
+    """
+    The purpose of this class is to simply allow a red tab for
+    failed image diffs.  There doesn't seem to be an easier way
+    to do it that works.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tabColors = {}  # Dictionary to store tab colors
+        app = QtWidgets.QApplication.instance()
+        palette = app.palette()
+        self.default_color = palette.color(QtGui.QPalette.Button)
+
+    def setTabColor(self, index, color):
+        """Set a custom color for a specific tab index."""
+        self.tabColors[index] = QColor(color)
+        self.update()  # Redraw the tab bar
+
+    def paintEvent(self, event):
+        """
+        This draws a custom colored tab with a rounded top which
+        tries to mimic the default tab style.  Derives colors from
+        the active palette so tabs remain readable in both themes.
+        """
+        painter = QtGui.QPainter(self)
+        palette = self.palette()
+
+        # Green highlight for the selected tab (intentionally not palette-derived)
+        selected_color = QtGui.QColor(60, 180, 75)
+        # Use palette-aware text colors
+        text_color = palette.color(QtGui.QPalette.ButtonText)
+        selected_text_color = palette.color(QtGui.QPalette.HighlightedText)
+        outline_color = palette.color(QtGui.QPalette.Dark)
+
+        for index in range(self.count()):
+            # Only use custom painting for tabs with custom colors or selected tabs
+            if index in self.tabColors or self.currentIndex() == index:
+                rect = self.tabRect(index)
+                color = self.tabColors.get(index, self.default_color)
+
+                radius = 8
+                path = QtGui.QPainterPath()
+                rect = rect.adjusted(0, 0, 0, radius)
+
+                # Draw the top-left rounded corner
+                path.moveTo(rect.topLeft())
+                path.arcTo(rect.left(), rect.top(), radius * 2, radius * 2, 180, -90)
+
+                # Draw the top-right rounded corner
+                path.lineTo(rect.right() - radius, rect.top())
+                path.arcTo(rect.right() - radius * 2, rect.top(), radius * 2, radius * 2, 90, -90)
+
+                # Draw the bottom edge (straight)
+                path.lineTo(rect.bottomRight())
+                path.lineTo(rect.bottomLeft())
+                path.closeSubpath()
+
+                # Fill the path with the tab color
+                if self.currentIndex() == index:
+                    painter.setBrush(QtGui.QBrush(selected_color))
+                else:
+                    painter.setBrush(QtGui.QBrush(color))
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.drawPath(path)
+
+                # Draw outline
+                painter.setPen(QtGui.QPen(outline_color, 1))
+                painter.setBrush(QtCore.Qt.NoBrush)
+                painter.drawPath(path)
+
+                # Draw text with palette-aware color
+                if self.currentIndex() == index:
+                    painter.setPen(selected_text_color)
+                else:
+                    painter.setPen(text_color)
+
+                text = self.tabText(index)
+                painter.drawText(rect, QtCore.Qt.AlignCenter, text)
+            else:
+                # Use default Qt rendering for tabs without custom colors
+                option = QtWidgets.QStyleOptionTab()
+                self.initStyleOption(option, index)
+                self.style().drawControl(QtWidgets.QStyle.CE_TabBarTab, option, painter, self)
+
+class CustomTabWidget(QtWidgets.QTabWidget):
+    def __init__(self):
+        super().__init__()
+        self.customTabBar = CustomTabBar()
+        self.setTabBar(self.customTabBar)
+
+    def addColoredTab(self, widget, title, color):
+        """Add a tab with a specific color."""
+        index = self.addTab(widget, title)
+        self.customTabBar.setTabColor(index, color)
+
+class NoWheelScrollArea(QtWidgets.QScrollArea):
+    """
+    Custom QScrollArea that:
+    - Blocks mouse wheel scrolling
+    - Enables panning with the left mouse button
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setWidgetResizable(True)
+        self.setMouseTracking(True)
+        self.last_pos = None  # Stores last mouse position
+        self.setCursor(QtCore.Qt.ArrowCursor)  # Default cursor
+
+    def wheelEvent(self, event):
+        event.ignore()  # Allow zooming elsewhere
+
+    def mousePressEvent(self, event):
+        """Start panning on left mouse button press."""
+        if event.button() == QtCore.Qt.LeftButton:
+            self.last_pos = event.pos()
+            self.setCursor(QtCore.Qt.ClosedHandCursor)  # Change cursor to indicate dragging
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Pan the scroll area when dragging with the left mouse button."""
+        if self.last_pos and event.buttons() & QtCore.Qt.LeftButton:
+            delta = event.pos() - self.last_pos  # Compute movement difference
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.last_pos = event.pos()  # Update last position
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Stop panning when left mouse button is released."""
+        if event.button() == QtCore.Qt.LeftButton:
+            self.last_pos = None
+            self.setCursor(QtCore.Qt.ArrowCursor)  # Restore default cursor
+        super().mouseReleaseEvent(event)
+
+# noinspection PyUnresolvedReferences
+class MyWindow(QtWidgets.QMainWindow):
+    def __init__(self, logs):
+        super().__init__()
+
+        self.images_cache = dict()
+        self.log_file_mode = False
+        if logs:
+            self.log_files = logs
+            self.log_file_mode = True
+
+        # Debounce timer for test selection changes
+        self._test_selection_timer = QtCore.QTimer()
+        self._test_selection_timer.setSingleShot(True)
+        self._test_selection_timer.setInterval(150)
+        self._test_selection_timer.timeout.connect(self._do_selection_changed_tests)
+
+        # Lazy image loading state:
+        # (test_type, tab_index) -> {"output_image": str, "scroll_x": int, "scroll_y": int}
+        self._pending_image_loads = {}
+
+        self.temp_dir = tempfile.mkdtemp()
+        QtCore.QCoreApplication.instance().aboutToQuit.connect(self.cleanup)
+
+        self.setGeometry(200, 200, 1300, 800)
+
+        self.profile_directory = os.environ.get(
+            "RPV_PROFILE_DIR",
+            "/work/rd/raas/moonray/ProfileRuns/latest_results/profile_reports")
+        self.process_weeks = True
+        self.current_test_name = None
+
+        self.work_directory = os.path.join(os.environ["HOME"], "render_profile_viewer")
+        if not os.path.exists(self.work_directory):
+            os.makedirs(self.work_directory)
+
+        # Global cache directory to check first
+        self.global_cache_directory = "/work/rd/raas/moonray/ProfileRuns/cache"
+        # User's local cache directory as fallback
+        self.cache_directory = os.path.join(self.work_directory, "cache")
+        if not os.path.exists(self.cache_directory):
+            os.makedirs(self.cache_directory)
+
+        if self.log_file_mode:
+            self.use_cache = False
+        else:
+            self.use_cache = True
+
+        self.setWindowTitle(f"Render Profile Viewer {__version__} -- (Profile directory: {self.profile_directory})")
+
+        # Stats filled in clicked_weeks_list and passed to RenderProfileChartView
+        self.stats = dict()
+
+        # Height for test types and other options group box UI
+        group_box_height = 100
+
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_v_layout = QtWidgets.QVBoxLayout()
+        central_widget.setLayout(main_v_layout)
+
+        # Menus
+        menu_bar = self.menuBar()
+        menu_bar.setNativeMenuBar(False)
+
+        # File Menu
+        file_menu = menu_bar.addMenu('File')
+
+        set_profile_dir_action = QtWidgets.QAction("Set alternate profiling dir", self)
+        set_profile_dir_action.triggered.connect(self.set_profile_dir)
+        file_menu.addAction(set_profile_dir_action)
+
+        set_log_dir_action = QtWidgets.QAction("Set log dir", self)
+        set_log_dir_action.triggered.connect(self.set_log_dir)
+        file_menu.addAction(set_log_dir_action)
+
+        use_cache_action = QtWidgets.QAction("Use cache", self)
+        use_cache_action.setCheckable(True)
+        use_cache_action.setChecked(self.use_cache)
+        use_cache_action.triggered.connect(self.set_use_cache)
+        file_menu.addAction(use_cache_action)
+
+        set_cache_dir_action = QtWidgets.QAction("Set cache dir", self)
+        set_cache_dir_action.triggered.connect(self.set_cache_dir)
+        file_menu.addAction(set_cache_dir_action)
+
+        clear_cache_dir_action = QtWidgets.QAction("Clear cache dir", self)
+        clear_cache_dir_action.triggered.connect(self.clear_cache_dir)
+        file_menu.addAction(clear_cache_dir_action)
+
+        quit_action = QtWidgets.QAction("Quit", self)
+        quit_action.triggered.connect(QtCore.QCoreApplication.quit)
+        file_menu.addAction(quit_action)
+
+        # View Menu
+        view_menu = menu_bar.addMenu('View')
+
+        set_light_theme_action = QtWidgets.QAction("Set light theme", self)
+        set_light_theme_action.triggered.connect(self.set_light_theme)
+        view_menu.addAction(set_light_theme_action)
+
+        set_dark_theme_action = QtWidgets.QAction("Set dark theme", self)
+        set_dark_theme_action.triggered.connect(self.set_dark_theme)
+        view_menu.addAction(set_dark_theme_action)
+
+        increase_font_size_action = QtWidgets.QAction("Increase font size", self)
+        increase_font_size_action.triggered.connect(self.font_size_increase)
+        view_menu.addAction(increase_font_size_action)
+
+        decrease_font_size_action = QtWidgets.QAction("Decrease font size", self)
+        decrease_font_size_action.triggered.connect(self.font_size_decrease)
+        view_menu.addAction(decrease_font_size_action)
+
+        set_label_angle_action = QtWidgets.QAction("Set chart label angle", self)
+        set_label_angle_action.triggered.connect(self.set_chart_label_angle)
+        view_menu.addAction(set_label_angle_action)
+
+        set_chart_height_action = QtWidgets.QAction("Set explicit chart height", self)
+        set_chart_height_action.triggered.connect(self.set_explicit_chart_height)
+        view_menu.addAction(set_chart_height_action)
+
+        main_h_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        main_h_splitter.setHandleWidth(10)
+        main_v_layout.addWidget(main_h_splitter)
+
+        # Theme
+        self.use_dark_theme = True
+
+        tests_weeks_log_widget = QtWidgets.QWidget()
+        main_h_splitter.addWidget(tests_weeks_log_widget)
+        tests_weeks_log_widget.setLayout(QtWidgets.QVBoxLayout())
+
+        if self.log_file_mode:
+            # Log List
+            logs_list_label = QtWidgets.QLabel("Logs")
+            tests_weeks_log_widget.layout().addWidget(logs_list_label)
+            self.show_full_paths_checkbox = QtWidgets.QCheckBox("Show full paths")
+            self.show_full_paths_checkbox.stateChanged.connect(self.checkbox_changed_full_paths)
+            tests_weeks_log_widget.layout().addWidget(self.show_full_paths_checkbox)
+            self.logs_list = QtWidgets.QListWidget()
+            self.logs_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+            tests_weeks_log_widget.layout().addWidget(self.logs_list)
+            self.logs_list.itemSelectionChanged.connect(self.selection_changed_logs)
+            self.populate_logs_list()
+            self.logs_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.logs_list.customContextMenuRequested.connect(self.log_list_context_menu)
+        else:
+            tests_weeks_v_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+            tests_weeks_v_splitter.setHandleWidth(10)
+            tests_weeks_log_widget.layout().addWidget(tests_weeks_v_splitter)
+
+            # Test List
+            tests_list_widget = QtWidgets.QWidget()
+            tests_weeks_v_splitter.addWidget(tests_list_widget)
+            tests_list_widget.setLayout(QtWidgets.QVBoxLayout())
+            tests_list_label = QtWidgets.QLabel("Tests")
+            tests_list_widget.layout().addWidget(tests_list_label)
+            self.tests_list = QtWidgets.QListWidget()
+            tests_list_widget.layout().addWidget(self.tests_list)
+            self.tests_list.itemSelectionChanged.connect(self.selection_changed_tests)
+            self.populate_test_list()
+
+            # Weeks List
+            weeks_list_widget = QtWidgets.QWidget()
+            tests_weeks_v_splitter.addWidget(weeks_list_widget)
+            weeks_list_widget.setLayout(QtWidgets.QVBoxLayout())
+            weeks_list_label = QtWidgets.QLabel("Weeks")
+            weeks_list_widget.layout().addWidget(weeks_list_label)
+            self.weeks_list = QtWidgets.QListWidget()
+            weeks_list_widget.layout().addWidget(self.weeks_list)
+            self.weeks_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+            self.weeks_list.itemSelectionChanged.connect(self.selection_changed_weeks)
+
+        # Chart / Image / Log tab widget
+        self.chart_image_log_tab_widget = QtWidgets.QTabWidget()
+        self.chart_image_log_tab_widget.setAutoFillBackground(True)
+        main_h_splitter.addWidget(self.chart_image_log_tab_widget)
+
+        # Create chart
+        self.render_profile_chart = RenderProfileChartView()
+        self.render_profile_chart.stat_signal.connect(self.statusBar().showMessage)
+
+        # Annotations - stored per test name, persisted to JSON in the log/work directory
+        self.annotations = {}
+        self._load_annotations()
+        self.render_profile_chart.annotation_changed_signal.connect(self._on_annotations_changed)
+
+        self.chart_label_angle = 90
+        self.explicit_chart_height = 100
+
+        # Chart Stats Checkboxes and Buttons
+        chart_stats_widget = QtWidgets.QWidget()
+        chart_stats_widget.setLayout(QtWidgets.QVBoxLayout())
+        chart_stats_widget.layout().setDirection(QtWidgets.QBoxLayout.BottomToTop)
+        chart_stats_widget.setFixedWidth(225)
+        chart_stats_widget.setFixedHeight(900)
+        chart_stats_widget.setAutoFillBackground(True)
+        chart_stats_widget.layout().setSpacing(0)
+        chart_stats_widget.layout().addStretch()
+
+        self.chart_stats_checkboxes = dict()
+
+        # Pixel samples stats
+        self.show_pixel_samples_checkbox = QtWidgets.QCheckBox("Show/Hide Pixel Samples")
+        self.show_pixel_samples_checkbox.setChecked(False)
+        self.show_pixel_samples_checkbox.stateChanged.connect(self.show_pixel_samples)
+        chart_stats_widget.layout().addWidget(self.show_pixel_samples_checkbox)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel(""))
+
+        # Memory stats
+        for stat in self.render_profile_chart.memory_stats:
+            self.add_stat_checkbox(stat, chart_stats_widget, False)
+        self.show_memory_checkbox = QtWidgets.QCheckBox("Show/Hide Memory Stats")
+        self.show_memory_checkbox.setChecked(False)
+        self.show_memory_checkbox.stateChanged.connect(self.show_memory)
+        chart_stats_widget.layout().addWidget(self.show_memory_checkbox)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel("Memory Stats"))
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel(""))
+
+        # Render prep stats
+        for stat in self.render_profile_chart.render_prep_stats:
+            self.add_stat_checkbox(stat, chart_stats_widget, True)
+        self.show_hide_render_prep_checkbox = QtWidgets.QCheckBox("Show/Hide Render Prep Stats")
+        self.show_hide_render_prep_checkbox.setChecked(True)
+        self.show_hide_render_prep_checkbox.stateChanged.connect(self.show_hide_render_prep_stats)
+        chart_stats_widget.layout().addWidget(self.show_hide_render_prep_checkbox)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel("Render Prep Stats"))
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel(""))
+
+        # Scalar stats
+        for stat in self.render_profile_chart.scalar_stats:
+            self.add_stat_checkbox(stat, chart_stats_widget)
+        self.show_hide_scalar_checkbox = QtWidgets.QCheckBox("Show/Hide Scalar Stats")
+        self.show_hide_scalar_checkbox.setChecked(True)
+        self.show_hide_scalar_checkbox.stateChanged.connect(self.show_hide_scalar_stats)
+        chart_stats_widget.layout().addWidget(self.show_hide_scalar_checkbox)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel("Scalar Stats"))
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel(""))
+
+        # Vector stats
+        for stat in self.render_profile_chart.vector_stats:
+            self.add_stat_checkbox(stat, chart_stats_widget)
+        self.show_hide_vector_checkbox = QtWidgets.QCheckBox("Show/Hide Vector Stats")
+        self.show_hide_vector_checkbox.setChecked(True)
+        self.show_hide_vector_checkbox.stateChanged.connect(self.show_hide_vector_stats)
+        chart_stats_widget.layout().addWidget(self.show_hide_vector_checkbox)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel("Vector Stats"))
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel(""))
+
+        # XPU stats
+        for stat in self.render_profile_chart.xpu_stats:
+            self.add_stat_checkbox(stat, chart_stats_widget)
+        chart_stats_widget.layout().addWidget(QtWidgets.QLabel("XPU Stats"))
+
+        hide_all_button = QtWidgets.QPushButton("Hide All")
+        hide_all_button.pressed.connect(self.hide_all_stats)
+        chart_stats_widget.layout().addWidget(hide_all_button)
+
+        show_all_button = QtWidgets.QPushButton("Show All")
+        show_all_button.pressed.connect(self.show_all_stats)
+        chart_stats_widget.layout().addWidget(show_all_button)
+
+        chart_v_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+
+        # Chart Tab
+        chart_v_widget = QtWidgets.QWidget()
+        chart_v_widget.setLayout(QtWidgets.QVBoxLayout())
+        chart_v_splitter.addWidget(chart_v_widget)
+        self.chart_image_log_tab_widget.addTab(chart_v_splitter, "Chart")
+
+        chart_stats_h_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        chart_v_widget.layout().addWidget(chart_stats_h_splitter)
+        chart_stats_h_splitter.setHandleWidth(10)
+
+        chart_stats_scroll_area = QtWidgets.QScrollArea()
+        chart_stats_scroll_area.setWidget(chart_stats_widget)
+        chart_stats_h_splitter.addWidget(chart_stats_scroll_area)
+
+        chart_stats_h_splitter.addWidget(self.render_profile_chart)
+        chart_stats_h_splitter.setSizes([175, 800])
+
+        # Test Types
+        test_type_group_box = QtWidgets.QGroupBox()
+        test_type_group_box.setLayout(QtWidgets.QVBoxLayout())
+        test_type_group_box.setFixedHeight(group_box_height)
+        test_type_group_box.setTitle("Test Types")
+        tests_weeks_log_widget.layout().addWidget(test_type_group_box)
+
+        self.scalar_checkbox = QtWidgets.QCheckBox("scalar")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.scalar_color)
+        pal.setColor(QtGui.QPalette.WindowText, self.render_profile_chart.scalar_color)
+        self.scalar_checkbox.setPalette(pal)
+        self.scalar_checkbox.setChecked(True)
+        if self.log_file_mode:
+            self.scalar_checkbox.stateChanged.connect(self.selection_changed_logs)
+        else:
+            self.scalar_checkbox.stateChanged.connect(self.selection_changed_weeks)
+        test_type_group_box.layout().addWidget(self.scalar_checkbox)
+
+        self.vector_checkbox = QtWidgets.QCheckBox("vector")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.vector_color)
+        pal.setColor(QtGui.QPalette.WindowText, self.render_profile_chart.vector_color)
+        self.vector_checkbox.setPalette(pal)
+        self.vector_checkbox.setChecked(True)
+        if self.log_file_mode:
+            self.vector_checkbox.stateChanged.connect(self.selection_changed_logs)
+        else:
+            self.vector_checkbox.stateChanged.connect(self.selection_changed_weeks)
+        test_type_group_box.layout().addWidget(self.vector_checkbox)
+
+        self.xpu_checkbox = QtWidgets.QCheckBox("xpu")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.xpu_color)
+        pal.setColor(QtGui.QPalette.WindowText, self.render_profile_chart.xpu_color)
+        self.xpu_checkbox.setPalette(pal)
+        self.xpu_checkbox.setChecked(True)
+        if self.log_file_mode:
+            self.xpu_checkbox.stateChanged.connect(self.selection_changed_logs)
+        else:
+            self.xpu_checkbox.stateChanged.connect(self.selection_changed_weeks)
+        test_type_group_box.layout().addWidget(self.xpu_checkbox)
+
+        # Image Tab
+        self.image_tabs = None
+        self._images_stale = False  # True when stats changed but images not yet rebuilt
+
+        self.image_size_spin_box = QtWidgets.QDoubleSpinBox()
+        self.image_size_spin_box.setFixedWidth(50)
+        self.image_size_spin_box.setSingleStep(0.05)
+        self.image_size_spin_box.setDecimals(2)
+        self.image_size_spin_box.setMinimum(0.1)
+        self.image_size_spin_box.setMaximum(10.0)
+        self.image_size_spin_box.setValue(1.0)
+        self.image_size_spin_box.setEnabled(True)
+        self.image_size_spin_box.valueChanged.connect(self.update_images)
+        self.image_size_spin_box.setToolTip("Zoom factor for displayed images")
+
+        self.scroll_areas = {"scalar": [], "vector": [], "xpu": []}  # Store scroll areas
+        self.image_widget = ImageTabWidget(self.image_size_spin_box, self.update_images)
+        self.image_widget.setLayout(QtWidgets.QVBoxLayout())
+        self.chart_image_log_tab_widget.addTab(self.image_widget, "Images")
+
+        # Image Label
+        self.image_label = QtWidgets.QLabel("")
+        self.image_widget.layout().addWidget(self.image_label)
+
+        # Show images button
+        if self.log_file_mode:
+            self.show_images_button = QtWidgets.QPushButton("Show images for selected logs with iv")
+        else:
+            self.show_images_button = QtWidgets.QPushButton("Show images for selected weeks with iv")
+        self.show_images_button.setFixedWidth(250)
+        self.show_images_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Maximum)
+        self.show_images_button.pressed.connect(self.show_selected_images)
+        self.image_widget.layout().addWidget(self.show_images_button)
+
+        # Diff images
+        self.diff_cache = { 'scalar': {}, 'vector': {}, 'xpu': {} }
+        image_diff_widget = QtWidgets.QWidget()
+        image_diff_widget.setLayout(QtWidgets.QHBoxLayout())
+
+        if self.log_file_mode:
+            self.diff_images_button = QtWidgets.QPushButton("Diff images for selected logs")
+        else:
+            self.diff_images_button = QtWidgets.QPushButton("Diff images for selected weeks")
+        self.diff_images_button.setFixedWidth(250)
+        self.diff_images_button.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Maximum)
+        self.diff_images_button.pressed.connect(self.diff_selected_images)
+        image_diff_widget.layout().addWidget(self.diff_images_button)
+
+        image_fail_label = QtWidgets.QLabel("Fail")
+        image_diff_widget.layout().addWidget(image_fail_label)
+        self.image_fail_spin_box = QtWidgets.QDoubleSpinBox()
+        self.image_fail_spin_box.setFixedWidth(50)
+        self.image_fail_spin_box.setSingleStep(0.001)
+        self.image_fail_spin_box.setDecimals(3)
+        self.image_fail_spin_box.setMinimum(0.0)
+        self.image_fail_spin_box.setMaximum(1.0)
+        self.image_fail_spin_box.setValue(0.004)
+        self.image_fail_spin_box.setToolTip("Failure absolute difference threshold")
+        image_diff_widget.layout().addWidget(self.image_fail_spin_box)
+
+        image_fail_percent_label = QtWidgets.QLabel("Fail Percent")
+        image_diff_widget.layout().addWidget(image_fail_percent_label)
+        self.image_fail_percent_spin_box = QtWidgets.QDoubleSpinBox()
+        self.image_fail_percent_spin_box.setFixedWidth(50)
+        self.image_fail_percent_spin_box.setSingleStep(0.01)
+        self.image_fail_percent_spin_box.setDecimals(2)
+        self.image_fail_percent_spin_box.setMinimum(0.0)
+        self.image_fail_percent_spin_box.setMaximum(1.0)
+        self.image_fail_percent_spin_box.setValue(0.01)
+        self.image_fail_percent_spin_box.setToolTip("Allow this percentage of failed pixels")
+        image_diff_widget.layout().addWidget(self.image_fail_percent_spin_box)
+
+        image_diff_widget.layout().addStretch()
+
+        image_scale_widget = QtWidgets.QWidget()
+        image_scale_widget.setLayout(QtWidgets.QHBoxLayout())
+        image_scale_label = QtWidgets.QLabel("Image Scale")
+        image_scale_widget.layout().addWidget(image_scale_label)
+        image_scale_widget.layout().addWidget(self.image_size_spin_box)
+        help_label = QtWidgets.QLabel("Tip: Zoom with mouse wheel, Pan with left mouse, PgUp/PgDn changes week tabs, Ctrl+PgUp/PgDn changes test type tabs")
+        image_scale_widget.layout().addWidget(help_label)
+        image_scale_widget.layout().addStretch()
+
+        self.image_tab_widget = QtWidgets.QTabWidget()
+        self.image_tab_widget.setTabBar(CustomTabBar())
+
+        # Add shortcuts for cycling test type tabs
+        next_type_tab = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+PgDown"), self.image_tab_widget)
+        next_type_tab.activated.connect(
+            lambda: self.image_tab_widget.setCurrentIndex((self.image_tab_widget.currentIndex() + 1) % self.image_tab_widget.count()))
+
+        prev_type_tab = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+PgUp"), self.image_tab_widget)
+        prev_type_tab.activated.connect(
+            lambda: self.image_tab_widget.setCurrentIndex((self.image_tab_widget.currentIndex() - 1) % self.image_tab_widget.count()))
+
+        self.image_widget.layout().addWidget(image_diff_widget)
+        self.image_widget.layout().addWidget(image_scale_widget)
+        self.image_widget.layout().addWidget(self.image_tab_widget)
+
+        # Logs Tab
+        logs_widget = QtWidgets.QWidget()
+        logs_widget.setLayout(QtWidgets.QVBoxLayout())
+        logs_widget.layout().addWidget(QtWidgets.QLabel("Select a week to display log files"))
+        self.chart_image_log_tab_widget.addTab(logs_widget, "Logs")
+        self._images_tab_index = self.chart_image_log_tab_widget.indexOf(self.image_widget)
+        self._logs_tab_index = self.chart_image_log_tab_widget.indexOf(logs_widget)
+        self._logs_stale = False
+        self._pending_log_widgets = []  # list of (log_path, test_type)
+        self.chart_image_log_tab_widget.currentChanged.connect(self._on_main_tab_changed)
+
+        # Font size
+        log_font_size_widget = QtWidgets.QWidget()
+        logs_widget.layout().addWidget(log_font_size_widget)
+        log_font_size_widget.setLayout(QtWidgets.QHBoxLayout())
+        log_font_size_widget.layout().addWidget(QtWidgets.QLabel("Font Size:"))
+        self.log_font_size_spinner = QtWidgets.QSpinBox()
+        self.log_font_size_spinner.setRange(1, 100)  # Set min and max font sizes
+        self.log_font_size_spinner.setValue(12)  # Set default font size
+        self.log_font_size_spinner.valueChanged.connect(self.change_logs_font_size)
+        log_font_size_widget.layout().addWidget(self.log_font_size_spinner)
+        self.apply_ansi_colors_checkbox = QtWidgets.QCheckBox("Apply ANSI colors")
+        self.apply_ansi_colors_checkbox.setChecked(True)
+        self.apply_ansi_colors_checkbox.setToolTip("Apply ansi colors to log file.  Can be slow with large files")
+        log_font_size_widget.layout().addWidget(self.apply_ansi_colors_checkbox)
+        self.word_wrap_checkbox = QtWidgets.QCheckBox("Wrap text")
+        log_font_size_widget.layout().addWidget(self.word_wrap_checkbox)
+        log_font_size_widget.layout().addStretch()
+
+        # Search UI
+        search_widget = QtWidgets.QWidget()
+        logs_widget.layout().addWidget(search_widget)
+        search_widget.setLayout(QtWidgets.QHBoxLayout())
+        search_widget.layout().addWidget(QtWidgets.QLabel("Search"))
+        self.search_text = QtWidgets.QLineEdit()
+        self.search_text.setFixedWidth(200)
+        self.search_text.setClearButtonEnabled(True)
+        self.search_text.returnPressed.connect(self.search_log_next)
+        search_widget.layout().addWidget(self.search_text)
+        self.search_next_button = QtWidgets.QPushButton("Find Next")
+        self.search_next_button.clicked.connect(self.search_log_next)
+        search_widget.layout().addWidget(self.search_next_button)
+        self.search_previous_button = QtWidgets.QPushButton("Find Previous")
+        self.search_previous_button.clicked.connect(self.search_log_previous)
+        search_widget.layout().addWidget(self.search_previous_button)
+        self.search_case_sensitive_checkbox = QtWidgets.QCheckBox("Case Sensitive")
+        search_widget.layout().addWidget(self.search_case_sensitive_checkbox)
+        search_widget.layout().addStretch()
+
+        self.search_forward = True
+        self.last_search = ""
+
+        # Hold list of log browsers to determine which one to search
+        self.log_browsers = []
+
+        self.log_tab_widget = QtWidgets.QTabWidget()
+        logs_widget.layout().addWidget(self.log_tab_widget)
+
+        self.log_scalar_tab = None
+        self.log_vector_tab = None
+        self.log_xpu_tab = None
+
+        # Bottom Scalar, Vector, and XPU Checkboxes and Resize
+        chart_bottom_widget = QtWidgets.QWidget()
+        chart_bottom_widget.setLayout(QtWidgets.QHBoxLayout())
+        chart_v_splitter.addWidget(chart_bottom_widget)
+
+        # Host Filter
+        host_filter_group_box = QtWidgets.QGroupBox()
+        host_filter_group_box.setLayout(QtWidgets.QVBoxLayout())
+        host_filter_group_box.setFixedHeight(group_box_height)
+        host_filter_group_box.setTitle("Host Filter")
+        chart_bottom_widget.layout().addWidget(host_filter_group_box)
+
+        self.host_filter_line_edit = QtWidgets.QLineEdit()
+        self.host_filter_line_edit.setToolTip("List of space separated host prefixes "
+                                              "to filter by (i.e. \"ws p920 tin\"")
+        self.host_filter_line_edit.editingFinished.connect(self.update_chart)
+        host_filter_group_box.layout().addWidget(self.host_filter_line_edit)
+
+        self.show_hosts_in_chart_checkbox = QtWidgets.QCheckBox("Show host names in chart")
+        self.show_hosts_in_chart_checkbox.setToolTip("Show the names of the hosts instead of dates/types in the chart")
+        self.show_hosts_in_chart_checkbox.setChecked(False)
+        self.show_hosts_in_chart_checkbox.stateChanged.connect(self.update_chart)
+        host_filter_group_box.layout().addWidget(self.show_hosts_in_chart_checkbox)
+
+        # Options
+        options_group_box = QtWidgets.QGroupBox()
+        options_group_box.setLayout(QtWidgets.QVBoxLayout())
+        options_group_box.layout().setSpacing(0)
+        options_group_box.setTitle("Options")
+        chart_bottom_widget.layout().addWidget(options_group_box)
+        options_group_box.setFixedHeight(group_box_height)
+
+        self.divide_by_ps_checkbox = QtWidgets.QCheckBox("Divide by Pixel Samples")
+        self.divide_by_ps_checkbox.setChecked(False)
+        self.divide_by_ps_checkbox.stateChanged.connect(lambda: self.update_chart(resize=True))
+        options_group_box.layout().addWidget(self.divide_by_ps_checkbox)
+
+        self.show_trend_lines_checkbox = QtWidgets.QCheckBox("Show Trend Lines")
+        self.show_trend_lines_checkbox.setChecked(True)
+        self.show_trend_lines_checkbox.stateChanged.connect(lambda: self.update_chart(resize=True))
+        options_group_box.layout().addWidget(self.show_trend_lines_checkbox)
+
+        self.show_fallback_checkbox = QtWidgets.QCheckBox("Show Fallback")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.fallback_color)
+        self.show_fallback_checkbox.setPalette(pal)
+        self.show_fallback_checkbox.setChecked(True)
+        self.show_fallback_checkbox.stateChanged.connect(lambda: self.update_chart(resize=True))
+        options_group_box.layout().addWidget(self.show_fallback_checkbox)
+
+        self.show_crash_checkbox = QtWidgets.QCheckBox("Show Crash")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.crash_color)
+        self.show_crash_checkbox.setPalette(pal)
+        self.show_crash_checkbox.setChecked(True)
+        self.show_crash_checkbox.stateChanged.connect(lambda: self.update_chart(resize=True))
+        options_group_box.layout().addWidget(self.show_crash_checkbox)
+
+        options_group_box.layout().addStretch()
+
+        # Bottom Performance Thresholds
+        performance_thresholds_group_box = QtWidgets.QGroupBox()
+        performance_thresholds_group_box.setLayout(QtWidgets.QHBoxLayout())
+        performance_thresholds_group_box.layout().setDirection(QtWidgets.QBoxLayout.RightToLeft)
+        performance_thresholds_group_box.setTitle("Performance Thresholds")
+        performance_thresholds_group_box.setFixedHeight(group_box_height)
+        chart_bottom_widget.layout().addWidget(performance_thresholds_group_box)
+
+        self.improvement_warning_checkbox = QtWidgets.QCheckBox("Show Improvements")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.improvements_color)
+        self.improvement_warning_checkbox.setPalette(pal)
+        self.improvement_warning_checkbox.setChecked(False)
+        self.improvement_warning_checkbox.stateChanged.connect(self.checkbox_changed_improvements)
+        self.improvement_warning_checkbox.setToolTip("Highlight stats that have improved more than this "
+                                                     " percentage from the previous week in green")
+        performance_thresholds_group_box.layout().addWidget(self.improvement_warning_checkbox)
+
+        self.improvement_warning_spin_box = QtWidgets.QSpinBox()
+        self.improvement_warning_spin_box.setMinimum(0)
+        self.improvement_warning_spin_box.setMaximum(100)
+        self.improvement_warning_spin_box.setValue(10)
+        self.improvement_warning_spin_box.setEnabled(False)
+        self.improvement_warning_spin_box.valueChanged.connect(self.update_chart)
+        self.improvement_warning_spin_box.setToolTip("Highlight stats that have improved more than this "
+                                                     " percentage from the previous week in green")
+        performance_thresholds_group_box.layout().addWidget(self.improvement_warning_spin_box)
+
+        self.regression_warning_checkbox = QtWidgets.QCheckBox("Show Regressions")
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, self.render_profile_chart.regression_color)
+        self.regression_warning_checkbox.setPalette(pal)
+        self.regression_warning_checkbox.setChecked(False)
+        self.regression_warning_checkbox.stateChanged.connect(self.checkbox_changed_regressions)
+        self.regression_warning_checkbox.setToolTip("Highlight stats that have regressed more than this "
+                                                    " percentage from the previous week in red")
+        performance_thresholds_group_box.layout().addWidget(self.regression_warning_checkbox)
+        self.regression_warning_spin_box = QtWidgets.QSpinBox()
+        self.regression_warning_spin_box.setMinimum(0)
+        self.regression_warning_spin_box.setMaximum(100)
+        self.regression_warning_spin_box.setValue(10)
+        self.regression_warning_spin_box.setEnabled(False)
+        self.regression_warning_spin_box.valueChanged.connect(self.update_chart)
+        self.regression_warning_spin_box.setToolTip("Highlight stats that have regressed more than this "
+                                                    " percentage from the previous week in red")
+        performance_thresholds_group_box.layout().addWidget(self.regression_warning_spin_box)
+
+        # Font Size
+        self.font_size = 11
+
+        # Bottom View Controls
+        view_group_box = QtWidgets.QGroupBox()
+        view_group_box.setFixedHeight(group_box_height)
+        view_group_box.setLayout(QtWidgets.QHBoxLayout())
+
+        view_group_box.setTitle("View")
+        view_group_box.setToolTip("Use the buttons or press 'wasd' to scroll,"
+                                  "'q' to zoom out, 'e' to zoom in, and 'r' to home")
+        chart_bottom_widget.layout().addWidget(view_group_box)
+
+        resize_button = QtWidgets.QPushButton("Refit Chart")
+        resize_button.setToolTip("Reset the view to fit the current chart - can also press 'Home' or 'r'")
+        resize_button.setFixedWidth(100)
+        resize_button.pressed.connect(lambda: self.update_chart(resize=True))
+        view_group_box.layout().addWidget(resize_button)
+
+        chart_bottom_widget.layout().addStretch()
+
+        main_h_splitter.setSizes([250, 1350])
+
+        self.show()
+
+        # Set initial dark theme
+        app = QtWidgets.QApplication.instance()
+        palette = app.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(50, 50, 50))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor(70, 70, 70))
+        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Text, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor(70, 70, 70))
+        app.setPalette(palette)
+        self.setStyleSheet(f'font-size: {self.font_size}px')
+
+        if self.log_file_mode:
+            self.logs_list.selectAll()
+        else:
+            # Select first row and show chars
+            self.tests_list.setCurrentRow(0)
+            self._do_selection_changed_tests()
+
+    def _get_annotations_file(self):
+        """Get the path to the annotations JSON file.
+
+        In log-file mode, stores annotations.json alongside the log files.
+        Otherwise, stores in a shared writable directory so annotations
+        are visible to all users.
+        """
+        if self.log_file_mode and hasattr(self, 'log_files') and self.log_files:
+            log_dir = os.path.dirname(os.path.abspath(self.log_files[0]))
+            return os.path.join(log_dir, "annotations.json")
+        shared_dir = os.environ.get("RPV_ANNOTATIONS_DIR",
+                                    "/work/gshad/moonshine/render_profile_viewer")
+        if not os.path.exists(shared_dir):
+            os.makedirs(shared_dir)
+        return os.path.join(shared_dir, "annotations.json")
+
+    @staticmethod
+    def _normalize_annotations_structure(data):
+        """Validate and normalize the annotations JSON structure.
+
+        Expects a dict mapping test names to lists of {week, y, note} objects.
+        Coerces y to float and note to string. Invalid entries are skipped.
+        """
+        if not isinstance(data, dict):
+            return {}
+        normalized = {}
+        for test_name, annotations in data.items():
+            if not isinstance(annotations, list):
+                continue
+            normalized_list = []
+            for ann in annotations:
+                if not isinstance(ann, dict):
+                    continue
+                try:
+                    week_raw = ann.get('week')
+                    y_raw = ann.get('y')
+                    if week_raw is None or y_raw is None:
+                        continue
+                    week = str(week_raw)
+                    y = float(y_raw)
+                except (TypeError, ValueError):
+                    continue
+                note = ann.get('note')
+                if note is None:
+                    note = ""
+                elif not isinstance(note, str):
+                    note = str(note)
+                normalized_list.append({'week': week, 'y': y, 'note': note})
+            if normalized_list:
+                normalized[test_name] = normalized_list
+        return normalized
+
+    def _load_annotations(self):
+        """Load annotations from the annotations JSON file."""
+        annotations_file = self._get_annotations_file()
+        if os.path.exists(annotations_file):
+            try:
+                with open(annotations_file, 'r') as f:
+                    raw_data = json.load(f)
+                self.annotations = self._normalize_annotations_structure(raw_data)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"Error loading annotations from {annotations_file}: {e}")
+                self.annotations = {}
+        else:
+            self.annotations = {}
+
+    def _save_annotations(self):
+        """Save annotations to the annotations JSON file."""
+        annotations_file = self._get_annotations_file()
+        try:
+            with open(annotations_file, 'w') as f:
+                json.dump(self.annotations, f, indent=4)
+        except IOError as e:
+            print(f"Error saving annotations to {annotations_file}: {e}")
+
+    def _on_annotations_changed(self, annotations):
+        """Called when annotations are added/edited/deleted in the chart view."""
+        test_name = self._get_current_test_name()
+        if test_name:
+            if annotations:
+                self.annotations[test_name] = annotations
+            elif test_name in self.annotations:
+                del self.annotations[test_name]
+            self._save_annotations()
+            self.update_chart()
+
+    def _get_current_test_name(self):
+        """Get a stable annotation storage key for the current selection.
+
+        Uses UserRole data ('name') when available so the key does not
+        change when 'Show full paths' is toggled.
+        """
+        try:
+            if self.log_file_mode:
+                selected = self.logs_list.selectedItems()
+                if len(selected) > 1:
+                    # Build a deterministic key from sorted stable names
+                    names = []
+                    for item in selected:
+                        user_data = item.data(QtCore.Qt.UserRole)
+                        if isinstance(user_data, dict) and 'name' in user_data:
+                            names.append(user_data['name'])
+                        else:
+                            names.append(item.text())
+                    return "_multi_log_:" + "|".join(sorted(names))
+                elif len(selected) == 1:
+                    item = selected[0]
+                    user_data = item.data(QtCore.Qt.UserRole)
+                    if isinstance(user_data, dict) and 'name' in user_data:
+                        return user_data['name']
+                    return item.text()
+            else:
+                if hasattr(self, 'tests_list') and self.tests_list.selectedItems():
+                    return self.tests_list.selectedItems()[0].text()
+        except (AttributeError, IndexError):
+            pass
+        return None
+
+    def cleanup(self):
+        if self.temp_dir:
+            shutil.rmtree(self.temp_dir)
+
+    def log_list_context_menu(self, position):
+        pop_menu = QtWidgets.QMenu()
+
+        if self.logs_list.itemAt(position):
+            set_test_name_action = QtWidgets.QAction("Set test name")
+            set_test_name_action.triggered.connect(self.set_custom_log_name)
+            pop_menu.addAction(set_test_name_action)
+            pop_menu.exec_(self.logs_list.mapToGlobal(position))
+
+    def set_custom_log_name(self):
+        selected_item = self.logs_list.selectedItems()[0]
+        user_role_dict = selected_item.data(QtCore.Qt.UserRole)
+        test_name = user_role_dict["name"]
+
+        new_test_name, ok = QtWidgets.QInputDialog.getText(self,
+                                                           "Set test name",
+                                                           "Enter new test name",
+                                                           QtWidgets.QLineEdit.Normal,
+                                                           test_name)
+
+        if ok:
+            selected_item.setText(new_test_name)
+            user_role_dict["name"] = new_test_name
+            selected_item.setData(QtCore.Qt.UserRole, user_role_dict)
+            self.selection_changed_logs()
+
+    # noinspection PyTypeChecker
+    def set_log_dir(self):
+        file_dialog = QtWidgets.QFileDialog(self)
+        file_dialog.setWindowTitle("Select logs directory")
+        file_dialog.setFileMode(QtWidgets.QFileDialog.Directory)
+        file_dialog.setOptions(QtWidgets.QFileDialog.DontUseNativeDialog)  # Forces Qt dialog with input field
+        if file_dialog.exec():
+            logs_dir = file_dialog.selectedFiles()[0]  # Get the chosen directory
+            # Restart the app with the logs passed on the command line
+            python_exe = sys.executable
+            script_path = sys.argv[0]  # Path to the script
+            log_files = glob.glob(f"{logs_dir}/*.log") or ["NoLogFilesFound"]
+            command = [script_path] + log_files
+            print("Restarting with command:", " ".join(command))
+            QtCore.QProcess.startDetached(script_path, log_files)
+            QtWidgets.QApplication.quit()
+
+        self.populate_test_list()
+        self.tests_list.setCurrentRow(0)
+        self._do_selection_changed_tests()
+        
+    def set_profile_dir(self):
+        file_dialog = QtWidgets.QFileDialog(self)
+        file_dialog.setWindowTitle("Select profile directory")
+        file_dialog.setFileMode(QtWidgets.QFileDialog.Directory)
+        file_dialog.setOptions(QtWidgets.QFileDialog.DontUseNativeDialog)  # Forces Qt dialog with input field
+        if file_dialog.exec():
+            self.profile_directory = file_dialog.selectedFiles()[0]  # Get the chosen directory
+            self.setWindowTitle(f"Render Profile Viewer {__version__} -- (Profile directory: {self.profile_directory})")
+            self.populate_test_list()
+            self.tests_list.setCurrentRow(0)
+            self._do_selection_changed_tests()
+            self.weeks_list.selectAll()
+            self.selection_changed_weeks()
+
+    # noinspection PyTypeChecker
+    def set_cache_dir(self):
+        file_dialog = QtWidgets.QFileDialog(self)
+        file_dialog.setWindowTitle("Select cache directory")
+        file_dialog.setFileMode(QtWidgets.QFileDialog.Directory)
+        file_dialog.setOptions(QtWidgets.QFileDialog.DontUseNativeDialog)  # Forces Qt dialog with input field
+        if file_dialog.exec():
+            self.cache_directory = file_dialog.selectedFiles()[0]  # Get the chosen directory
+
+    def clear_cache_dir(self):
+        shutil.rmtree(self.cache_directory,
+                      ignore_errors=False)
+        os.makedirs(self.cache_directory)
+
+    def load_stats_from_cache(self, cache_file_name):
+        """
+        Try to load stats from global cache or user's local cache directory.
+        Returns stats dict if found, else None.
+        """
+        # Check global cache directory first
+        global_cache_file_path = os.path.join(self.global_cache_directory, cache_file_name)
+        if os.path.exists(global_cache_file_path) and self.use_cache:
+            try:
+                with open(global_cache_file_path) as f:
+                    stats = json.load(f)
+                    return stats
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                print(f"Error reading {global_cache_file_path}: {e}")
+
+        # Check user's local cache directory
+        cache_file_path = os.path.join(self.cache_directory, cache_file_name)
+        if os.path.exists(cache_file_path) and self.use_cache:
+            try:
+                with open(cache_file_path) as f:
+                    stats = json.load(f)
+                return stats
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                print(f"Error reading {cache_file_path}: {e}")
+        return None
+
+    def set_use_cache(self):
+        self.use_cache = not self.use_cache
+
+    def set_dark_theme(self):
+        app = QtWidgets.QApplication.instance()
+        palette = app.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(50, 50, 50))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor(70, 70, 70))
+        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Text, QtGui.QColor(255, 255, 255))
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor(70, 70, 70))
+        app.setPalette(palette)
+        self.setStyleSheet(f'font-size: {self.font_size}px')
+        self.use_dark_theme = True
+        self.update_chart()
+
+    def set_light_theme(self):
+        app = QtWidgets.QApplication.instance()
+        palette = app.palette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(239, 239, 239))
+        palette.setColor(QtGui.QPalette.Button, QtGui.QColor(239, 239, 239))
+        palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(0, 0, 0))
+        palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(0, 0, 0))
+        palette.setColor(QtGui.QPalette.Text, QtGui.QColor(0, 0, 0))
+        palette.setColor(QtGui.QPalette.Base, QtGui.QColor(255, 255, 255))
+        app.setPalette(palette)
+        self.setStyleSheet(f'font-size: {self.font_size}px')
+        self.use_dark_theme = False
+        self.update_chart()
+
+    def checkbox_changed_improvements(self):
+        if self.improvement_warning_checkbox.isChecked():
+            self.improvement_warning_spin_box.setEnabled(True)
+        else:
+            self.improvement_warning_spin_box.setEnabled(False)
+        self.update_chart()
+
+    def checkbox_changed_regressions(self):
+        if self.regression_warning_checkbox.isChecked():
+            self.regression_warning_spin_box.setEnabled(True)
+        else:
+            self.regression_warning_spin_box.setEnabled(False)
+        self.update_chart()
+
+    def checkbox_changed_full_paths(self):
+        for row in range(self.logs_list.count()):
+            item = self.logs_list.item(row)
+            user_role_dict = item.data(QtCore.Qt.UserRole)
+            if self.show_full_paths_checkbox.isChecked():
+                item.setText(user_role_dict["path"])
+            else:
+                item.setText(user_role_dict["name"])
+
+    def font_size_increase(self):
+        if self.font_size <= 50:
+            self.font_size += 2
+            self.setStyleSheet(f'font-size: {self.font_size}px')
+            self.update_chart(resize=False)
+
+    def font_size_decrease(self):
+        if self.font_size >= 5:
+            self.font_size -= 2
+            self.setStyleSheet(f'font-size: {self.font_size}px')
+            self.update_chart(resize=False)
+
+    def set_chart_label_angle(self):
+        angle, ok = QtWidgets.QInputDialog.getDouble(self,
+                                                     "Set chart labels angle",
+                                                     "Enter new angle",
+                                                     self.chart_label_angle,
+                                                     -360.0, 360.0)
+
+        if ok:
+            self.chart_label_angle = angle
+            self.update_chart()
+
+    def set_explicit_chart_height(self):
+        height, ok = QtWidgets.QInputDialog.getDouble(self,
+                                                     "Set explicit chart height",
+                                                     "Enter new height",
+                                                     self.explicit_chart_height,
+                                                     0, 1000000)
+
+        if ok:
+            self.explicit_chart_height = height
+            self.update_chart(resize=False, explicit_height=height)
+
+    def show_all_stats(self):
+        for stat in self.chart_stats_checkboxes.keys():
+            self.chart_stats_checkboxes[stat].setChecked(True)
+        self.show_hide_vector_checkbox.setChecked(True)
+        self.show_hide_scalar_checkbox.setChecked(True)
+        self.show_hide_render_prep_checkbox.setChecked(True)
+        self.update_chart(resize=True)
+
+    def hide_all_stats(self):
+        for stat in self.chart_stats_checkboxes.keys():
+            self.chart_stats_checkboxes[stat].setChecked(False)
+
+        self.show_hide_vector_checkbox.setChecked(False)
+        self.show_hide_scalar_checkbox.setChecked(False)
+        self.show_hide_render_prep_checkbox.setChecked(False)
+        self.update_chart()
+
+    def show_hide_scalar_stats(self):
+        for stat in self.render_profile_chart.scalar_stats:
+            if self.show_hide_scalar_checkbox.isChecked():
+                self.chart_stats_checkboxes[stat].setChecked(True)
+            else:
+                self.chart_stats_checkboxes[stat].setChecked(False)
+        self.update_chart(resize=False)
+
+    def show_hide_render_prep_stats(self):
+        for stat in self.render_profile_chart.render_prep_stats:
+            if self.show_hide_render_prep_checkbox.isChecked():
+                self.chart_stats_checkboxes[stat].setChecked(True)
+            else:
+                self.chart_stats_checkboxes[stat].setChecked(False)
+        self.update_chart(resize=False)
+
+    def show_hide_vector_stats(self):
+        for stat in self.render_profile_chart.vector_stats:
+            if self.show_hide_vector_checkbox.isChecked():
+                self.chart_stats_checkboxes[stat].setChecked(True)
+            else:
+                self.chart_stats_checkboxes[stat].setChecked(False)
+        self.update_chart(resize=False)
+
+    def show_pixel_samples(self):
+        stats = self.render_profile_chart.render_prep_stats +\
+                self.render_profile_chart.scalar_stats +\
+                self.render_profile_chart.vector_stats +\
+                self.render_profile_chart.xpu_stats
+        if self.show_pixel_samples_checkbox.isChecked():
+            self.show_memory_checkbox.setChecked(False)
+            self.show_hide_render_prep_checkbox.setEnabled(False)
+            self.show_hide_scalar_checkbox.setEnabled(False)
+            self.show_hide_vector_checkbox.setEnabled(False)
+            for stat in stats:
+                self.chart_stats_checkboxes[stat].setEnabled(False)
+        else:
+            self.show_hide_render_prep_checkbox.setEnabled(True)
+            self.show_hide_scalar_checkbox.setEnabled(True)
+            self.show_hide_vector_checkbox.setEnabled(True)
+            for stat in stats:
+                self.chart_stats_checkboxes[stat].setEnabled(True)
+        self.update_chart(resize=True)
+
+    def show_memory(self):
+        stats = self.render_profile_chart.render_prep_stats + \
+                self.render_profile_chart.scalar_stats + \
+                self.render_profile_chart.vector_stats + \
+                self.render_profile_chart.xpu_stats
+        if self.show_memory_checkbox.isChecked():
+            self.show_pixel_samples_checkbox.setChecked(False)
+            self.show_hide_render_prep_checkbox.setEnabled(False)
+            self.show_hide_scalar_checkbox.setEnabled(False)
+            self.show_hide_vector_checkbox.setEnabled(False)
+            for stat in stats:
+                self.chart_stats_checkboxes[stat].setEnabled(False)
+            for stat in self.render_profile_chart.memory_stats:
+                self.chart_stats_checkboxes[stat].setChecked(True)
+                self.chart_stats_checkboxes[stat].setEnabled(True)
+        else:
+            self.show_hide_render_prep_checkbox.setEnabled(True)
+            self.show_hide_scalar_checkbox.setEnabled(True)
+            self.show_hide_vector_checkbox.setEnabled(True)
+            for stat in stats:
+                self.chart_stats_checkboxes[stat].setEnabled(True)
+            for stat in self.render_profile_chart.memory_stats:
+                self.chart_stats_checkboxes[stat].setChecked(False)
+                self.chart_stats_checkboxes[stat].setEnabled(False)
+        self.update_chart(resize=True)
+
+    def add_stat_checkbox(self, stat, stats_widget, default_state=True):
+        check_box = QtWidgets.QCheckBox(stat)
+        check_box.setChecked(default_state)
+        check_box.setSizePolicy(QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Minimum)
+        check_box.setFixedHeight(18)
+        check_box.clicked.connect(lambda: self.update_chart(resize=False))
+
+        check_box_color = self.render_profile_chart.stat_colors[stat]
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Window, check_box_color)
+        pal.setColor(QtGui.QPalette.Base, check_box_color)
+        check_box.setPalette(pal)
+        check_box.update()
+
+        stats_widget.layout().addWidget(check_box)
+        self.chart_stats_checkboxes[stat] = check_box
+
+    def get_test_dir(self, test_name):
+        return os.path.join(self.profile_directory, test_name)
+
+    def extract_weeks_from_cache_directory(self, cache_dir, test_name, weeks):
+        """Extract weeks from cache files in the specified directory.
+        
+        Args:
+            cache_dir: Path to the cache directory to scan
+            test_name: Name of the test to filter cache files
+            weeks: Set to add discovered weeks to
+        """
+        if not os.path.isdir(cache_dir):
+            return
+        
+        with os.scandir(cache_dir) as cache_files:
+            for f in cache_files:
+                if not f.is_dir() and f.name.startswith(test_name + '_') and f.name.endswith('.json'):
+                    # Extract week from cache filename: testname_week_logtype.json
+                    parts = f.name[len(test_name) + 1:].split('_')
+                    if len(parts) >= 2:
+                        week = parts[0]
+                        weeks.add(week)
+
+    def selection_changed_tests(self):
+        # Debounce: restart the timer on each selection change so that
+        # rapid clicks only trigger one expensive update.
+        self._test_selection_timer.start()
+
+    def _do_selection_changed_tests(self):
+        # Stop the debounce timer in case this was called directly
+        self._test_selection_timer.stop()
+
+        # Reset zoom
+        self.image_size_spin_box.setValue(1.0)
+
+        prev_selected_weeks = [i.text() for i in self.weeks_list.selectedItems()]
+
+        self.weeks_list.clear()
+        self.stats.clear()
+        if len(self.tests_list.selectedItems()) == 0:
+            return
+
+        test_name = self.tests_list.selectedItems()[0].text()
+        
+        # Check if we're switching to a different test
+        is_new_test = (test_name != self.current_test_name)
+        self.current_test_name = test_name
+
+        weeks = set()
+        test_dir = self.get_test_dir(test_name)
+        with os.scandir(test_dir) as files:
+            for f in files:
+                if not f.is_dir():
+                    week = f.name.split('_')[0]
+                    weeks.add(week)
+
+        # If use_cache is enabled, also check cache directories for cache files
+        if self.use_cache:
+            # Check global cache directory first
+            self.extract_weeks_from_cache_directory(self.global_cache_directory, test_name, weeks)
+            
+            # Check user's local cache directory
+            self.extract_weeks_from_cache_directory(self.cache_directory, test_name, weeks)
+
+        self.process_weeks = False
+        sorted_weeks = sorted(weeks)
+        weeks_were_restored = False
+        
+        for w in sorted_weeks:
+            week_item = QtWidgets.QListWidgetItem(w)
+            self.weeks_list.addItem(week_item)
+            if w in prev_selected_weeks:
+                week_item.setSelected(True)
+                weeks_were_restored = True
+        
+        # If this is a new test or no weeks were restored, select only the last 10 by default
+        should_scroll_to_bottom = False
+        if (is_new_test or not weeks_were_restored) and len(sorted_weeks) > 0:
+            # Clear any restored selections if this is a new test
+            if is_new_test:
+                for i in range(len(sorted_weeks)):
+                    self.weeks_list.item(i).setSelected(False)
+            
+            start_index = max(0, len(sorted_weeks) - 10)
+            for i in range(start_index, len(sorted_weeks)):
+                self.weeks_list.item(i).setSelected(True)
+            should_scroll_to_bottom = True
+        
+        self.process_weeks = True
+        self.selection_changed_weeks()
+        
+        # Scroll to bottom after everything is complete (only for new test selections)
+        if should_scroll_to_bottom:
+            def scroll_to_bottom():
+                scrollbar = self.weeks_list.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+            # Delayed scroll after UI updates settle
+            QtCore.QTimer.singleShot(100, scroll_to_bottom)
+
+    def get_log_path(self, test_name, week, exec_mode):
+        test_dir = self.get_test_dir(test_name)
+        with os.scandir(test_dir) as files:
+            for f in files:
+                if not f.is_dir():
+                    if fnmatch.fnmatch(f.name, f"{week}_*_{exec_mode}.txt"):
+                        log_path = os.path.join(test_dir, f.name)
+                        return log_path
+
+        return None
+
+    def search_log_next(self):
+        self.search_forward = True
+        self.search_log()
+
+    def search_log_previous(self):
+        self.search_forward = False
+        self.search_log()
+
+    def search_log(self):
+        if len(self.log_browsers) == 0:
+            return
+        browser_widget = self.log_browsers[self.log_tab_widget.currentIndex()]
+
+        search_text = self.search_text.text()
+        if not search_text:
+            return
+
+        if not self.last_search or (self.last_search and search_text != self.last_search):
+            # Reset cursor to beginning
+            cursor = browser_widget.textCursor()
+            cursor.setPosition(0)
+            browser_widget.setTextCursor(cursor)
+            self.last_search = search_text
+
+        # Determine search flags
+        flags = browser_widget.document().FindFlags()
+        if not self.search_forward:
+            flags |= browser_widget.document().FindBackward
+        if self.search_case_sensitive_checkbox.isChecked():
+            flags |= browser_widget.document().FindCaseSensitively
+
+        found = browser_widget.find(self.last_search, flags)
+
+        if found:
+            # Text is found, it's now selected
+            pass
+        else:
+            # If not found, wrap around
+            cursor = browser_widget.textCursor()
+            if self.search_forward:
+                cursor.movePosition(QtGui.QTextCursor.Start)
+            else:
+                cursor.movePosition(QtGui.QTextCursor.End)
+            browser_widget.setTextCursor(cursor)
+            found = browser_widget.find(self.last_search, flags)
+            if not found:
+                QtWidgets.QMessageBox.information(self, "Find Next", f"No more occurances of '{self.last_search}'")
+
+
+    def process_logs(self, test_name, test_type):
+        # selectedItems needs to handle profile runs that run into the next day better.
+        for i, item in enumerate(sorted(self.weeks_list.selectedItems())):
+            week = item.text()
+            if week not in self.stats:
+                self.stats[week] = dict()
+            log_path = self.get_log_path(test_name, week, test_type)
+            if not log_path:
+                next_day = str(datetime.datetime.strptime(week, "%Y-%m-%d").date() +
+                               datetime.timedelta(days=1))
+                log_path = self.get_log_path(test_name, next_day, test_type)
+                if not log_path:
+                    prev_day = str(datetime.datetime.strptime(week, "%Y-%m-%d").date() -
+                                   datetime.timedelta(days=1))
+                    log_path = self.get_log_path(test_name, prev_day, test_type)
+                    if not log_path:
+                        # If cache is enabled, try to load from cache even without log file
+                        if self.use_cache:
+                            cache_file_name = f"{test_name}_{week}_{test_type}.json"
+                            stats = self.load_stats_from_cache(cache_file_name)
+                            if stats:
+                                self.stats[week][test_type] = stats
+                                continue
+                        self.stats[week][test_type] = "missing"
+            if log_path:
+                if test_type not in self.stats[week]:
+                    self.stats[week][test_type] = self.get_stats(test_name, week, log_path, test_type)
+                if i == 0:
+                    self._pending_log_widgets.append((log_path, test_type))
+
+    def apply_ansi_escape_codes(self, log_browser, text):
+        cursor = log_browser.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.Start)
+
+        # ANSI color codes
+        ansi_color_codes = {
+            '30': QColor(0, 0, 0),  # Black
+            '31': QColor(255, 0, 0),  # Red
+            '32': QColor(0, 255, 0),  # Green
+            '33': QColor(255, 255, 0),  # Yellow
+            '34': QColor(0, 0, 255),  # Blue
+            '35': QColor(255, 0, 255),  # Magenta
+            '36': QColor(0, 255, 255),  # Cyan
+            '37': QColor(255, 255, 255),  # White
+            '90': QColor(128, 128, 128),  # Bright Black (Gray)
+            '91': QColor(255, 0, 0),  # Bright Red
+            '92': QColor(0, 255, 0),  # Bright Green
+            '93': QColor(255, 255, 0),  # Bright Yellow
+            '94': QColor(0, 0, 255),  # Bright Blue
+            '95': QColor(255, 0, 255),  # Bright Magenta
+            '96': QColor(0, 255, 255),  # Bright Cyan
+            '97': QColor(255, 255, 255),  # Bright White
+        }
+
+        # Regular expression to match ANSI escape codes
+        ansi_escape = re.compile(r'\x1b\[((?:\d+;)*\d+)m')
+
+        # Split the text by ANSI escape codes
+        fragments = ansi_escape.split(text)
+
+        for i, fragment in enumerate(fragments):
+            if i % 2 == 0:
+                # This is a text fragment
+                cursor.insertText(fragment)
+            else:
+                # This is an ANSI code fragment
+                codes = fragment.split(';')
+                format = QTextCharFormat()
+
+                for code in codes:
+                    if code in ansi_color_codes:
+                        format.setForeground(ansi_color_codes[code])
+                    elif code == '1':
+                        format.setFontWeight(QtGui.QFont.Bold)
+                    elif code == '3':
+                        format.setFontItalic(True)
+                    elif code == '4':
+                        format.setFontUnderline(True)
+                    # Add more code handlers as needed
+
+                cursor.setCharFormat(format)
+
+        log_browser.setTextCursor(cursor)
+        log_browser.moveCursor(QtGui.QTextCursor.Start)
+
+    def create_log_widget(self, log_path, test_type):
+        log_widget = QtWidgets.QWidget()
+        log_widget.setLayout(QtWidgets.QVBoxLayout())
+        #log_browser = QtWidgets.QTextBrowser()
+        log_browser = QtWidgets.QPlainTextEdit()
+        if not self.word_wrap_checkbox.isChecked():
+            log_browser.setWordWrapMode(QtGui.QTextOption.NoWrap)
+        # Set the stylesheet for the QTextBrowser
+        log_browser.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: black;
+                color: white;
+            }
+            QPlainTextEdit::selection {
+                background-color: yellow;
+                color: black;
+            }
+        """)
+
+        # Set initial monospace font
+        font = QtGui.QFont("Courier")
+        font.setStyleHint(QtGui.QFont.Monospace)
+        font.setFixedPitch(True)
+        font.setPointSize(self.log_font_size_spinner.value())
+        log_browser.setFont(font)
+
+        self.log_browsers.append(log_browser)
+
+        self.set_log_text(log_browser, log_path)
+        log_widget.layout().addWidget(log_browser)
+
+        if test_type == 'scalar':
+            if self.log_scalar_tab == None:
+                self.log_scalar_tab = QtWidgets.QTabWidget()
+                self.log_tab_widget.addTab(self.log_scalar_tab, "scalar")
+            self.log_scalar_tab.addTab(log_widget, os.path.basename(log_path))
+        elif test_type == 'vector':
+            if self.log_vector_tab == None:
+                self.log_vector_tab = QtWidgets.QTabWidget()
+                self.log_tab_widget.addTab(self.log_vector_tab, "vector")
+            self.log_vector_tab.addTab(log_widget, os.path.basename(log_path))
+        elif test_type == 'xpu':
+            if self.log_xpu_tab == None:
+                self.log_xpu_tab = QtWidgets.QTabWidget()
+                self.log_tab_widget.addTab(self.log_xpu_tab, "xpu")
+            self.log_xpu_tab.addTab(log_widget, os.path.basename(log_path))
+
+
+    def change_log_font_size(self, log_browser, size):
+        # Create a new font with the desired size
+        new_font = log_browser.font()
+        new_font.setPointSize(size)
+        # Set the new font as the default for the document
+        log_browser.document().setDefaultFont(new_font)
+        # Update the viewport to reflect the changes
+        log_browser.viewport().update()
+
+    def change_logs_font_size(self, size):
+        for log_browser in self.log_browsers:
+            self.change_log_font_size(log_browser, size)
+
+    def selection_changed_weeks(self):
+        self.diff_cache = dict()
+        if not self.process_weeks:
+            return
+        self.stats.clear()
+        if len(self.tests_list.selectedItems()) == 0:
+            return
+
+        # Reset log browser list
+        self.log_browsers = []
+        self.log_scalar_tab = None
+        self.log_vector_tab = None
+        self.log_xpu_tab = None
+        self.log_tab_widget.clear()
+        self._pending_log_widgets = []
+        self._logs_stale = False
+
+        test_name = self.tests_list.selectedItems()[0].text()
+        if self.scalar_checkbox.isChecked():
+            self.process_logs(test_name, 'scalar')
+        if self.vector_checkbox.isChecked():
+            self.process_logs(test_name, 'vector')
+        if self.xpu_checkbox.isChecked():
+            self.process_logs(test_name, 'xpu')
+
+        # Defer log widget creation unless the Logs tab is currently visible
+        self._logs_stale = True
+        if self.chart_image_log_tab_widget.currentIndex() == self._logs_tab_index:
+            self._flush_log_widgets()
+
+        # Set initial font size
+        self.change_logs_font_size(self.log_font_size_spinner.value())
+
+        self.update_chart(resize=True)
+
+        try:
+            self._request_update_images()
+        except (RuntimeError, KeyError) as e:
+            print(f"Caught an exception: {e}")
+
+
+    def get_unique_test_name(self, test_name, log_file):
+        dir_name = os.path.dirname(log_file)
+        dirs = dir_name.split('/')
+        i = 1
+        while test_name in self.stats:
+            test_name = f"{dirs[-i]}_{test_name}"
+            i += 1
+        return test_name
+
+    def selection_changed_logs(self):
+        self.stats.clear()
+        if len(self.logs_list.selectedItems()) == 0:
+            return
+
+        # Reset log browser list
+        self.log_browsers = []
+        self.log_scalar_tab = None
+        self.log_vector_tab = None
+        self.log_xpu_tab = None
+        self.log_tab_widget.clear()
+
+        current_tab_index = self.chart_image_log_tab_widget.currentIndex()
+        for i, item in enumerate(self.logs_list.selectedItems()):
+            user_role_dict = item.data(QtCore.Qt.UserRole)
+            log_file = user_role_dict["path"]
+            test_name = user_role_dict["name"]
+            test_display_name = user_role_dict["name"]
+            if test_name in self.stats:
+                test_name = self.get_unique_test_name(test_name, log_file)
+            week = 'none'
+
+            log_type = 'scalar'
+            if fnmatch.fnmatch(test_name, f"*_vector.txt"):
+                log_type = 'vector'
+            if fnmatch.fnmatch(test_name, f"*_xpu.txt"):
+                log_type = 'xpu'
+
+            stats = self.get_stats(test_name,
+                                   week,
+                                   log_file,
+                                   log_type)
+
+            if stats:
+                self.stats[test_name] = dict()
+                self.stats[test_name][log_type] = stats
+                self.stats[test_name][log_type]['display_name'] = test_display_name
+
+            if i == 0 and current_tab_index == 2:
+                self.create_log_widget(log_file, log_type)
+
+        self.update_chart(resize=True)
+
+        try:
+            self._request_update_images()
+        except (RuntimeError, KeyError) as e:
+            print(f"Caught an exception: {e}")
+
+    def create_tab_widget(self, name):
+        tab = CustomTabWidget()
+        self.image_tab_widget.addTab(tab, name)
+
+        # Add shortcuts
+        next_tab = QtWidgets.QShortcut(QtGui.QKeySequence("PgDown"), tab)
+        next_tab.activated.connect(
+            lambda: tab.setCurrentIndex((tab.currentIndex() + 1) % tab.count()))
+
+        prev_tab = QtWidgets.QShortcut(QtGui.QKeySequence("PgUp"), tab)
+        prev_tab.activated.connect(
+            lambda: tab.setCurrentIndex((tab.currentIndex() - 1) % tab.count()))
+
+        return tab
+
+    def sync_vertical_scroll(self, value):
+        for test_type, scroll_areas in self.scroll_areas.items():
+            for area in scroll_areas:
+                area.verticalScrollBar().setValue(value)
+
+    def sync_horizontal_scroll(self, value):
+        for test_type, scroll_areas in self.scroll_areas.items():
+            for area in scroll_areas:
+                area.horizontalScrollBar().setValue(value)
+
+    def sync_week_tabs(self, index):
+        """Synchronize week tab selection across all test types"""
+        # Block signals to prevent infinite recursion
+        for test_type in self.image_tabs:
+            if self.image_tabs[test_type]:
+                self.image_tabs[test_type].blockSignals(True)
+                # Only set index if it's valid for this test type
+                if index < self.image_tabs[test_type].count():
+                    self.image_tabs[test_type].setCurrentIndex(index)
+                self.image_tabs[test_type].blockSignals(False)
+
+    def create_image_widget(self,
+                            test_type,
+                            output_image,
+                            q_image,
+                            image_width,
+                            image_height,
+                            scroll_x,
+                            scroll_y):
+        image_label = QtWidgets.QLabel("")
+        image_label.setAlignment(QtCore.Qt.AlignCenter)
+        image_label.setProperty('image_path', output_image)
+        image_label.setScaledContents(False)
+        size_factor = self.image_size_spin_box.value()
+        w = int(size_factor * image_width)
+        h = int(size_factor * image_height)
+        pixmap = QtGui.QPixmap(q_image)
+        image_label.setPixmap(pixmap.scaled(w, h,
+                                            QtCore.Qt.KeepAspectRatio,
+                                            QtCore.Qt.SmoothTransformation))
+
+        image_scroll_area = NoWheelScrollArea()
+        image_scroll_area.setWidget(image_label)
+        image_scroll_area.setWidgetResizable(True)
+        image_scroll_area.horizontalScrollBar().setValue(scroll_x)
+        image_scroll_area.verticalScrollBar().setValue(scroll_y)
+        image_scroll_area.verticalScrollBar().valueChanged.connect(self.sync_vertical_scroll)
+        image_scroll_area.horizontalScrollBar().valueChanged.connect(self.sync_horizontal_scroll)
+        self.scroll_areas[test_type].append(image_scroll_area)
+
+        image_widget = QtWidgets.QWidget()
+        image_widget.setLayout(QtWidgets.QVBoxLayout())
+        image_widget.layout().addWidget(image_scroll_area)
+
+        return image_widget
+
+    def get_scroll_positions(self):
+        scroll_x = 0
+        scroll_y = 0
+        if self.scroll_areas:
+            for test_type in self.scroll_areas:
+                for area in self.scroll_areas[test_type]:
+                    scroll_x = area.horizontalScrollBar().value()
+                    scroll_y = area.verticalScrollBar().value()
+                    # All the scolls are the same so we just need the first one
+                    break
+        return (scroll_x, scroll_y)
+
+    def _load_image_for_tab(self, test_type, tab_index):
+        """Lazily load an image when its tab becomes visible."""
+        tab_widget = self.image_tabs.get(test_type)
+        if tab_widget is None:
+            return
+        key = (test_type, tab_index)
+        if key not in self._pending_image_loads:
+            return
+
+        info = self._pending_image_loads.pop(key)
+        output_image = info['output_image']
+        scroll_x = info['scroll_x']
+        scroll_y = info['scroll_y']
+
+        q_image = None
+        image_width = 0
+        image_height = 0
+        if output_image in self.images_cache:
+            (q_image, image_width, image_height) = self.images_cache[output_image]
+        elif os.path.exists(output_image):
+            (q_image, image_width, image_height) = load_exr_as_qimage(output_image)
+            self.images_cache[output_image] = (q_image, image_width, image_height)
+        else:
+            return
+
+        # Replace the placeholder widget with the real image
+        widget = self.create_image_widget(test_type,
+                                          output_image,
+                                          q_image,
+                                          image_width,
+                                          image_height,
+                                          scroll_x,
+                                          scroll_y)
+        tab_text = tab_widget.tabText(tab_index)
+        tab_color = tab_widget.tabBar().tabTextColor(tab_index)
+        # Block signals to prevent removeTab/insertTab from cascading
+        # through currentChanged → loading every other tab
+        tab_widget.blockSignals(True)
+        tab_widget.removeTab(tab_index)
+        tab_widget.insertTab(tab_index, widget, tab_text)
+        if tab_color.isValid():
+            tab_widget.tabBar().setTabTextColor(tab_index, tab_color)
+        tab_widget.setCurrentIndex(tab_index)
+        tab_widget.blockSignals(False)
+
+    def _on_image_tab_changed(self, test_type, index):
+        """Called when a week tab is selected; loads the image if pending."""
+        self._load_image_for_tab(test_type, index)
+        self.sync_week_tabs(index)
+
+    def _request_update_images(self):
+        """Mark images as needing rebuild; only do the work if the Images tab is visible."""
+        self._images_stale = True
+        if self.chart_image_log_tab_widget.currentIndex() == self._images_tab_index:
+            self._flush_update_images()
+
+    def _flush_update_images(self):
+        """Actually rebuild image tabs if they are stale."""
+        if not self._images_stale:
+            return
+        self._images_stale = False
+        self.update_images()
+
+    def _on_main_tab_changed(self, index):
+        """When the user switches to the Images or Logs tab, rebuild if needed."""
+        if index == self._images_tab_index:
+            try:
+                self._flush_update_images()
+            except (RuntimeError, KeyError) as e:
+                print(f"Caught an exception: {e}")
+        elif index == self._logs_tab_index:
+            self._flush_log_widgets()
+
+    def _flush_log_widgets(self):
+        """Actually create log widgets if they are pending."""
+        if not self._logs_stale:
+            return
+        self._logs_stale = False
+        for log_path, test_type in self._pending_log_widgets:
+            self.create_log_widget(log_path, test_type)
+        self._pending_log_widgets = []
+        self.change_logs_font_size(self.log_font_size_spinner.value())
+
+    def update_images(self):
+        # Get previous scroll positions
+        (scroll_x, scroll_y) = self.get_scroll_positions()
+
+        # Remember the current tabs to restore at the end of this function
+        current_tab_indices = {"scalar":0, "vector":0, "xpu":0}
+        had_previous_tabs = {"scalar": False, "vector": False, "xpu": False}
+        if self.image_tabs:
+            for test_type in self.image_tabs:
+                if self.image_tabs[test_type] and self.image_tabs[test_type].count() > 0:
+                    had_previous_tabs[test_type] = True
+                    current_tab_indices[test_type] = self.image_tabs[test_type].currentIndex()
+
+        self.scroll_areas = {"scalar": [], "vector": [], "xpu": []}  # Store scroll areas
+        self.image_tab_widget.clear()
+        self._pending_image_loads = {}
+
+        self.image_tabs = {
+            'scalar': self.create_tab_widget("scalar") if self.scalar_checkbox.isChecked() else None,
+            'vector': self.create_tab_widget("vector") if self.vector_checkbox.isChecked() else None,
+            'xpu': self.create_tab_widget("xpu") if self.xpu_checkbox.isChecked() else None
+        }
+
+        for week in self.stats:
+            for test_type in self.stats[week]:
+                # Check if the current test type is active
+                if self.image_tabs.get(test_type) is None:
+                    continue
+
+                if 'output_image' not in self.stats[week][test_type]:
+                    continue
+
+                # Add failed diff image if it exists (these are already loaded)
+                if test_type in self.diff_cache and week in self.diff_cache[test_type]:
+                    (q_image, image_width, image_height) = self.diff_cache[test_type][week]
+                    image_widget = self.create_image_widget(test_type,
+                                                            "diff fail",
+                                                            q_image,
+                                                            image_width,
+                                                            image_height,
+                                                            scroll_x,
+                                                            scroll_y)
+
+                    # Create tab with a red color
+                    self.image_tabs[test_type].addColoredTab(image_widget, "FAIL", "red")
+
+                output_image = self.stats[week][test_type]['output_image']
+
+                # Skip if the image file doesn't exist and isn't cached
+                if output_image not in self.images_cache and not os.path.exists(output_image):
+                    continue
+
+                if self.log_file_mode:
+                    tab_name = self.stats[week][test_type]['display_name']
+                else:
+                    tab_name = f"{week}"
+
+                # If the image is already cached, create the widget immediately
+                if output_image in self.images_cache:
+                    (q_image, image_width, image_height) = self.images_cache[output_image]
+                    image_widget = self.create_image_widget(test_type,
+                                                            output_image,
+                                                            q_image,
+                                                            image_width,
+                                                            image_height,
+                                                            scroll_x,
+                                                            scroll_y)
+                else:
+                    # Create a lightweight placeholder; actual load happens on tab switch
+                    image_widget = QtWidgets.QWidget()
+                    image_widget.setLayout(QtWidgets.QVBoxLayout())
+                    placeholder = QtWidgets.QLabel("Loading...")
+                    placeholder.setAlignment(QtCore.Qt.AlignCenter)
+                    image_widget.layout().addWidget(placeholder)
+
+                # Use current button color from light/dark theme for tab color
+                app = QtWidgets.QApplication.instance()
+                palette = app.palette()
+                col = palette.color(QtGui.QPalette.Button)
+                self.image_tabs[test_type].addColoredTab(image_widget, tab_name, col)
+
+                # Register pending load for uncached images
+                if output_image not in self.images_cache:
+                    tab_index = self.image_tabs[test_type].count() - 1
+                    self._pending_image_loads[(test_type, tab_index)] = {
+                        'output_image': output_image,
+                        'scroll_x': scroll_x,
+                        'scroll_y': scroll_y,
+                    }
+
+        # Add tabs to the image tab widget
+        for test_type, tab in self.image_tabs.items():
+            if tab is not None:
+                self.image_tab_widget.addTab(tab, test_type.capitalize())
+
+        # Restore current tab (or set to last tab if first time)
+        for test_type in self.image_tabs:
+            if self.image_tabs[test_type]:
+                # If no previous tabs, default to the last week instead of first
+                if not had_previous_tabs[test_type] and self.image_tabs[test_type].count() > 0:
+                    self.image_tabs[test_type].setCurrentIndex(self.image_tabs[test_type].count() - 1)
+                else:
+                    self.image_tabs[test_type].setCurrentIndex(current_tab_indices[test_type])
+
+        # Connect signals for lazy loading and tab sync
+        for test_type in self.image_tabs:
+            if self.image_tabs[test_type]:
+                tt = test_type  # capture for lambda
+                self.image_tabs[test_type].currentChanged.connect(
+                    lambda index, t=tt: self._on_image_tab_changed(t, index))
+
+        # Ensure outer image tab changes also trigger lazy loading for the newly visible test type
+        try:
+            self.image_tab_widget.currentChanged.disconnect(self._on_outer_image_tab_changed)
+        except TypeError:
+            pass
+        self.image_tab_widget.currentChanged.connect(self._on_outer_image_tab_changed)
+
+        # Eagerly load the currently visible tab for each test type
+        for test_type in self.image_tabs:
+            if self.image_tabs[test_type] and self.image_tabs[test_type].count() > 0:
+                self._load_image_for_tab(test_type, self.image_tabs[test_type].currentIndex())
+
+    def _on_outer_image_tab_changed(self, index):
+        """When the outer image_tab_widget (Scalar/Vector/XPU) changes, ensure
+        the current week tab for the newly visible test type is loaded."""
+        if index < 0:
+            return
+        outer_widget = self.image_tab_widget.widget(index)
+        if outer_widget is None:
+            return
+        # Find which test_type this outer widget corresponds to
+        for test_type, tab_widget in self.image_tabs.items():
+            if tab_widget is outer_widget:
+                if tab_widget.count() > 0 and tab_widget.currentIndex() >= 0:
+                    self._load_image_for_tab(test_type, tab_widget.currentIndex())
+                break
+
+    def show_selected_images(self):
+        cmd = ['iv']
+        for week in self.stats:
+            for test_type in self.stats[week]:
+
+                if (test_type == 'scalar' and self.scalar_checkbox.isChecked()) or \
+                   (test_type == 'vector' and self.vector_checkbox.isChecked()) or \
+                   (test_type == 'xpu' and self.xpu_checkbox.isChecked()):
+
+                    if 'output_image' in self.stats[week][test_type]:
+                        output_image = self.stats[week][test_type]['output_image']
+                        if os.path.exists(output_image):
+                            cmd.append(output_image)
+                        else:
+                            print(f"Error: Image file not found: {output_image}")
+                            return
+        subprocess.Popen(cmd)
+
+    def diff_images(self, imageA, imageB, output):
+        fail = self.image_fail_spin_box.value()
+        fail_percent = self.image_fail_percent_spin_box.value()
+        cmd = [ "idiff", imageA, imageB,
+                "--fail", str(fail),
+                "--failpercent", str(fail_percent),
+                "--warn", str(fail),
+                "--warnpercent", str(fail_percent),
+                "-a",
+                "--abs",
+                "-o", output ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if ('FAILURE' in result.stdout):
+            return False
+        else:
+            return True
+
+    def diff_selected_images(self):
+        self.diff_cache = {
+            'scalar': {}, 'vector': {}, 'xpu': {}
+        }
+        prev_image = {"scalar": None, "vector": None, "xpu": None}
+        diff_image = os.path.join(self.temp_dir, "diff.exr")
+
+        tabs = {
+            'scalar': True if self.scalar_checkbox.isChecked() else False,
+            'vector': True if self.vector_checkbox.isChecked() else False,
+            'xpu':    True if self.xpu_checkbox.isChecked()    else False
+        }
+
+        for week in self.stats:
+            for test_type in self.stats[week]:
+                if not tabs.get(test_type): continue
+
+                if not 'output_image' in self.stats[week][test_type]:
+                    print(f"Error: No output image in log for {week}:{test_type}")
+                    continue
+
+                output_image = self.stats[week][test_type]['output_image']
+                if not os.path.exists(output_image):
+                    print(f"Error: Image file not found: {output_image}")
+                    continue
+
+                if not prev_image[test_type]:
+                    prev_image[test_type] = output_image
+                    continue
+
+                if not self.diff_images(prev_image[test_type], output_image, diff_image):
+                    (q_image, image_width, image_height) = load_exr_as_qimage(diff_image)
+                    self.diff_cache[test_type][week] = (q_image, image_width, image_height)
+
+                prev_image[test_type] = output_image
+
+        self.update_images()
+
+    def update_chart(self, resize=False, explicit_height=0):
+        stats_visibility_list = list()
+        for stat in self.chart_stats_checkboxes.keys():
+            if self.show_memory_checkbox.isChecked():
+                if stat in self.render_profile_chart.memory_stats and \
+                        self.chart_stats_checkboxes[stat].isChecked():
+                    stats_visibility_list.append(stat)
+            elif self.chart_stats_checkboxes[stat].isChecked():
+                stats_visibility_list.append(stat)
+
+        host_visibility_list = self.host_filter_line_edit.text().split()
+
+        my_stats = copy.deepcopy(self.stats)
+
+        # Divide by pixel samples
+        if self.divide_by_ps_checkbox.isChecked():
+            for week in my_stats:
+                for typ in my_stats[week]:
+                    if 'pixel_samples' in my_stats[week][typ]:
+                        pixel_samples = my_stats[week][typ]['pixel_samples'] * 1000000
+                        for stat_name in my_stats[week][typ]:
+                            if not stat_name == "pixel_samples" and isinstance(my_stats[week][typ][stat_name], float):
+                                my_stats[week][typ][stat_name] /= pixel_samples
+                    else:
+                        print(f"Error: No pixel_samples data for {week}")
+
+        # Calculate total time for visible stats
+        for week in my_stats:
+            for test_type in my_stats[week]:
+                if not my_stats[week][test_type] or my_stats[week][test_type] == "missing":
+                    continue
+                visible_time = 0.0
+                if self.show_pixel_samples_checkbox.isChecked():
+                    visible_time = my_stats[week][test_type]['pixel_samples']
+                else:
+                    for stat in my_stats[week][test_type]:
+                        if stat in stats_visibility_list:
+                            visible_time += my_stats[week][test_type][stat]
+                my_stats[week][test_type]['visible_time'] = visible_time
+
+        type_visibility_list = list()
+        if self.scalar_checkbox.isChecked():
+            type_visibility_list.append('scalar')
+        if self.vector_checkbox.isChecked():
+            type_visibility_list.append('vector')
+        if self.xpu_checkbox.isChecked():
+            type_visibility_list.append('xpu')
+
+        if self.log_file_mode:
+            if len(self.logs_list.selectedItems()) > 1:
+                test_name = ""
+            else:
+                test_name = self.logs_list.selectedItems()[0].text()
+        else:
+            test_name = self.tests_list.selectedItems()[0].text()
+
+        # Set annotations for the current test using a stable key
+        annotation_key = self._get_current_test_name()
+        current_annotations = self.annotations.get(annotation_key, []) if annotation_key else []
+        self.render_profile_chart.set_annotations(current_annotations)
+
+        self.render_profile_chart.update_chart(test_name,
+                                               my_stats,
+                                               self.show_pixel_samples_checkbox.isChecked(),
+                                               self.show_memory_checkbox.isChecked(),
+                                               self.show_hosts_in_chart_checkbox.isChecked(),
+                                               type_visibility_list,
+                                               host_visibility_list,
+                                               stats_visibility_list,
+                                               resize,
+                                               explicit_height,
+                                               self.font_size,
+                                               self.regression_warning_checkbox.isChecked(),
+                                               self.regression_warning_spin_box.value(),
+                                               self.improvement_warning_checkbox.isChecked(),
+                                               self.improvement_warning_spin_box.value(),
+                                               self.use_dark_theme,
+                                               self.show_trend_lines_checkbox.isChecked(),
+                                               self.divide_by_ps_checkbox.isChecked(),
+                                               self.show_fallback_checkbox.isChecked(),
+                                               self.show_crash_checkbox.isChecked(),
+                                               self.chart_label_angle)
+
+    def set_log_text(self, log_widget, log_file):
+        if not log_file:
+            log_widget.setPlainText(f"Log: does not exist")
+            return
+
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as log_file:
+                log_file_text = log_file.read()
+            log_widget.clear()
+            if self.apply_ansi_colors_checkbox.isChecked():
+                self.apply_ansi_escape_codes(log_widget, log_file_text)
+            else:
+                log_widget.setPlainText(log_file_text)
+        else:
+            log_widget.setPlainText(f"Log: {log_file} does not exist")
+
+    def populate_test_list(self):
+        self.tests_list.clear()
+        with os.scandir(self.profile_directory) as test_dirs:
+            for t in test_dirs:
+                if t.is_dir():
+                    test_item = QtWidgets.QListWidgetItem(t.name)
+                    self.tests_list.addItem(test_item)
+
+    def add_log_file_to_list(self, log_file):
+        extension = os.path.splitext(log_file)[1]
+        if extension != '.txt' and extension != '.log':
+            return
+        user_role_dict = dict()
+        path = os.path.abspath(log_file)
+        name = os.path.basename(path)
+        user_role_dict["name"] = name
+        user_role_dict["path"] = path
+        display_text = name
+        if self.show_full_paths_checkbox.isChecked():
+            display_text = path
+        item = QtWidgets.QListWidgetItem(display_text)
+        item.setData(QtCore.Qt.UserRole, user_role_dict)
+        item.setToolTip(path)
+        self.logs_list.addItem(item)
+
+    def add_log_files_to_list(self, log_file):
+        if os.path.isdir(log_file):
+            with os.scandir(log_file) as files:
+                for f in files:
+                    self.add_log_files_to_list(f.path)
+        else:
+            self.add_log_file_to_list(log_file)
+
+    def populate_logs_list(self):
+        self.logs_list.clear()
+        for l in self.log_files:
+            self.add_log_files_to_list(l)
+        self.logs_list.sortItems()
+
+    def parse_log_file(self, log_file):
+        fallback_re = re.compile(r"Executing a (.*) render since execution mode was set to ([^.]*).")
+        in_breakdown = False
+        in_render_prep = False
+        in_render_prep_memory = False
+        found_wrote_line = False
+        found_breakdown = False
+        stats = dict()
+        stats['fallback'] = False
+        stats['crash'] = False
+        with open(log_file) as f:
+            for line in f:
+                match = fallback_re.match(line)
+                if match:
+                    if len(match.groups()) == 2:
+                        if (match.group(1) == 'scalar' and match.group(2) == 'xpu') or \
+                                (match.group(1) == 'vector' and match.group(2) == 'xpu') or \
+                                (match.group(1) == 'scalar' and match.group(2) == 'vector') or \
+                                (match.group(1) == 'vector' and match.group(2) == 'auto') or \
+                                (match.group(1) == 'scalar' and match.group(2) == 'auto'):
+                            stats['fallback'] = True
+                            stats['fallback_mode'] = match.group(1)
+                if in_breakdown:
+                    if 'Totals' in line:
+                        total_mcrt_time = line.split()[-2]
+                        total_mcrt_time = total_mcrt_time.replace(',', '')
+                        stats['total_mcrt_time'] = float(total_mcrt_time)
+                        stats['MCRT memory'] = get_gigabytes_from_size(line.split()[1], line.split()[2])
+                        if 'total_render_prep_memory' in stats:
+                            stats['MCRT memory'] = stats['MCRT memory'] - stats['total_render_prep_memory']
+                        in_breakdown = False
+                        continue
+                    if '----' in line or 'Total' in line or 'Avg Time per' in line:
+                        continue
+                    tokens = line.split(' ')
+                    stat_name = str()
+                    get_stat_name = False
+                    for t in tokens:
+                        if get_stat_name:
+                            if t == '':
+                                get_stat_name = False
+                            else:
+                                stat_name = stat_name + t + ' '
+                        if t == '|':
+                            get_stat_name = True
+                    stat_name = stat_name[0:-1]
+                    time = tokens[-2]
+                    time = time.replace(',', '')
+                    stats[stat_name] = float(time)
+                elif '- MCRT Time Breakdown -' in line:
+                    in_breakdown = True
+                    found_breakdown = True
+                elif in_render_prep:
+                    if 'Total render prep' in line:
+                        stats['total_render_prep_time'] = get_seconds_from_time(line.split()[-1])
+                        in_render_prep = False
+                    else:
+                        for stat in self.render_profile_chart.render_prep_stats:
+                            if stat in line:
+                                stats[stat] = get_seconds_from_time(line.split()[-1])
+                elif '- Render Prep Stats -' in line:
+                    in_render_prep = True
+                elif in_render_prep_memory:
+                    if 'Total memory' in line:
+                        stats['total_render_prep_memory'] = get_gigabytes_from_size(line.split()[-2], line.split()[-1])
+                        in_render_prep_memory = False
+                    else:
+                        for stat in self.render_profile_chart.memory_stats:
+                            if stat in line:
+                                stats[stat] = get_gigabytes_from_size(line.split()[-2], line.split()[-1])
+                elif '- Memory Summary -' in line:
+                    in_render_prep_memory = True
+                elif 'Pixel samples' in line and 'Pixel samples sqrt' not in line:
+                    pixel_samples = line.split('=')[1]
+                    pixel_samples = pixel_samples.replace(',', '')
+                    pixel_samples = pixel_samples.replace(' ', '')
+                    pixel_samples = pixel_samples.replace('\n', '')
+                    stats['pixel_samples'] = float(pixel_samples) / 1000000
+                elif 'Host name' in line:
+                    host_name = line.split('=')[1]
+                    host_name = host_name.replace(' ', '')
+                    host_name = host_name.replace('\n', '')
+                    stats['host_name'] = host_name
+                elif 'Wrote' in line and 'Wrote:' not in line:
+                    if not found_wrote_line:
+                        output_image = line.split()[1]
+                        if output_image.endswith('.exr'):
+                            stats['output_image'] = output_image
+                            found_wrote_line = True
+                elif '-- Callstack:' in line:
+                    stats['crash'] = True
+
+        if not found_breakdown:
+            return None
+
+        return stats
+
+    def get_stats(self, test_name, week, log_file, log_type):
+        cache_file_name = f"{test_name}_{week}_{log_type}.json"
+        
+        # Try to load from cache
+        stats = self.load_stats_from_cache(cache_file_name)
+        if stats:
+            return stats
+
+        # If the cache file doesn't exist then parse the logs for the stats
+        if not os.path.exists(log_file):
+            return None
+
+        stats = self.parse_log_file(log_file)
+
+        # Write json cache file with the stats data
+        cache_file_path = os.path.join(self.cache_directory, cache_file_name)
+        if not os.path.exists(os.path.dirname(cache_file_path)):
+            os.makedirs(os.path.dirname(cache_file_path))
+
+        with open(cache_file_path, "w") as f:
+            json.dump(stats, f, indent=4)
+
+        return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualizes render profile"
+                                                 " statistics from log files"
+                                                 " using charts")
+    parser.add_argument('logs', nargs='*', help='optional list of log files to '
+                                                'display as an alternative to the '
+                                                'default render logs')
+    args = parser.parse_args()
+
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle(QtWidgets.QStyleFactory.create('Fusion'))
+    MyWindow(args.logs)
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

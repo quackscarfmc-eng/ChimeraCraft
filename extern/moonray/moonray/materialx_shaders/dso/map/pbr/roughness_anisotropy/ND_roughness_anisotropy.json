@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"anisotropyAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "anisotropy",
+			"type" : "Float"
+		},
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"roughnessAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "roughness",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_roughness_anisotropy",
+	"type" : "Map"
+}

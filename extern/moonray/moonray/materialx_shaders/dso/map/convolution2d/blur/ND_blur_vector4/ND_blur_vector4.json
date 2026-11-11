@@ -1,0 +1,39 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "filtertypeAttr" : 
+        {
+            "default" : 0,
+            "enum" : 
+            {
+                "box" : 0,
+                "gaussian" : 1
+            },
+            "flags" : "FLAGS_BINDABLE| FLAGS_ENUMERABLE",
+            "name" : "filtertype",
+            "type" : "Int"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec4f"
+        },
+        "sizeAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "size",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_blur_vector4",
+    "type" : "Map"
+}

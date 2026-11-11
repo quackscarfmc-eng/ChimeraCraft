@@ -1,0 +1,322 @@
+// File: crates/ppf-cts-server/src/main.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// ppf-cts-server binary. Parses CLI args (host/port/debug), builds an
+// engine + default executor, runs the tokio accept loop until the
+// process receives SIGINT/SIGTERM.
+//
+// The binary speaks the wire protocol advertised by
+// `PROTOCOL_VERSION` (see lib.rs) and follows the `progress.log`
+// startup contract the launcher polls for: it appends
+// `SERVER_STARTING` on entry and `SERVER_READY` once the listener is
+// bound. The launcher script
+// (`blender_addon/core/effect_runner.py`) greps for `SERVER_READY`.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
+use ppf_cts_server::{
+    config::EngineConfig,
+    serve::{bind_listener, serve_with_listener, stop_when_idle},
+    DefaultExecutor, EffectExecutor, ServerEngine,
+};
+
+/// Composed version string shown by `--version` and at the top of
+/// `--help`. Embeds the wire protocol and schema versions so the
+/// launcher (or a human) can sanity-check compatibility from the CLI
+/// without speaking the wire protocol. Built at first access since
+/// `concat!` only accepts literal tokens, not `pub const` items from
+/// other crates.
+fn version_line() -> &'static str {
+    use std::sync::OnceLock;
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        format!(
+            "{} (protocol v{}, schema v{})",
+            env!("CARGO_PKG_VERSION"),
+            ppf_cts_server::PROTOCOL_VERSION,
+            ppf_cts_formats::SCHEMA_VERSION,
+        )
+    })
+}
+
+/// ppf-cts-server: tokio-based Rust solver host.
+#[derive(Debug, Parser)]
+#[command(
+    name = "ppf-cts-server",
+    version = version_line(),
+    about = "ppf-cts-server (tokio-based Rust solver host)",
+)]
+struct Args {
+    /// Bind address.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Listen port.
+    #[arg(long, default_value_t = 9090)]
+    port: u16,
+
+    /// Enable verbose logging.
+    #[arg(long, default_value_t = false)]
+    debug: bool,
+
+    /// Readiness marker file. The launcher polls this for
+    /// `SERVER_READY`; default is `progress.log` relative to CWD.
+    #[arg(long, default_value = "progress.log")]
+    progress_file: PathBuf,
+
+    /// Stop after this many seconds in which no client sent a request and
+    /// no solve or build ran. 0 keeps the server up until it is stopped.
+    /// The Blender add-on passes its own value at Start Server and pings the
+    /// server while it is connected.
+    #[arg(long, default_value_t = 3600)]
+    idle_timeout: u64,
+}
+
+/// Append a single line to the progress file. Best-effort: a write
+/// failure must not abort startup, since the launcher will fall back
+/// to its overall timeout anyway.
+fn write_progress(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Truncate the progress file at startup so a previous run's
+/// `SERVER_READY` line can't fool the launcher into thinking we're
+/// already up.
+fn clear_progress(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    let log_level = if args.debug {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Info
+    };
+    setup_logger(log_level);
+
+    clear_progress(&args.progress_file);
+    write_progress(&args.progress_file, "SERVER_STARTING");
+
+    let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
+
+    // Harvest log channel `(name, filename)` pairs at startup. The map
+    // lets `response::build_response` populate the `summary` and
+    // `average_summary` fields the addon panel reads. Best-effort:
+    // an unreadable tree contributes nothing.
+    //
+    // Walk locations: the `// Name:` / `logging.push("...")` markers
+    // live in CUDA + Rust source. Order matters only for diagnostic
+    // logging; the merged map is keyed by channel name and later
+    // entries with the same key overwrite earlier ones (channel names
+    // do not collide across files in practice). Probed roots, in order:
+    //   1. `<root>/crates/ppf-cts-solver/src/`        (the neutral solver)
+    //   2. `<root>/crates/ppf-cts-compute/`          (every backend; none
+    //                                                  declares a channel today)
+    //   3. `<root>/crates/ppf-cts-core/src/`          (Rust kernels)
+    // `<root>` is resolved as: `PPF_CTS_LOG_SRC_DIR` env var first
+    // (colon-separated absolute paths used directly), then cwd, then a
+    // `target/release/` walk-up from the binary's own location. The
+    // walk-up matters for the debug-rig orchestrator, which spawns the
+    // server with `cwd=<per_worker_tmp_dir>` — there's no `src/` or
+    // `crates/` next to cwd, but the binary still lives at
+    // `<repo_root>/target/release/ppf-cts-server`, so its parent chain
+    // points at the right tree.
+    let mut config = EngineConfig::default();
+    // Populate `hardware` with a real probe. Without this, only the backend is
+    // known and the addon's "Remote Hardware" panel has nothing to show.
+    config.hardware = ppf_cts_server::hardware::probe();
+    // ONE ENTRY PER FIELD THAT IS PRESENT, matching what the panel draws. A
+    // fixed format string would have to print something for a field this
+    // backend does not have, which is the thing the panel stopped doing.
+    let hw = &config.hardware;
+    let mut fields = vec![format!("Backend={}", hw.backend)];
+    for (label, value) in [
+        ("GPU", hw.gpu.clone()),
+        ("GPU Family", hw.gpu_family.clone()),
+        ("GPU Index", hw.gpu_index.map(|index| index.to_string())),
+        ("VRAM", hw.vram.clone()),
+        ("CUDA", hw.cuda.clone()),
+        ("SM", hw.sm.clone()),
+    ] {
+        if let Some(value) = value {
+            fields.push(format!("{label}={value}"));
+        }
+    }
+    fields.push(format!("CPU={}", hw.cpu));
+    fields.push(format!("RAM={}", hw.ram));
+    log::info!(target: "ppf::serve", "hardware: {}", fields.join(" "));
+    // Which build this server's runs will use, reported on every response so
+    // an add-on attaching to this server can refuse it when it is not the
+    // build the add-on's device selection names.
+    let solver = ppf_cts_server::executor::solver_build();
+    log::info!(
+        target: "ppf::serve",
+        "solver build: target_dir={} backend={}",
+        if solver.target_dir.is_empty() { "<unknown>" } else { &solver.target_dir },
+        if solver.backend.is_empty() { "<unknown>" } else { &solver.backend },
+    );
+    config.solver_target_dir = solver.target_dir;
+    config.solver_backend = solver.backend;
+    config.idle_timeout_s = args.idle_timeout;
+    if args.idle_timeout == 0 {
+        log::info!(target: "ppf::serve", "idle stop: off");
+    } else {
+        log::info!(
+            target: "ppf::serve",
+            "idle stop: after {} s with no request and no solve or build running",
+            args.idle_timeout,
+        );
+    }
+    let src_roots: Vec<std::path::PathBuf> = if let Ok(override_paths) =
+        std::env::var("PPF_CTS_LOG_SRC_DIR")
+    {
+        override_paths
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()
+    } else {
+        let mut probe_bases: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            probe_bases.push(cwd);
+        }
+        // Walk up from the binary: `<root>/target/release/<bin>` ->
+        // `<root>`. Three parents (file -> release -> target -> root).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(root) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                let root = root.to_path_buf();
+                if !probe_bases.contains(&root) {
+                    probe_bases.push(root);
+                }
+            }
+        }
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for base in probe_bases {
+            roots.push(base.join("crates").join("ppf-cts-solver").join("src"));
+            // THE COMPUTE CRATE, WHOLE, RATHER THAN ONE BACKEND BY NAME. The
+            // walk recurses, so this one root covers cuda/, rocm/ and metal/
+            // at once and needs no edit when a backend is added. Measured: NO
+            // backend directory declares a channel today, `SimpleLog logging(`
+            // appearing only in ppf-cts-core/src and ppf-cts-solver/src/driver,
+            // so this root contributes nothing and is kept for the backend that
+            // declares one next. It used to name `cuda` and say nearly every
+            // channel was declared there, which was true of the CUDA
+            // orchestrator that used to live in that tree and has since been
+            // deleted; the stale comment cost a reader a wrong conclusion about
+            // what a distribution must ship. A missing root is skipped in
+            // silence below.
+            roots.push(base.join("crates").join("ppf-cts-compute"));
+            roots.push(base.join("crates").join("ppf-cts-core").join("src"));
+        }
+        roots
+    };
+    let mut merged: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for root in &src_roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let docstrings = ppf_cts_core::parsers::get_logging_docstrings(root);
+        let added = docstrings.len();
+        for (name, entry) in docstrings {
+            merged.insert(name, entry.filename);
+        }
+        log::info!(
+            target: "ppf::serve",
+            "log_filenames: harvested {} channels from {}",
+            added,
+            root.display(),
+        );
+    }
+    config.log_filenames = merged.into_iter().collect();
+    log::info!(
+        target: "ppf::serve",
+        "log_filenames: {} channels total",
+        config.log_filenames.len(),
+    );
+
+    let engine = ServerEngine::new(config);
+    let executor: Arc<dyn EffectExecutor> = Arc::new(DefaultExecutor::new());
+    let idle = {
+        let engine = engine.clone();
+        let timeout = args.idle_timeout;
+        async move {
+            if timeout == 0 {
+                std::future::pending::<()>().await;
+            }
+            stop_when_idle(engine, std::time::Duration::from_secs(timeout)).await;
+        }
+    };
+
+    // Bind first, then publish SERVER_READY: the launcher polls this
+    // file and dispatches ServerLaunched only after seeing the marker
+    // *and* a successful TCP query, so writing it before bind would
+    // race the polling loop in the docker-misconfig branch.
+    let (listener, bound) = bind_listener(addr).await?;
+    log::info!(target: "ppf::serve", "ppf-cts-server listening on {bound}");
+    write_progress(&args.progress_file, "SERVER_READY");
+
+    // Cancel on SIGINT or SIGTERM (Unix), or when the server has been idle
+    // for `--idle-timeout`. Windows only delivers Ctrl-C through
+    // `tokio::signal::ctrl_c()`; SIGTERM doesn't apply.
+    let signals = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    log::info!(target: "ppf::serve", "Ctrl-C received, shutting down");
+                }
+                _ = sigterm.recv() => {
+                    log::info!(target: "ppf::serve", "SIGTERM received, shutting down");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            log::info!(target: "ppf::serve", "Ctrl-C received, shutting down");
+        }
+    };
+
+    let cancel = async {
+        tokio::select! {
+            _ = signals => {}
+            _ = idle => {}
+        }
+    };
+
+    serve_with_listener(listener, engine, executor, cancel).await;
+    Ok(())
+}
+
+fn setup_logger(level: log::LevelFilter) {
+    use log4rs::append::console::ConsoleAppender;
+    use log4rs::config::{Appender, Config, Root};
+    use log4rs::encode::pattern::PatternEncoder;
+
+    let console = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new("{d(%Y-%m-%dT%H:%M:%S%.3f)} {l} {t} - {m}{n}")))
+        .build();
+    let cfg = Config::builder()
+        .appender(Appender::builder().build("console", Box::new(console)))
+        .build(Root::builder().appender("console").build(level));
+    if let Ok(c) = cfg {
+        let _ = log4rs::init_config(c);
+    }
+}

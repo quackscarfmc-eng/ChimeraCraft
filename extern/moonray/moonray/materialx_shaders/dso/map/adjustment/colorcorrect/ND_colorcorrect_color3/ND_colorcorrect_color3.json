@@ -1,0 +1,76 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "hueAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "hue",
+            "type" : "Float"
+        },
+        "saturationAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "saturation",
+            "type" : "Float"
+        },
+        "gammaAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Float"
+        },
+        "liftAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "lift",
+            "type" : "Float"
+        },
+        "gainAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gain",
+            "type" : "Float"
+        },
+        "contrastAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "contrast",
+            "type" : "Float"
+        },
+        "contrastpivotAttr" :
+        {
+            "default" : 0.5,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "contrastpivot",
+            "type" : "Float"
+        },
+        "exposureAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "exposure",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_colorcorrect_color3",
+    "type" : "Map"
+}

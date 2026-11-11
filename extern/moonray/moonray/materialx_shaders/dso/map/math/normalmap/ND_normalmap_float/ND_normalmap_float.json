@@ -1,0 +1,45 @@
+{
+    "attributes" :
+    {
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Vec3f(0.5f, 0.5f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec3f"
+        },
+        "normalAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "normal",
+            "type" : "Vec3f"
+        },
+        "scaleAttr" :
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "scale",
+            "type" : "Float"
+        },
+        "tangentAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "tangent",
+            "type" : "Vec3f"
+        },
+        "bitangentAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bitangent",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_normalmap_float",
+    "type" : "Map"
+}

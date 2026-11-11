@@ -1,0 +1,58 @@
+# File: crates/ppf-cts-core/Cargo.toml
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+#
+# Pure data model + state machine + numeric kernels. No PyO3, no tokio,
+# no I/O; those live in ppf-cts-py and ppf-cts-server respectively.
+# This crate must be testable on its own with `cargo test -p
+# ppf-cts-core` so the algorithmic core stays decoupled from the
+# binding and runtime layers.
+
+[package]
+name = "ppf-cts-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+nalgebra.workspace = true
+ndarray.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+wide = "0.7"
+
+[build-dependencies]
+# Compiles cpp/intersect_ffi.cpp, the host C ABI over the shared
+# edge-triangle pierce predicate in the solver's C++ tree, so the Rust
+# build-time self-intersection check runs the same geometry as the GPU.
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3.13"
+criterion = "0.5"
+proptest = "1"
+
+[features]
+default = []
+# Workspace-level source of truth for the `cpu` flag, on the same footing as
+# `ppf-cts-solver` selects the Rust CPU backend with it, and
+# this crate's `check_gpu` reads it so a CPU build is not asked for an NVIDIA
+# device it neither has nor needs. Dependents declare
+# `cpu = ["ppf-cts-core/cpu"]` so one toggle cascades.
+cpu = []
+# Workspace-level source of truth for the `rocm` flag, on the same footing as
+# `cpu` above. `check_gpu` reads it so a ROCm build is not asked for an NVIDIA
+# device it neither has nor needs, which is exactly what the CUDA arm would do:
+# it shells out to `nvidia-smi` for every non-macOS build that is not `cpu`.
+rocm = []
+
+[[bench]]
+name = "rasterizer"
+harness = false
+
+[lints]
+workspace = true

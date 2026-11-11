@@ -1,0 +1,56 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuetlAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuetl",
+            "type" : "Vec4f"
+        },
+        "valuetrAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuetr",
+            "type" : "Vec4f"
+        },
+        "valueblAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuebl",
+            "type" : "Vec4f"
+        },
+        "valuebrAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuebr",
+            "type" : "Vec4f"
+        }
+    },
+    "name" : "ND_ramp4_vector4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "name" : "out",
+            "type" : "Vec4f"
+        }
+    },
+    "type" : "Map"
+}

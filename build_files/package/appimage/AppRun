@@ -1,0 +1,44 @@
+#!/bin/sh
+
+set -e
+
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEPS_ROOT="$APPDIR/usr/lib/moonray/installs"
+MOONRAY_ROOT="$DEPS_ROOT/openmoonray"
+
+# AppRun hard-exits when the MoonRay runtime is incomplete. The original
+# launcher only checked plugin/pxr and rdl2dso; sessions/ and shader_json/
+# are equally required (ARRAS_SESSION_PATH / MOONRAY_CLASS_PATH), and a
+# missing one used to fail much later, deep inside Arras/MCRT.
+missing=""
+for dir in plugin/pxr rdl2dso sessions shader_json; do
+    if [ ! -d "$MOONRAY_ROOT/$dir" ]; then
+        missing="$missing $dir"
+    fi
+done
+if [ -n "$missing" ]; then
+    printf '%s\n' "MoonRay runtime is missing from this AppImage (missing:$missing)." >&2
+    exit 1
+fi
+
+export LD_LIBRARY_PATH="$DEPS_ROOT/deps/lib:$DEPS_ROOT/lib:$DEPS_ROOT/lib64:$MOONRAY_ROOT/lib:$MOONRAY_ROOT/lib64:$APPDIR/usr/lib:$APPDIR/usr/bin/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH="$MOONRAY_ROOT/bin:$PATH"
+export RDL2_DSO_PATH="$MOONRAY_ROOT/rdl2dso"
+export REZ_MOONRAY_ROOT="$MOONRAY_ROOT"
+export ARRAS_SESSION_PATH="$MOONRAY_ROOT/sessions"
+export MOONRAY_CLASS_PATH="$MOONRAY_ROOT/shader_json"
+
+# The bundled hd_moonray plugin was built against USD v22.11, which discovers
+# plugins through PXR_PLUGINPATH_NAME (the canonical USD variable, still the
+# one used by OpenMoonRay's own scripts/setup.sh). Export the same search list
+# through every historically accepted spelling so both old and new USD builds
+# find the bundled plugins, and only append the bundled USD plugin directory
+# when it actually exists.
+USD_PLUGIN_PATHS="$MOONRAY_ROOT/plugin/pxr"
+if [ -d "$APPDIR/usr/bin/lib/usd" ]; then
+    USD_PLUGIN_PATHS="$USD_PLUGIN_PATHS:$APPDIR/usr/bin/lib/usd"
+fi
+export PXR_PLUGINPATH_NAME="$USD_PLUGIN_PATHS${PXR_PLUGINPATH_NAME:+:$PXR_PLUGINPATH_NAME}"
+export USD_PLUG_IN_PATH="$USD_PLUGIN_PATHS${USD_PLUG_IN_PATH:+:$USD_PLUG_IN_PATH}"
+
+exec "$APPDIR/usr/bin/blender" "$@"

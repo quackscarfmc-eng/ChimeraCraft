@@ -1,0 +1,14 @@
+Testing
+
+ND_distance_vector2
+    Test that in1 defaults to 0,0 and that in2 accepts a constant by setting in2 and leaving in1 at its default value
+    Test that in2 defaults to 0,0 and that in1 accepts a constant by setting in1 and leaving in2 at its default value
+    Test that in1 and in2 can be set to variable values by attaching checkerboard textures to each
+ND_distance_vector3
+    Test that in1 defaults to 0,0,0 and that in2 accepts a constant by setting in2 and leaving in1 at its default value
+    Test that in2 defaults to 0,0,0 and that in1 accepts a constant by setting in1 and leaving in2 at its default value
+    Test that in1 and in2 can be set to variable values by attaching checkerboard textures to each
+ND_distance_vector4
+    Test that in1 defaults to 0,0,0,0 and that in2 accepts a constant by setting in2 and leaving in1 at its default value
+    Test that in2 defaults to 0,0,0,0 and that in1 accepts a constant by setting in1 and leaving in2 at its default value
+    Test that in1 and in2 can be set to variable values by attaching checkerboard textures to each

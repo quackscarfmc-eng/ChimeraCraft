@@ -1,0 +1,35 @@
+mtllib cube.mtl
+
+# vertices outside of any "o"
+v -1 -1 1
+v -1 1 1
+v 1 1 1
+v 1 -1 1
+v -1 -1 -1
+v -1 1 -1
+v 1 1 -1
+v 1 -1 -1
+# one extra vertex to the side
+v -2 -2 2
+
+# a dummy normal (has to be present though,
+# to trick the importer into buggy behavior)
+vn 0 0 1
+
+# should be just a red cube, with first 8 vertices
+o ActualCube
+g ActualCube
+usemtl red
+f 4 3 2 1 
+f 1 2 6 5 
+f 7 6 2 3 
+f 4 8 7 3 
+f 5 8 4 1  
+f 5 6 7 8
+
+# just a triangle, using two vertices from the cube
+# and that one extra
+o SparseTri
+g SparseTri
+usemtl blue
+f 9 4 5

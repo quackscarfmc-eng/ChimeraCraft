@@ -1,0 +1,49 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "in1Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in1",
+            "type" : "Rgba"
+        },
+        "in2Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in2",
+            "type" : "Rgba"
+        },
+        "value1Attr" : 
+        {
+            "default" : "1",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "value1",
+            "type" : "Int"
+        },
+        "value2Attr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "value2",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_ifgreater_color4I",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

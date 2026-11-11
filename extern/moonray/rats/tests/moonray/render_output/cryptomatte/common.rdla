@@ -1,0 +1,118 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+sceneVars = SceneVariables {
+    ["lights_visible_in_camera"] = true,
+    ["pixel_samples"] = 2,
+    ["max_depth"] = 0,
+    ["light_samples"] = 1,
+    ["bsdf_samples"] = 1,
+    ["image_width"] = 256,
+    ["image_height"] = 256,
+    ["enable_presence_shadows"] = true,
+    ["deep_id_attribute_names"] = {"id0"},
+}
+
+id0 = UserData("id0") {
+    ["float_key"] = "id0",
+}
+
+ROOM_WIDTH=5
+ROOM_HEIGHT=5
+ROOM_DEPTH=5
+
+id0 = UserData("id0") {
+    ["float_key"] = "id0",
+    ["float_values"] = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6},
+}
+
+shotCam = Camera("/Scene/rendering/shot_cam") {
+    ["node_xform"] = translate(0, 0, ROOM_DEPTH),
+    ["focal"] = 20,
+}
+
+rectLight = RectLight("/Scene/lighting/rect") {
+    ["node_xform"] = rotate(-90, 1, 0, 0) * translate(0, ROOM_HEIGHT/2, 0),
+    ["on"] = true,
+    ["color"] = Rgb(1, 1, 1),
+    ["intensity"] = 1,
+    ["exposure"] = 5.6,
+    ["normalized"] = false,
+    ["width"] = 0.8,
+    ["height"] = 0.8,
+    ["presence_shadows"] = 1,
+}
+
+lightSet = LightSet("LightSetA") {
+    rectLight
+}
+
+-- Geometry --
+planeBack = UsdGeometry("/Scene/geometry/back") {
+    ["node_xform"] = rotate(90, 1, 0, 0) * scale(ROOM_WIDTH, ROOM_HEIGHT, ROOM_DEPTH) * translate(0, 0, -ROOM_DEPTH/2),
+    ["stage"] = rats_assets_dir.."/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+planeBottom = UsdGeometry("/Scene/geometry/bottom") {
+    ["node_xform"] = scale(ROOM_WIDTH, ROOM_HEIGHT, ROOM_DEPTH) * translate(0, -ROOM_HEIGHT/2, 0),
+    ["stage"] = rats_assets_dir.."/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+planeTop = UsdGeometry("/Scene/geometry/top") {
+    ["node_xform"] = scale(ROOM_WIDTH, ROOM_HEIGHT, ROOM_DEPTH) * translate(0, ROOM_HEIGHT/2, 0),
+    ["stage"] = rats_assets_dir.."/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+planeLeft = UsdGeometry("/Scene/geometry/left") {
+    ["node_xform"] = rotate(90, 0, 0, 1) * scale(ROOM_WIDTH, ROOM_HEIGHT, ROOM_DEPTH) * translate(ROOM_WIDTH/2, 0, 0),
+    ["stage"] = rats_assets_dir.."/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+planeRight = UsdGeometry("/Scene/geometry/right") {
+    ["node_xform"] = rotate(-90, 0, 0, 1) * scale(ROOM_WIDTH, ROOM_HEIGHT, ROOM_DEPTH) * translate(-ROOM_WIDTH/2, 0, 0),
+    ["stage"] = rats_assets_dir.."/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+GeometrySet("geometrySet") {
+    planeBack,
+    planeBottom,
+    planeTop,
+    planeLeft,
+    planeRight,
+}
+
+
+whiteMtl = DwaBaseMaterial("/Scene/surfacing/material/white") {
+    ["albedo"] = Rgb(0.6, 0.55, 0.4),
+}
+
+leftMtl = DwaBaseMaterial("/Scene/surfacing/material/left") {
+    ["albedo"] = Rgb(0.7, 0.1, 0.08),
+}
+
+rightMtl = DwaBaseMaterial("/Scene/surfacing/material/right") {
+    ["albedo"] = Rgb(0.2, 0.4, 0.7),
+}
+
+Layer("layer") {
+    { planeBack, "", whiteMtl, lightSet },
+    { planeBottom, "", whiteMtl, lightSet },
+    { planeTop, "", whiteMtl, lightSet },
+    { planeLeft, "", leftMtl, lightSet },
+    { planeRight, "", rightMtl, lightSet },
+}
+
+RenderOutput("cryptomatte") {
+    ["result"] = "cryptomatte",
+    ["file_name"] = "cryptomatte.exr",
+}
+
+RenderOutput("dummy0") {
+    ["file_name"] = "ignore_this_file.exr",
+    ["primitive_attribute"] = "id0",
+    ["result"] = "primitive attribute",
+}

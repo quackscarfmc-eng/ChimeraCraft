@@ -1,0 +1,28 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"valueAttr" : 
+		{
+			"default" : "Mat3f(1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "value",
+			"type" : "Mat3f"
+		}
+	},
+	"name" : "ND_constant_matrix33",
+	"outputAttributes" : 
+	{
+		"outAttr" : 
+		{
+			"name" : "out",
+			"type" : "Mat3f"
+		}
+	},
+	"type" : "Map"
+}

@@ -1,0 +1,861 @@
+# License: GPL-3.0-or-later
+"""General Blender operation handlers using the decorator system.
+
+This module contains MCP handlers for basic Blender operations like scene management,
+object creation, material handling, and other general Blender functionality.
+"""
+
+import io
+import sys
+
+from typing import Optional
+
+import bmesh  # pyright: ignore
+import bpy  # pyright: ignore
+
+from mathutils import Vector  # pyright: ignore
+
+from ..models.groups import get_addon_data
+from .decorators import MCPError, ValidationError, mcp_handler
+
+_PENDING_CURVE_BUILDERS: dict[str, object] = {}
+
+
+def _require_curve_builder(name: str):
+    builder = _PENDING_CURVE_BUILDERS.get(name)
+    if builder is None:
+        raise MCPError(
+            f"No pending curve builder named '{name}'. Call create_curve first."
+        )
+    return builder
+
+
+def _coerce_curve_points(points: list[list[float]]) -> list[tuple[float, float, float]]:
+    coerced: list[tuple[float, float, float]] = []
+    for index, point in enumerate(points):
+        if len(point) != 3:
+            raise ValidationError(
+                f"points[{index}] must contain exactly 3 coordinates"
+            )
+        try:
+            coerced.append((float(point[0]), float(point[1]), float(point[2])))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"points[{index}] must contain numeric coordinates"
+            ) from exc
+    return coerced
+
+
+@mcp_handler(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
+def run_python_script(code: str):
+    """Execute arbitrary Python code in Blender with access to bpy, bmesh, and mathutils modules.
+
+    Args:
+        code: Python code to execute in Blender context
+    """
+    # Capture stdout to return any printed output
+    old_stdout = sys.stdout
+    captured_output = io.StringIO()
+    sys.stdout = captured_output
+
+    try:
+        # Create a safe execution environment with common Blender modules
+        exec_globals = {
+            "__builtins__": __builtins__,
+            "bpy": bpy,
+            "bmesh": bmesh,
+            "mathutils": __import__("mathutils"),
+            "Vector": Vector,
+        }
+
+        # Execute the code
+        exec(code, exec_globals)
+
+        # Get any printed output
+        output = captured_output.getvalue()
+
+        return {
+            "message": "Python script executed successfully",
+            "output": output if output else "No output",
+            "success": True,
+        }
+
+    except Exception as e:
+        # Set a top-level "status": "error" so the mcp_handler wrapper passes
+        # the dict through unchanged (it checks for "status") and the MCP client
+        # sees status='error'. Returning the dict (instead of raising MCPError)
+        # preserves the captured pre-exception stdout, which the bare raise path
+        # would discard.
+        return {
+            "status": "error",
+            "message": f"Python script execution failed: {str(e)}",
+            "output": captured_output.getvalue(),
+            "error": str(e),
+        }
+
+    finally:
+        # Restore stdout
+        sys.stdout = old_stdout
+
+
+@mcp_handler
+def capture_viewport_image(filepath: str, max_size: int = 800):
+    """Capture a screenshot of the current 3D viewport and save it to specified file path.
+
+    Args:
+        filepath: File path where to save the screenshot
+        max_size: Maximum size in pixels for the largest dimension
+    """
+    # Find the 3D viewport area
+    viewport_area = None
+    for area in bpy.context.screen.areas:
+        if area.type == "VIEW_3D":
+            viewport_area = area
+            break
+
+    if not viewport_area:
+        raise MCPError("No 3D viewport found")
+
+    # Set up render settings for viewport screenshot
+    scene = bpy.context.scene
+    original_filepath = scene.render.filepath
+    original_resolution_x = scene.render.resolution_x
+    original_resolution_y = scene.render.resolution_y
+
+    try:
+        # Set render settings
+        scene.render.filepath = filepath
+
+        # Calculate resolution maintaining aspect ratio
+        current_x = viewport_area.width
+        current_y = viewport_area.height
+
+        if current_x > current_y:
+            new_x = min(max_size, current_x)
+            new_y = int((current_y / current_x) * new_x)
+        else:
+            new_y = min(max_size, current_y)
+            new_x = int((current_x / current_y) * new_y)
+
+        scene.render.resolution_x = new_x
+        scene.render.resolution_y = new_y
+
+        # Override context to render from 3D viewport
+        with bpy.context.temp_override(area=viewport_area):
+            bpy.ops.render.opengl(write_still=True)
+
+        return {
+            "message": f"Viewport screenshot saved to '{filepath}'",
+            "filepath": filepath,
+            "resolution": [new_x, new_y],
+            "max_size": max_size,
+        }
+
+    finally:
+        # Restore original render settings
+        scene.render.filepath = original_filepath
+        scene.render.resolution_x = original_resolution_x
+        scene.render.resolution_y = original_resolution_y
+
+
+# ============================================================================
+# Curve Construction
+# ============================================================================
+
+
+@mcp_handler
+def create_curve(
+    name: str,
+    bevel_depth: float = 0.0,
+    bevel_resolution: int = 2,
+    resolution_u: int = 4,
+    dimensions: str = "3D",
+    clear_existing: bool = True,
+):
+    """Create a pending curve builder for ROD-scene authoring.
+
+    Args:
+        name: Object name for the curve to be finalized later
+        bevel_depth: Tube radius for viewport visualization
+        bevel_resolution: Tube cross-section subdivisions
+        resolution_u: Spline interpolation resolution
+        dimensions: Curve dimensions ("3D" or "2D")
+        clear_existing: Remove an existing same-name object before finalize
+    """
+    from ..ops.api.curve import _CurveBuilder
+
+    builder = _CurveBuilder(
+        name,
+        bevel_depth=float(bevel_depth),
+        bevel_resolution=int(bevel_resolution),
+        resolution_u=int(resolution_u),
+        dimensions=str(dimensions),
+        clear_existing=bool(clear_existing),
+    )
+    _PENDING_CURVE_BUILDERS[name] = builder
+    return {
+        "message": f"Created pending curve builder '{name}'",
+        "curve_name": name,
+        "bevel_depth": float(bevel_depth),
+        "bevel_resolution": int(bevel_resolution),
+        "resolution_u": int(resolution_u),
+        "dimensions": str(dimensions),
+        "clear_existing": bool(clear_existing),
+    }
+
+
+@mcp_handler
+def add_curve_spline(name: str, points: list[list[float]], closed: bool = False):
+    """Append a Bezier spline to a pending curve builder.
+
+    Args:
+        name: Curve builder name passed to create_curve
+        points: List of [x, y, z] control-point coordinates
+        closed: Whether to make the spline cyclic
+    """
+    builder = _require_curve_builder(name)
+    coerced_points = _coerce_curve_points(points)
+    try:
+        spline_index = builder.add_spline(coerced_points, closed=bool(closed))
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    return {
+        "message": f"Added spline {spline_index} to pending curve '{name}'",
+        "curve_name": name,
+        "spline_index": spline_index,
+        "point_count": len(coerced_points),
+        "closed": bool(closed),
+    }
+
+
+@mcp_handler
+def set_curve_material(
+    name: str,
+    spline_index: int,
+    material_name: str,
+    create_if_missing: bool = False,
+):
+    """Bind a Blender material to a spline on a pending curve builder.
+
+    Args:
+        name: Curve builder name passed to create_curve
+        spline_index: Spline index returned by add_curve_spline
+        material_name: Existing Blender material name
+        create_if_missing: Create the material when it does not exist
+    """
+    builder = _require_curve_builder(name)
+    material = bpy.data.materials.get(material_name)
+    if material is None and create_if_missing:
+        material = bpy.data.materials.new(material_name)
+    if material is None:
+        raise MCPError(
+            f"Material '{material_name}' not found. "
+            "Pass create_if_missing=true to create it."
+        )
+    try:
+        builder.set_material(int(spline_index), material)
+    except IndexError as exc:
+        raise ValidationError(str(exc)) from exc
+    return {
+        "message": f"Bound material '{material_name}' to spline {spline_index}",
+        "curve_name": name,
+        "spline_index": int(spline_index),
+        "material_name": material_name,
+    }
+
+
+@mcp_handler
+def finalize_curve(name: str):
+    """Finalize a pending curve builder, link it to the scene, and return the object.
+
+    Args:
+        name: Curve builder name passed to create_curve
+    """
+    builder = _require_curve_builder(name)
+    try:
+        obj = builder.finalize()
+    except RuntimeError as exc:
+        raise MCPError(str(exc)) from exc
+    _PENDING_CURVE_BUILDERS.pop(name, None)
+    return {
+        "message": f"Finalized curve '{obj.name}'",
+        "curve_name": name,
+        "object_name": obj.name,
+        "object_type": obj.type,
+        "spline_count": len(obj.data.splines),
+    }
+
+
+# ============================================================================
+# UI Element Status Functions
+# ============================================================================
+
+# The categories this tool reports under. Operators are grouped by the module
+# that registers them; properties are grouped by _categorize_state_property
+# and by the property group they live on.
+_UI_CATEGORIES = frozenset({"solver", "dynamics", "client", "debug"})
+
+
+@mcp_handler
+def get_ui_element_status(
+    element_type: str = "all",
+    element_name: Optional[str] = None,
+    category: Optional[str] = None,
+):
+    """Get status of Blender addon UI elements - poll results for operators, values for properties.
+
+    Args:
+        element_type: Type of elements to check ("operator", "property", "all")
+        element_name: Specific element name to check (optional)
+        category: Filter by category ("solver", "dynamics", "client", "debug")
+    """
+    result = {"operators": [], "properties": []}
+
+    # Validate element_type
+    if element_type not in ["operator", "property", "all"]:
+        raise ValidationError("element_type must be 'operator', 'property', or 'all'")
+
+    # An unrecognized category would filter everything out and report an empty
+    # list, which reads as "this surface is empty" rather than "you asked for
+    # something that does not exist".
+    if category is not None and category not in _UI_CATEGORIES:
+        raise ValidationError(
+            f"category must be one of {', '.join(sorted(_UI_CATEGORIES))}; "
+            f"got {category!r}"
+        )
+
+    try:
+        # Get operators if requested
+        if element_type in ["operator", "all"]:
+            operators = _get_operator_status(element_name, category)
+            result["operators"] = operators
+
+        # Get properties if requested
+        if element_type in ["property", "all"]:
+            properties = _get_property_status(element_name, category)
+            result["properties"] = properties
+
+        return {
+            "elements": result,
+            "total_operators": len(result["operators"]),
+            "total_properties": len(result["properties"]),
+        }
+
+    except Exception as e:
+        raise MCPError(f"Failed to get UI element status: {str(e)}") from e
+
+
+def _get_operator_status(
+    element_name: Optional[str], category: Optional[str]
+) -> list[dict]:
+    """Get status of all operators with poll method results."""
+    operators = []
+
+    # Import UI modules to discover operators
+    try:
+        from ..ui import (
+            addon_ops,
+            connection_ops,
+            debug_ops,
+            dynamics,
+            geometry_cleanup_ops,
+            install_ops,
+            jupyter_ops,
+            main_panel,
+            mcp_ops,
+            solver,
+            solver_control_ops,
+        )
+        from ..ui.dynamics import material_map_ops
+
+        # Every module that registers operators, grouped under the categories
+        # this tool advertises. A category that named no module would report an
+        # empty list for a surface that exists, so the table covers all four.
+        # `material_map_ops` is named explicitly because `ui.dynamics` does not
+        # re-export it, so reaching it through the package would report the
+        # material map operators as absent rather than as a category with no
+        # entries.
+        operator_modules = {
+            "solver": (solver, solver_control_ops, jupyter_ops, main_panel),
+            "dynamics": (dynamics, geometry_cleanup_ops, material_map_ops),
+            "client": (connection_ops, install_ops),
+            "debug": (debug_ops, mcp_ops, addon_ops),
+        }
+
+        # One operator is reported once, whichever module exposes it.
+        seen_idnames = set()
+
+        for module_name, modules in operator_modules.items():
+            # Skip if category filter doesn't match
+            if category and category != module_name:
+                continue
+
+            for module in modules:
+                # Get all operator classes from the module
+                for attr_name in dir(module):
+                    attr = getattr(module, attr_name)
+
+                    # Check if it's an operator class
+                    if hasattr(attr, "__bases__") and any(
+                        "Operator" in base.__name__ for base in attr.__bases__
+                    ):
+                        # Report a class only from the module or package that
+                        # OWNS it. A package owns what its submodules define,
+                        # which is how `ui.dynamics` covers its operator
+                        # modules; a module that merely imports a sibling's
+                        # operator for its own use does not, which is what
+                        # keeps one operator from being reported several times
+                        # under whichever category was scanned first.
+                        owner = getattr(attr, "__module__", "")
+                        if not owner.startswith(module.__name__):
+                            continue
+                        if getattr(attr, "bl_idname", None) in seen_idnames:
+                            continue
+                        seen_idnames.add(attr.bl_idname)
+
+                        # Skip if element_name filter doesn't match
+                        if element_name and attr_name != element_name:
+                            continue
+
+                        try:
+                            # Get operator info
+                            op_info = {
+                                "name": attr_name,
+                                "bl_idname": getattr(attr, "bl_idname", "unknown"),
+                                "description": attr.__doc__.split("\n")[0].strip()
+                                if attr.__doc__
+                                else "",
+                                "category": module_name,
+                                "clickable": False,
+                            }
+
+                            # Call poll method if it exists
+                            if hasattr(attr, "poll") and callable(attr.poll):
+                                try:
+                                    context = bpy.context
+                                    poll_result = attr.poll(context)
+                                    op_info["clickable"] = bool(poll_result)
+                                except Exception as poll_error:
+                                    op_info["clickable"] = False
+                                    op_info["poll_error"] = str(poll_error)
+
+                            operators.append(op_info)
+
+                        except Exception:
+                            # If we can't process this operator, skip it
+                            continue
+
+    except Exception as e:
+        raise MCPError(f"Failed to discover operators: {str(e)}") from e
+
+    return operators
+
+
+def _get_property_status(
+    element_name: Optional[str], category: Optional[str]
+) -> list[dict]:
+    """Get current values of scene properties by dynamically discovering them."""
+    properties = []
+
+    try:
+        scene = bpy.context.scene
+
+        # Dynamically discover State properties (solver/debug categories)
+        addon_data = get_addon_data(scene)
+        if addon_data and hasattr(addon_data, "state"):
+            state_properties = _discover_property_group_properties(
+                addon_data.state, "state", _categorize_state_property
+            )
+            properties.extend(
+                _filter_properties(state_properties, element_name, category)
+            )
+
+        # Dynamically discover SSH State properties (client category)
+        if addon_data and hasattr(addon_data, "ssh_state"):
+            ssh_properties = _discover_property_group_properties(
+                addon_data.ssh_state, "ssh_state", lambda name: "client"
+            )
+            properties.extend(
+                _filter_properties(ssh_properties, element_name, category)
+            )
+
+        # Dynamically discover Object group properties (dynamics category)
+        if category in [None, "dynamics"]:
+            from ..models.groups import iterate_active_object_groups
+
+            for i, group in enumerate(iterate_active_object_groups(scene)):
+                # Read-only: never call ensure_uuid() here; this runs in
+                # a timer context where ID-property writes are forbidden.
+                group_uuid = group.uuid if group.uuid else f"idx{i}"
+                prefix = f"group_{group_uuid}"
+                group_properties = _discover_property_group_properties(
+                    group, prefix, lambda name: "dynamics"
+                )
+                properties.extend(
+                    _filter_properties(group_properties, element_name, category)
+                )
+
+    except Exception as e:
+        raise MCPError(f"Failed to get property values: {str(e)}") from e
+
+    return properties
+
+
+def _discover_property_group_properties(
+    prop_group, prefix: str, categorize_func
+) -> list[dict]:
+    """Dynamically discover properties in a Blender PropertyGroup using introspection."""
+    properties = []
+
+    try:
+        # Use Blender's bl_rna.properties to get property definitions
+        if hasattr(prop_group, "bl_rna") and hasattr(prop_group.bl_rna, "properties"):
+            bl_properties = prop_group.bl_rna.properties
+
+            for attr_name in bl_properties:
+                # Skip private/internal attributes
+                if attr_name.startswith("_") or attr_name in [
+                    "bl_rna",
+                    "rna_type",
+                    "name",
+                ]:
+                    continue
+
+                try:
+                    # Get property value
+                    attr_value = getattr(prop_group, attr_name)
+
+                    # Skip methods and functions
+                    if callable(attr_value):
+                        continue
+
+                    # Get property info from bl_rna
+                    prop_info = bl_properties[attr_name]
+
+                    prop_name = (
+                        f"{prefix}_{attr_name}" if prefix != attr_name else attr_name
+                    )
+                    prop_type = _get_blender_rna_property_type(prop_info)
+                    prop_category = categorize_func(attr_name)
+
+                    # Serialize the value to ensure JSON compatibility
+                    serialized_value = _serialize_property_value(attr_value)
+
+                    properties.append(
+                        {
+                            "name": prop_name,
+                            "value": serialized_value,
+                            "type": prop_type,
+                            "category": prop_category,
+                        }
+                    )
+
+                except Exception:
+                    # If we can't get property info, skip it
+                    continue
+
+    except Exception:
+        # If RNA introspection fails, fall back to simple attribute iteration
+        for attr_name in dir(prop_group):
+            if (
+                not attr_name.startswith("_")
+                and attr_name not in ["bl_rna", "rna_type"]
+                and not callable(getattr(prop_group, attr_name, None))
+            ):
+                try:
+                    attr_value = getattr(prop_group, attr_name)
+                    prop_name = (
+                        f"{prefix}_{attr_name}" if prefix != attr_name else attr_name
+                    )
+                    prop_type = _infer_type_from_value(attr_value)
+                    prop_category = categorize_func(attr_name)
+
+                    # Serialize the value to ensure JSON compatibility
+                    serialized_value = _serialize_property_value(attr_value)
+
+                    properties.append(
+                        {
+                            "name": prop_name,
+                            "value": serialized_value,
+                            "type": prop_type,
+                            "category": prop_category,
+                        }
+                    )
+                except Exception:
+                    continue
+
+    return properties
+
+
+def _get_blender_rna_property_type(prop_info) -> str:
+    """Get the type string for a Blender RNA property info."""
+    try:
+        # Get the property type from RNA info
+        if hasattr(prop_info, "type"):
+            prop_type = prop_info.type
+
+            # Check for specific subtypes first
+            if hasattr(prop_info, "subtype") and prop_info.subtype != "NONE":
+                subtype = prop_info.subtype
+                if subtype == "FILE_PATH":
+                    return "file_path"
+                elif subtype == "COLOR":
+                    return "color"
+
+            # Map RNA types to our type strings
+            type_mapping = {
+                "STRING": "string",
+                "INT": "int",
+                "FLOAT": "float",
+                "BOOLEAN": "bool",
+                "ENUM": "enum",
+                "FLOAT_VECTOR": "float_vector",
+                "COLLECTION": "collection",
+                "POINTER": "pointer",
+            }
+            return type_mapping.get(prop_type, "unknown")
+
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def _serialize_property_value(value):
+    """Serialize property value to ensure JSON compatibility."""
+    try:
+        # Handle basic types that are already JSON-serializable
+        if isinstance(value, str | int | float | bool | type(None)):
+            return value
+
+        # Handle Blender collections and special objects
+        if hasattr(value, "__len__") and not isinstance(value, str):
+            # Try to convert collections to lists, handling Blender PropertyGroup items
+            try:
+                serialized_list = []
+                for item in value:
+                    # Handle Blender PropertyGroup items (like AssignedObject)
+                    if hasattr(item, "bl_rna"):
+                        # For PropertyGroup items, extract key properties
+                        entry = {"type": str(type(item).__name__)}
+                        if hasattr(item, "name"):
+                            entry["name"] = item.name
+                        if hasattr(item, "uuid") and item.uuid:
+                            entry["uuid"] = item.uuid
+                        serialized_list.append(entry)
+                    else:
+                        # For regular items, try direct serialization
+                        try:
+                            serialized_list.append(item)
+                        except Exception:
+                            serialized_list.append(str(item))
+                return serialized_list
+            except (TypeError, ValueError):
+                # If collection conversion fails, return a string representation
+                return str(value)
+
+        # For any other type, convert to string
+        return str(value)
+
+    except Exception:
+        # If all else fails, return a safe string representation
+        return "<unserializable>"
+
+
+def _infer_type_from_value(value) -> str:
+    """Infer property type from its current value."""
+    if isinstance(value, bool):
+        return "bool"
+    elif isinstance(value, int):
+        return "int"
+    elif isinstance(value, float):
+        return "float"
+    elif isinstance(value, str):
+        return "string"
+    elif hasattr(value, "__len__") and not isinstance(value, str):
+        return "collection"
+    else:
+        return "unknown"
+
+
+def _categorize_state_property(prop_name: str) -> str:
+    """Categorize state properties into solver or debug categories."""
+    debug_props = {
+        "server_script",
+        "shell_command",
+        "mcp_port",
+        "max_console_lines",
+        "use_shell",
+        "data_size",
+        "log_file_path",
+    }
+    return "debug" if prop_name in debug_props else "solver"
+
+
+def _filter_properties(
+    properties: list[dict], element_name: Optional[str], category: Optional[str]
+) -> list[dict]:
+    """Filter properties based on element_name and category filters."""
+    filtered = []
+
+    for prop in properties:
+        # Skip if category filter doesn't match
+        if category and prop["category"] != category:
+            continue
+
+        # Skip if element_name filter doesn't match
+        if element_name and prop["name"] != element_name:
+            continue
+
+        filtered.append(prop)
+
+    return filtered
+
+
+# ============================================================================
+# UI Management Functions
+# ============================================================================
+
+
+@mcp_handler
+def get_average_edge_length(object_name: str):
+    """Compute the average edge length of a mesh object.
+
+    Args:
+        object_name: Name of the mesh object to analyze
+    """
+    # Get the object from the scene
+    obj = bpy.data.objects.get(object_name)
+
+    if not obj:
+        raise MCPError(f"Object '{object_name}' not found in scene")
+
+    if obj.type != "MESH":
+        raise MCPError(
+            f"Object '{object_name}' is not a mesh object (type: {obj.type})"
+        )
+
+    from ..core.uuid_registry import get_object_uuid
+    obj_uuid = get_object_uuid(obj)  # read-only: timer context forbids ID writes
+    mesh = obj.data
+
+    if len(mesh.edges) == 0:
+        return {
+            "object_name": object_name,
+            "object_uuid": obj_uuid,
+            "average_edge_length": 0.0,
+            "total_edges": 0,
+            "message": "Object has no edges",
+        }
+
+    # Calculate edge lengths in world space
+    world_mat = obj.matrix_world
+    total_edge_length = 0.0
+
+    for edge in mesh.edges:
+        v1_world = world_mat @ mesh.vertices[edge.vertices[0]].co
+        v2_world = world_mat @ mesh.vertices[edge.vertices[1]].co
+        edge_length = (v2_world - v1_world).length
+        total_edge_length += edge_length
+
+    average_length = total_edge_length / len(mesh.edges)
+
+    return {
+        "object_name": object_name,
+        "object_uuid": obj_uuid,
+        "average_edge_length": average_length,
+        "total_edges": len(mesh.edges),
+        "total_vertices": len(mesh.vertices),
+        "message": f"Average edge length computed for '{object_name}'",
+    }
+
+
+@mcp_handler
+def get_object_bounding_box_diagonal(object_name: str):
+    """Compute the bounding box of an object and return the largest diagonal distance.
+
+    Two diagonals are returned, and they differ for a rotated object.
+    ``largest_diagonal_distance`` is the diagonal of the world-space box around
+    the eight corners of the object's local bounding box, which grows when the
+    object is rotated. ``contact_length_diagonal`` is the diagonal of the
+    world-space box around the object's own vertices, and it is the length a
+    group in relative mode multiplies by its Contact Gap Ratio and Contact
+    Offset Ratio to size this object's contact gap and offset. To predict
+    either distance, use ``contact_length_diagonal``.
+
+    Args:
+        object_name: Name of the object to analyze
+    """
+    # Get the object from the scene
+    obj = bpy.data.objects.get(object_name)
+
+    if not obj:
+        raise MCPError(f"Object '{object_name}' not found in scene")
+
+    from ..core.uuid_registry import get_object_uuid
+    obj_uuid = get_object_uuid(obj)  # read-only: timer context forbids ID writes
+
+    # Get bounding box in local coordinates
+    bbox_corners = [Vector(corner) for corner in obj.bound_box]
+
+    # Transform to world coordinates
+    world_mat = obj.matrix_world
+    world_bbox_corners = [world_mat @ corner for corner in bbox_corners]
+
+    # Find min and max coordinates for each axis
+    min_x = min(corner.x for corner in world_bbox_corners)
+    max_x = max(corner.x for corner in world_bbox_corners)
+    min_y = min(corner.y for corner in world_bbox_corners)
+    max_y = max(corner.y for corner in world_bbox_corners)
+    min_z = min(corner.z for corner in world_bbox_corners)
+    max_z = max(corner.z for corner in world_bbox_corners)
+
+    # Calculate bounding box dimensions
+    width = max_x - min_x
+    height = max_y - min_y
+    depth = max_z - min_z
+
+    # Calculate the main diagonal (3D diagonal of the bounding box)
+    diagonal_distance = (Vector((width, height, depth))).length
+
+    # The length the encoder sizes this object's contact distances from, asked
+    # of the encoder itself so the two cannot drift apart.
+    from ..core.encoder.mesh import compute_object_bounding_box_diagonal
+    contact_length_diagonal = compute_object_bounding_box_diagonal(obj)
+
+    return {
+        "object_name": object_name,
+        "object_uuid": obj_uuid,
+        "bounding_box": {
+            "min": [min_x, min_y, min_z],
+            "max": [max_x, max_y, max_z],
+            "center": [(min_x + max_x) / 2, (min_y + max_y) / 2, (min_z + max_z) / 2],
+            "dimensions": [width, height, depth],
+        },
+        "largest_diagonal_distance": diagonal_distance,
+        "contact_length_diagonal": contact_length_diagonal,
+        "message": f"Bounding box diagonal computed for '{object_name}'",
+    }
+
+
+@mcp_handler
+def refresh_ui():
+    """Refresh all UI areas in Blender to reflect recent changes.
+
+    This is useful when programmatic changes need to be reflected in the UI,
+    such as after starting/stopping servers or updating addon state.
+    """
+    import bpy  # pyright: ignore
+
+    # Refresh all areas in the current screen
+    for area in bpy.context.screen.areas:
+        area.tag_redraw()
+
+    return "UI refresh completed successfully"

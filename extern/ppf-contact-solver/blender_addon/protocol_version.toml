@@ -1,0 +1,225 @@
+# License: GPL-3.0-or-later
+# Single source of truth for the addon <-> server WIRE PROTOCOL version.
+#
+# Read by BOTH separately shipped halves so the number can never drift:
+#   - the addon (Python): blender_addon/core/protocol.py loads it at runtime
+#   - the server (Rust):  crates/ppf-cts-server/build.rs bakes it into
+#     ppf_cts_server::PROTOCOL_VERSION at build time (env!)
+# transitions.py does a strict-equality check of the server's advertised
+# version against the addon's, so a stale server carrying an incompatible (or
+# merely different-behavior) frontend is rejected and forced to restart.
+#
+# The addon RELEASE version is a DIFFERENT thing and lives in
+# blender_manifest.toml, which Blender reads directly (core/manifest.py reads
+# it back at runtime). It is not duplicated, so it stays there.
+#
+# BUMP `protocol` whenever the data / param payload schema OR the
+# addon-encoder / frontend-decoder contract changes, OR when a server-side
+# behavior fix must not be served by a stale binary.
+#
+# Changelog:
+#   0.21: SOLID pins follow their script exactly. The frontend decoder gives each
+#         pin group of a SOLID its own pin settings, and keeps every exact pin
+#         candidate on a SOLID's pinned surface exact, adjacent candidates
+#         included. Scene export adds "[display-pin-<i>]" blocks (the pin TOML
+#         and op bins under that section name, plus display-pin-rest-<i>.bin and
+#         display-pin-dmap-<i>.bin) for the Blender vertices of a SOLID's exact
+#         pin groups, a "display_pin_block" count, and an always-written
+#         display_pin_map.pickle (CBOR kind "DisplayPinMap"). The solver writes
+#         display_pin_<N>.bin beside each vert_<N>.bin, and the addon requires
+#         the map and places those vertices from it. A server carrying an older
+#         frontend writes no map, which the addon refuses on every fetch, so the
+#         handshake rejects that server instead.
+#   0.22: the status response gains `solver_target_dir` and `solver_backend`,
+#         naming the cargo target directory this server's runs take the solver
+#         from and what that solver answers to `--backend`. A local native
+#         add-on (Windows Native, macOS Native) attaching to a server already
+#         running on its port refuses one whose `solver_target_dir` is not the
+#         build its Compute Device selection resolves to, so a CPU selection
+#         can no longer drive a GPU server an earlier session left running, or
+#         the reverse. A server that predates the fields cannot be checked, and
+#         the bump makes the handshake stop such a server rather than let the
+#         add-on attach to it unchecked.
+#   0.23: Allow Existing Intersections. The param payload gains the per-object
+#         `allow-existing-intersection` key, which a frontend that predates it
+#         refuses as an unknown parameter; the scene export may add
+#         bin/start_link.bin, which the solver reads into its contact filter;
+#         and the status response gains `exemptions`, what the latest
+#         successful build exempted, read back from build_exemptions.json on a
+#         reconnect. A stale server would reject the key at build, so the bump
+#         stops it at the handshake instead.
+#   0.24: The server stops itself after `--idle-timeout` seconds (3600 by
+#         default, 0 for never) in which no request arrived and no solve or
+#         build ran, and the status response gains `idle_timeout_s`. The add-on
+#         starts its servers with its own value (60 s by default) and pings a
+#         server it is connected to from a thread of its own, which is what
+#         keeps that server up while Blender is connected. An add-on that does
+#         not ping would lose its server a minute into an idle connection, and
+#         an older server rejects the flag at launch, so the bump keeps the two
+#         from pairing.
+#   0.25: force fields as field objects. The PARAM payload's `force_field`
+#         carries `fields`, one entry per Blender field object (its settings
+#         and a track of per-frame samples, which the solver evaluates exactly
+#         at every vertex), and `scripts`, in place of the sampled `grids`; a
+#         Fluid Flow field carries its fluid volume as per-frame brick tables
+#         and bricks, and a Texture field its image and `z_up`. Large byte
+#         strings (a fluid frame's table and bricks, a texture's image) travel
+#         as a LIST of byte chunks of at most 1 MiB, which the decoder joins.
+#         A frontend that predates this reads none of it, so the bump stops a
+#         stale server at the handshake.
+#   0.26: contact gap limit. A SOLID, SHELL or ROD group's params gain
+#         `contact-gap-limit`, the fraction of the room between mesh neighbors
+#         that each element's contact gap may take, which the frontend applies
+#         when it expands `contact-gap` onto the elements. A frontend that
+#         predates the key refuses it as an unknown parameter at build, so the
+#         bump stops a stale server at the handshake instead.
+#   0.20: spatial material maps gain a time axis, a tetrahedral path, and one
+#         unit conversion shared with the values they blend against. A map row
+#         in "material-maps" carries either "weights" ({object UUID: [w per
+#         vertex]}) as before, or "times" plus "weight_frames" ({object UUID:
+#         [[w per vertex] per time]}) when the map is keyed over frames; never
+#         both. The row's own source is the map at simulated time zero and its
+#         samples name later sources, with the weights between two consecutive
+#         samples their linear interpolation, so a constant hold is two samples
+#         naming one source. A keyed map is resolved per element by the
+#         frontend and rides the existing per-triangle keyframe table, so the
+#         solver reads the same n_samples x n_element arrays it already reads.
+#         A SOLID's painted weights are authored on its Blender mesh and are
+#         carried onto its tetrahedra by a convex closest-triangle transfer
+#         plus a Dirichlet Laplace extension into the interior, which an older
+#         frontend refused on a vertex count. The map TARGET, the animated
+#         sample and the static value now go through one conversion, so a
+#         "young-mod" target ships density-normalized where it previously
+#         shipped raw pascals, and a target on a parameter whose feature toggle
+#         is off is refused rather than reintroducing the parameter. Weights
+#         are resolved by object UUID rather than by name, an attribute source
+#         is read off the EVALUATED mesh so a Geometry Nodes output reaches it,
+#         a non-finite weight is refused, and a keyframe on a ROD group's
+#         material slider is refused because no per-frame table is written for
+#         rods.
+#   0.19: Lock Translation and Lock Rotation each gain an all-axes mode
+#         (issue #139). The parameter payload adds two booleans keyed by
+#         object UUID, "lock-all-translations" and "lock-all-rotations",
+#         emitted for every object whose matching lock is enabled. True
+#         pins the center of mass to its initial POINT (three rows) or
+#         forbids net rotation about every axis (three rows); false is the
+#         line lock of 0.14 and the per-axis rotation modes of 0.15 / 0.16.
+#         An all-axes object names no axis, so it is omitted from
+#         "lock-translation" / "lock-rotation" and, for rotation, from
+#         "lock-rotation-prohibit-axis" as well: each lock state has exactly
+#         one spelling on the wire. Scene export adds the matching optional
+#         translation_lock_mode.bin table, one uint32 per displacement group
+#         aligned with translation_lock.bin (0 for a disabled or line-locked
+#         row, 1 for an all-axes row), and rotation_lock_mode.bin gains the
+#         value 2 for an all-axes rotation row. Both mode tables are omitted
+#         when no object enables the matching lock, as their axis tables are.
+#         The mode, not the axis, carries the enable bit: an all-axes record
+#         ships an exactly zero axis and scene build asserts that.
+#   0.18: structured crash reporting. The status response gains `crash_kind`, a
+#         stable snake_case tag naming the crash cause (the CrashKind the solver
+#         or the supervisor determined), alongside the existing free-form
+#         `error` string. The addon maps the tag to a localized one-line panel
+#         headline and keeps the full multi-line report, which now carries the
+#         solver's stderr tail as well as its stdout tail, in the Console. An
+#         empty tag means the error is not a solver crash. The server also
+#         reports a crash cause after a reconnect, where it previously reported
+#         a failure with no reason at all.
+#   0.17: solver-produced per-object timeline statistics. Scene build writes a
+#         versioned statistics_input.cbor object/range manifest; the solver
+#         writes statistics_manifest.cbor plus statistics_<frame>.cbor beside
+#         each vertex frame. The addon fetches these records into persistent
+#         UUID-backed .stats files and performs no geometry or physics analysis.
+#         Statistics include position, geometry measures, stretch, linear and
+#         angular motion, and normalized angular axis. Contact count is reserved
+#         for the exact production contact-attribution pass.
+#   0.16: Lock Rotation gains a per-object prohibit-axis mode switch. The
+#         parameter payload adds a boolean keyed by object UUID under
+#         "lock-rotation-prohibit-axis": false (default) keeps the axis an
+#         allow-only whitelist (only rotation about it is permitted, as in
+#         0.15); true flips it to a blacklist (rotation about the axis is
+#         forbidden, the perpendicular rotation plane stays free). The key is
+#         meaningless without a Lock Rotation axis and is only ever emitted
+#         for an object that also has "lock-rotation" set. Scene export adds
+#         the matching optional rotation_lock_mode.bin table, one uint32 per
+#         displacement group aligned with rotation_lock.bin (0 for a disabled
+#         or allow-only row, 1 for a prohibit-axis row); the file is omitted
+#         when no object has Lock Rotation enabled, same as rotation_lock.bin.
+#   0.15: per-object Lock Rotation. Coexists independently with Lock
+#         Translation (0.14): the parameter payload gains a second
+#         normalized world-space axis, keyed by object UUID under
+#         "lock-rotation", restricting the object's mass-weighted best-fit
+#         rigid rotation to rotation about that axis only (translation and
+#         deformation stay free). Scene export writes the matching
+#         per-displacement-group rotation_lock.bin table alongside
+#         translation_lock.bin. An object may set either, both, or neither.
+#   0.14: per-object Lock Translation. The parameter payload gains a normalized
+#         world-space axis keyed by object UUID, and scene export writes the
+#         matching per-displacement-group translation_lock.bin table.
+#   0.13: timing-free data payload (CBOR SCHEMA_VERSION 1 -> 2). Every DATA
+#         payload animation channel now ships frame-indexed timing instead of
+#         seconds: transform_animation carries frame_offset (was time),
+#         static_ops carry frame_offset_start / frame_offset_end (was
+#         t_start / t_end) plus angular_velocity_anim (raw authored degrees
+#         per animation second; was the pre-scaled angular_velocity), and
+#         static_deform_animation drops its time array (row i IS frame
+#         offset i). The PARAM payload gains a required top-level time_scale.
+#         The frontend derives all seconds from the Param fps at decode, so
+#         a Time Scale / FPS edit flips only the param hash and Update Params
+#         suffices (no geometry re-transfer). Old payloads are refused loudly
+#         by the envelope version gate (re-Transfer from the addon); the
+#         handshake forces a matching addon / server pair.
+#   0.12: driven-collider exactness. Restored the frame-writer exact-pose
+#         placement and the TOI-truncation pin rewind that the universal pin
+#         DOF removal had dropped, so a moving fix-pinned collider tracks its
+#         keyframe to round-off again. Server behavior only; the bump forces a
+#         stale server carrying the old jitter to restart against the on-disk
+#         binary.
+#   0.11: scipy pin-path. A Windows bundle without scipy took a surface-only
+#         pin fallback, changing the pin set; scipy is now installed in the
+#         bundle and numpy / scipy pinned. Frontend behavior only; the bump
+#         forces a fresh frontend.
+#   0.09: additive scene / dyn-param fields for the per-object bending
+#         reference rest shape and the angular velocity overwrite. ObjectInfo
+#         gains an optional bend_rest_vert (guarded by a has_bend_rest_vert
+#         count) carrying per-object reference rest positions for hinge rest
+#         angles, and the dyn-param table gains angular_velocity:<dmap> /
+#         angular_velocity_world:<dmap> keyframe streams (principal-axis spins
+#         resolved from live geometry, and fixed world-axis spins). The new
+#         fields are optional, so an old decoder silently drops the bending
+#         reference and the spins instead of erroring; the handshake forces the
+#         matching pair.
+#   0.08: co-located transfer. When the addon and server share a machine
+#         (local / win_native / mac_native backends), the addon writes data.pickle /
+#         param.pickle straight to the project root on disk and then sends a
+#         lightweight upload_notify JSON request (carrying the addon-minted
+#         upload_id, the data / param hashes, and has_data / has_param) instead
+#         of streaming the payloads through the socket via upload_atomic. The
+#         server stamps the supplied id, then dispatches the same UploadLanded
+#         event the streamed path does. Set PPF_FORCE_TCP_TRANSFER=1 to keep
+#         those co-located backends on the streamed path. An old server paired with a
+#         new addon rejects upload_notify as an unknown request; both
+#         directions are caught by this handshake.
+#   0.07: moving STATIC colliders join the output vertex map. The pin-shells
+#         produced by transform_animation (Case 1) and static_deform_animation
+#         (Case 3) are no longer flagged _exclude_from_output, so their
+#         simulator-projected per-frame positions stream back as a regular
+#         PC2 + ContactSolverCache modifier on the static object.
+#   0.06: deforming STATIC mesh colliders. A STATIC object whose modifier stack
+#         deforms vertices (Armature, MeshDeform, Lattice, shape keys, etc.) can
+#         now carry a static_deform_animation payload alongside vert / transform:
+#         a per-frame absolute vertex buffer in solver world space, captured
+#         from Blender's depsgraph via the Capture Deformation operator.
+#         Mutually exclusive with transform_animation and static_ops; an old
+#         decoder would ignore the new field and play the rest-pose mesh.
+#   0.05: keyframed pin animation. param.pin_config[uuid] stays
+#         {vertex_index: PinData}, but each PinData now carries its own
+#         single-entry pin_anim and the frontend decoder builds genuine
+#         per-vertex MoveByOperation deltas from it instead of broadcasting one
+#         vertex's track. An old decoder would treat the new payload as a rigid
+#         translation.
+#   0.04: TCMD requests carry a 4-byte big-endian length prefix between the
+#         b"TCMD" header and the payload, replacing the prior wire that relied
+#         on shutdown(SHUT_WR) as the end-of-input signal. Windows tokio did not
+#         deliver that half-close to the server's AsyncRead, so the server hung
+#         in its read loop and connections piled up in FIN_WAIT_2.
+protocol = "0.26"

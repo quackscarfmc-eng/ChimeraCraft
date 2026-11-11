@@ -1,0 +1,4270 @@
+// File: scene.rs
+// Code: Claude Code and Codex
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+
+use super::builder::{convert_prop, dedup_param, make_collision_mesh, SandParams};
+use super::data::*;
+use super::{CVec, MeshSet, ParamSet, ProgramArgs, Props, SimArgs, SimMesh};
+use bytemuck::Pod;
+use log::{error, warn};
+use more_asserts::*;
+use na::{
+    Const, Matrix, Matrix2x3, Matrix2xX, Matrix3xX, Matrix4xX, Matrix6xX, VecStorage, Vector3,
+};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, BufRead, Read, Write};
+use toml::Value;
+
+pub struct CollisionWindowTable {
+    pub vert_dmap: Vec<u32>,
+    pub windows: Vec<f32>,
+    pub window_counts: Vec<u32>,
+    pub n_groups: u32,
+    pub has_windows: bool,
+}
+
+impl CollisionWindowTable {
+    pub fn empty() -> Self {
+        Self {
+            vert_dmap: Vec::new(),
+            windows: Vec::new(),
+            window_counts: Vec::new(),
+            n_groups: 0,
+            has_windows: false,
+        }
+    }
+}
+
+/// A streamed time-varying rest shape: per-keyframe full rest-vertex sets
+/// (each `n_vert` columns, same coordinate space as the static `rest_vert`)
+/// and their keyframe times in seconds. Built frontend-side by blending the
+/// captured pull-pin deformation into the original rest pose per vertex; the
+/// solver recomputes `inv_rest` from each frame and interpolates between them.
+struct RestVertSchedule {
+    times: Vec<f64>,
+    frames: Vec<Matrix3xX<f32>>,
+}
+
+pub struct Scene {
+    args: SimArgs,
+    dyn_args: DynParamTable,
+    displacement: Matrix3xX<f32>,
+    vert_dmap: Vec<u32>,
+    /// One solver-space center-of-mass lock axis per displacement group. An
+    /// exact zero vector disables the corresponding group, EXCEPT under
+    /// `TRANSLATION_LOCK_ALL`, where the mode carries the enable bit and the
+    /// axis is required to be zero because it has no meaning.
+    translation_lock: Vec<Vec3f>,
+    /// One translation-lock mode per displacement group, aligned with
+    /// `translation_lock`.
+    translation_lock_mode: Vec<u32>,
+    /// One solver-space best-fit angular lock axis per displacement group. An
+    /// exact zero vector disables the corresponding group, EXCEPT under
+    /// `ROTATION_LOCK_ALL`, where the mode carries the enable bit and the axis
+    /// is required to be zero because it has no meaning.
+    rotation_lock: Vec<Vec3f>,
+    /// One rotation-lock mode per displacement group. A disabled rotation axis
+    /// ignores its mode.
+    rotation_lock_mode: Vec<u32>,
+    vert: Matrix3xX<f32>,
+    vel: Matrix3xX<f32>,
+    uv: Option<Vec<Matrix2x3<f32>>>,
+    rod: Matrix2xX<usize>,
+    tri: Matrix3xX<usize>,
+    tet: Matrix4xX<usize>,
+    static_vert_dmap: Vec<u32>,
+    static_vert: Matrix3xX<f32>,
+    static_tri: Matrix3xX<usize>,
+    stitch_ind: Matrix6xX<usize>,
+    stitch_w: Matrix6xX<f32>,
+    stitch_stiffness: Vec<f32>,
+    /// Per-stitch authored rest length, read only where the flag beside it is
+    /// set; a stitch without one derives its rest length from contact gaps.
+    stitch_rest_length: Vec<f32>,
+    stitch_has_rest_length: Vec<bool>,
+    /// Tie constraints, one held vertex per tie and `TIE_SLOTS` controllers
+    /// and affine weights per tie, read from `tie_vertex.bin`, `tie_ind.bin`
+    /// and `tie_w.bin`, all three written or none. Empty when the scene has
+    /// no tie. `driver::tie` validates them at `initialize()`.
+    tie_vertex: Vec<u32>,
+    tie_ind: Vec<u32>,
+    tie_w: Vec<f32>,
+    pin: Vec<Pin>,
+    display_pin: Vec<DisplayPin>,
+    wall: Vec<InvisibleWall>,
+    sphere: Vec<InvisibleSphere>,
+    rest_vert: Option<Matrix3xX<f32>>,
+    rest_vert_mask: Vec<bool>,
+    rest_vert_schedule: Option<RestVertSchedule>,
+    /// Per-object bending reference rest shape: full per-vertex positions
+    /// (unmasked entries equal the initial vert) used to compute hinge rest
+    /// angles for objects that opted into a reference rest angle. `None` when
+    /// no object in the scene uses one.
+    bend_rest_vert: Option<Matrix3xX<f32>>,
+    /// Per-vertex mask marking which vertices belong to an object with a
+    /// reference rest angle. Empty when `bend_rest_vert` is `None`.
+    bend_rest_vert_mask: Vec<bool>,
+    /// Time-varying bending reference rest shape: keyframe times (seconds)
+    /// and full per-vertex positions per keyframe (unmasked entries equal the
+    /// initial vert), for objects whose rest angle follows an animated
+    /// shape-key mix. `None` when no object animates its bending rest shape.
+    /// The hinges it drives are the ones `bend_rest_vert_mask` marks.
+    bend_rest_vert_schedule: Option<RestVertSchedule>,
+    /// Per-vertex mask marking vertices that belong to a STATIC collider.
+    /// Empty when the scene has no collider in the solved namespace.
+    collider_vert_mask: Vec<u8>,
+    /// Per-vertex source-object identity, used to tell a self-intersection
+    /// from an inter-object one. Empty when the session directory predates
+    /// `object_vert.bin`, in which case no intersection allowance applies.
+    object_vert_index: Vec<u32>,
+    /// Per-vertex source-group identity, used to tell an inter-group pair
+    /// from two objects of one group. Written only when some object asks for
+    /// the inter-group allowance; empty otherwise.
+    group_vert_index: Vec<u32>,
+    /// Per-vertex intersection tolerances, resolved by the frontend from each
+    /// vertex's object's material. Empty when every object is at the default.
+    intersect_policy: Vec<u8>,
+    /// Allow Existing Intersections: the vertex links the scene-build check
+    /// made, flat `u32` pairs in the combined namespace (the dynamic vertices,
+    /// then the collision-mesh vertices after them). Empty when nothing was
+    /// linked, which is every scene that does not use the option.
+    start_link: Vec<u32>,
+    shell_count: usize,
+    rod_param: Vec<(String, ParamValueList)>,
+    tri_param: Vec<(String, ParamValueList)>,
+    tet_param: Vec<(String, ParamValueList)>,
+    static_param: Vec<(String, ParamValueList)>,
+    /// Keyframe times, seconds, strictly increasing, for every animated
+    /// material schedule. Empty when the scene animates no material.
+    param_anim_times: Vec<f64>,
+    /// Animated `tri-` material keys. One entry per key; each holds
+    /// `param_anim_times.len()` frames, and each frame is one value per
+    /// triangle, matching the static `tri_param` layout exactly so both go
+    /// through the same assembly.
+    tri_param_anim: Vec<(String, Vec<Vec<f32>>)>,
+    /// Granular (SAND) scalar material params, one entry per `sand-*.bin`
+    /// param file (each a single float, len 1). A faceless particle cloud
+    /// has no elements, so these carry the grain mass / contact-offset /
+    /// contact-gap / friction outside the per-element assert. Empty when the
+    /// scene has no SAND object.
+    sand_param: Vec<(String, ParamValueList)>,
+    /// One row per PDRD body, packed as f32: vertex_start, vertex_count,
+    /// volume, centroid (3), rest_gram_inv (9), mass_per_vertex. 16
+    /// floats per row. Written by the Python frontend.
+    pdrd_body_rows: Vec<f32>,
+    /// Per-vertex 1-based PDRD body id (0 = not in an PDRD body), one
+    /// u32 per global vertex.
+    pdrd_vert_index: Vec<u32>,
+    /// Flat list of global vertex indices participating in PDRD
+    /// bodies, body-major. Body slices are contiguous in this list
+    /// per `PdrdBodyProp.vertex_start/vertex_count`.
+    pdrd_vert_list: Vec<u32>,
+    /// Centered rest position per entry of `pdrd_vert_list`, packed
+    /// (x, y, z). Length 3 * pdrd_vert_list.len().
+    pdrd_rest_centered: Vec<f32>,
+    /// One byte per rod edge, aligned with `rod`: non-zero where the edge
+    /// belongs to a Cosserat rod, whose edges carry a material frame.
+    cosserat_edge: Vec<u8>,
+    /// The authored roll of a Cosserat rod's material frame about its tangent,
+    /// one radian value per vertex, aligned with `vert`; empty when no rod
+    /// authored one.
+    cosserat_tilt: Vec<f32>,
+}
+
+#[derive(Clone)]
+enum ParamValueList {
+    Model(Vec<Model>),
+    Value(Vec<f32>),
+}
+
+// Extract the i-th scalar from a value list, panicking with the offending
+// key in the message when the list is the wrong variant. `key` is the literal
+// parameter key (e.g. "young-mod") so a panic maps straight back to the
+// param file.
+fn as_value(value: &ParamValueList, i: usize, key: &str) -> f32 {
+    match value {
+        ParamValueList::Value(v) => v[i],
+        _ => panic!("Expected parameter '{key}' to be a value list"),
+    }
+}
+
+// Extract the i-th model from a name list, panicking with the offending key
+// in the message when the list is the wrong variant.
+fn as_model(value: &ParamValueList, i: usize, key: &str) -> Model {
+    match value {
+        ParamValueList::Model(v) => v[i],
+        _ => panic!("Expected parameter '{key}' to be a name list"),
+    }
+}
+
+fn decode_optional_lock_axes(
+    values: Option<Vec<f32>>,
+    group_count: usize,
+    filename: &str,
+) -> Vec<Vec3f> {
+    let Some(values) = values else {
+        return vec![Vec3f::zeros(); group_count];
+    };
+    assert_eq!(
+        values.len(),
+        3 * group_count,
+        "{filename} must contain one f32 vec3 per displacement group"
+    );
+    values
+        .chunks_exact(3)
+        .enumerate()
+        .map(|(group, values)| {
+            let axis = Vec3f::new(values[0], values[1], values[2]);
+            assert!(
+                axis.iter().all(|value| value.is_finite()),
+                "{filename} group {group} contains a non-finite axis"
+            );
+            if axis == Vec3f::zeros() {
+                return axis;
+            }
+            let norm = axis.norm();
+            assert!(
+                norm.is_finite() && (norm - 1.0).abs() <= 64.0 * f32::EPSILON,
+                "{filename} group {group} must be a normalized nonzero solver-space direction (length {norm})"
+            );
+            axis / norm
+        })
+        .collect()
+}
+
+// Decode one optional per-displacement-group lock mode table. `accepted` lists
+// the legal values in order, and its FIRST entry is the default an absent file
+// decodes to, so both tables must keep zero as their off value: a session
+// written before its mode table existed is an unlocked scene, not a malformed
+// one.
+fn decode_optional_lock_modes(
+    values: Option<Vec<u32>>,
+    group_count: usize,
+    filename: &str,
+    accepted: &[(u32, &str)],
+) -> Vec<u32> {
+    let Some(values) = values else {
+        return vec![accepted[0].0; group_count];
+    };
+    assert_eq!(
+        values.len(),
+        group_count,
+        "{filename} must contain one u32 mode per displacement group"
+    );
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(group, mode)| {
+            assert!(
+                accepted.iter().any(|(value, _)| *value == mode),
+                "{filename} group {group} has invalid mode {mode}; expected {}",
+                accepted
+                    .iter()
+                    .map(|(value, name)| format!("{value} ({name})"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            );
+            mode
+        })
+        .collect()
+}
+
+fn decode_optional_translation_lock_modes(
+    values: Option<Vec<u32>>,
+    group_count: usize,
+    filename: &str,
+) -> Vec<u32> {
+    decode_optional_lock_modes(
+        values,
+        group_count,
+        filename,
+        &[
+            (TRANSLATION_LOCK_AXIS, "axis"),
+            (TRANSLATION_LOCK_ALL, "all-axes"),
+        ],
+    )
+}
+
+fn decode_optional_rotation_lock_modes(
+    values: Option<Vec<u32>>,
+    group_count: usize,
+    filename: &str,
+) -> Vec<u32> {
+    decode_optional_lock_modes(
+        values,
+        group_count,
+        filename,
+        &[
+            (ROTATION_LOCK_ALLOW_ONLY, "allow-only"),
+            (ROTATION_LOCK_PROHIBIT_AXIS, "prohibit-axis"),
+            (ROTATION_LOCK_ALL, "all-axes"),
+        ],
+    )
+}
+
+// An all-axes mode has no direction, so its axis must be EXACTLY zero and an
+// axis mode's axis must be non-zero to be on. Enforcing the biconditional here
+// gives a record one canonical spelling: an encoder that leaves a stale axis
+// behind when the artist switches to All fails at load with the group named,
+// rather than shipping a second spelling that every downstream enable test
+// then has to agree about.
+fn assert_lock_modes_match_axes(
+    axes: &[Vec3f],
+    modes: &[u32],
+    all_mode: u32,
+    axis_filename: &str,
+    mode_filename: &str,
+) {
+    for (group, (axis, mode)) in axes.iter().zip(modes.iter()).enumerate() {
+        if *mode == all_mode {
+            assert!(
+                *axis == Vec3f::zeros(),
+                "{mode_filename} group {group} selects all-axes, so {axis_filename} must be \
+                 exactly zero for that group (got {axis:?}); the axis carries no meaning in \
+                 an all-axes mode"
+            );
+        }
+    }
+}
+
+// Apply per-vertex instancing displacement in place: each column of `base`
+// gains `displacement[dmap[i]]`. Shared by the dynamic and static vertex
+// paths so they cannot drift in their displacement indexing.
+// The sum is checked because a mesh and a placement that each represent fine on
+// their own can still add to something that is not finite, which would otherwise
+// travel into the solve and surface much later as a NaN. This is the one place
+// both vertex paths combine the two, so the check belongs here rather than at the
+// callers.
+fn apply_displacement(
+    base: &mut Matrix3xX<f32>,
+    displacement: &Matrix3xX<f32>,
+    dmap: &[u32],
+) {
+    for (i, mut x) in base.column_iter_mut().enumerate() {
+        let offset = displacement.column(dmap[i] as usize);
+        for (row, value) in x.iter_mut().enumerate() {
+            let sum = *value + offset[row];
+            assert!(
+                sum.is_finite(),
+                "vertex {i}, component {row} lands at {sum} once its object \
+                 placement is applied, which is not a representable position. \
+                 The mesh and the placement each represent fine on their own; \
+                 their sum does not. Move or rescale the geometry."
+            );
+            *value = sum;
+        }
+    }
+}
+
+enum PinOperation {
+    MoveBy {
+        delta: Matrix3xX<f32>,
+        t_start: f64,
+        t_end: f64,
+        transition: String,
+        /// Cubic-Bezier control points `[hr_x, hr_y, hl_x, hl_y]` when
+        /// `transition == "bezier"`. None means linear fallback,
+        /// matching the behavior of older saves that don't carry the
+        /// handles in their TOML.
+        bezier_handles: Option<[f64; 4]>,
+    },
+    MoveTo {
+        target: Matrix3xX<f32>,
+        t_start: f64,
+        t_end: f64,
+        transition: String,
+        bezier_handles: Option<[f64; 4]>,
+    },
+    Spin {
+        center: Vector3<f32>,
+        axis: Vector3<f32>,
+        angular_velocity: f32,
+        t_start: f64,
+        t_end: f64,
+    },
+    Scale {
+        center: Vector3<f32>,
+        factor: f32,
+        t_start: f64,
+        t_end: f64,
+        transition: String,
+        bezier_handles: Option<[f64; 4]>,
+    },
+    Torque {
+        axis_component: u32,
+        magnitude: f32,
+        hint_vertex: usize,
+        t_start: f64,
+        t_end: f64,
+    },
+    /// Sparse TRS keyframes evaluated per-vertex as R(t)*S(t)*local + T(t),
+    /// then offset by -rest_t so that `position + displacement` yields the
+    /// interpolated world pose.  Rotation uses slerp; segments may carry
+    /// Bezier easing.
+    TransformKeyframes {
+        local: Matrix3xX<f32>,
+        times: Vec<f64>,
+        translations: Vec<[f64; 3]>,
+        quaternions: Vec<[f64; 4]>,
+        scales: Vec<[f64; 3]>,
+        interps: Vec<u8>,
+        handles: Vec<[f64; 4]>,
+        rest_t: [f64; 3],
+    },
+}
+
+/// Positions written out for display only: the Blender vertices an exact
+/// SOLID pin holds, driven by that pin's operations from their own rest
+/// positions. They are not simulation vertices and take no part in the solve.
+/// A SOLID is tetrahedralized onto a surface of its own, so reconstructing
+/// its pinned Blender vertices from that surface cannot put them back on
+/// their script exactly; `display_pin_positions` evaluates the script itself,
+/// with the same `apply_pin_op` a fix pin uses, once per output frame.
+struct DisplayPin {
+    /// Rest positions, in the same untranslated frame as `vert`.
+    rest: Matrix3xX<f32>,
+    /// Displacement group of each rest position, as `vert_dmap` is for `vert`.
+    dmap: Vec<u32>,
+    operations: Vec<PinOperation>,
+    unpin_time: Option<f64>,
+}
+
+struct Pin {
+    index: Vec<usize>,
+    operations: Vec<PinOperation>,
+    unpin_time: Option<f64>,
+    pull_w: f32,
+    /// Optional per-vertex pull weight (aligned to `index`). When present,
+    /// overrides the scalar `pull_w` per vertex, so a single holder can
+    /// pull different vertices with different (graceful, diffused)
+    /// strengths. Absent for hard pins and scalar pull pins.
+    pull_weights: Option<Vec<f32>>,
+    pin_group_id: String,
+    /// This pin allows the elements it fully covers to intersect: they get no
+    /// contact, no CCD filter and no report. Carried onto every FixPair and
+    /// PullPair it produces, and consumed once at scene build to latch
+    /// `VertexProp::pin_allow_intersection`. Defaults to false, so a session
+    /// directory written before the key existed behaves as before.
+    allow_intersection: bool,
+}
+
+struct InvisibleSphere {
+    center: Matrix3xX<f32>,
+    radius: Vec<f32>,
+    timing: Vec<f64>,
+    inverted: bool,
+    hemisphere: bool,
+    transition: String,
+    contact_gap: f32,
+    friction: f32,
+    /// Simulation time in seconds after which this collider stops acting.
+    /// -1.0 means no limit (default).
+    active_duration: f32,
+    /// Maximum penetration depth (m) beyond which a vertex is considered
+    /// pass-through: its contact and CCD contribution from this sphere
+    /// are ignored. Must be > 0.
+    thickness: f32,
+}
+
+struct InvisibleWall {
+    normal: Vector3<f32>,
+    position: Matrix3xX<f32>,
+    timing: Vec<f64>,
+    transition: String,
+    contact_gap: f32,
+    friction: f32,
+    /// Simulation time in seconds after which this collider stops acting.
+    /// -1.0 means no limit (default).
+    active_duration: f32,
+    /// Maximum penetration depth (m) below the wall beyond which a vertex
+    /// is considered pass-through. Must be > 0.
+    thickness: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    param: SimArgs,
+}
+
+type MatReadResult<T, const C: usize> =
+    io::Result<Matrix<T, Const<C>, na::Dyn, VecStorage<T, Const<C>, na::Dyn>>>;
+#[derive(Clone, Copy, Debug)]
+enum DynParamValue {
+    Scalar(f64),
+    Vec3([f64; 3]),
+}
+
+impl DynParamValue {
+    fn lerp(self, other: Self, w: f64) -> Self {
+        match (self, other) {
+            (DynParamValue::Scalar(a), DynParamValue::Scalar(b)) => {
+                DynParamValue::Scalar(a * (1.0 - w) + b * w)
+            }
+            (DynParamValue::Vec3(a), DynParamValue::Vec3(b)) => DynParamValue::Vec3([
+                a[0] * (1.0 - w) + b[0] * w,
+                a[1] * (1.0 - w) + b[1] * w,
+                a[2] * (1.0 - w) + b[2] * w,
+            ]),
+            _ => self,
+        }
+    }
+}
+
+type DynParamTable = Vec<(String, Vec<(f64, DynParamValue)>)>;
+
+/// Reject a world-space coordinate that cannot be represented as a position.
+///
+/// Every externally supplied position reaches the solver through `scale_mat` or
+/// `scale_vec` below, so the rule is stated once, here, instead of at each
+/// ingest site. Without it a non-finite or overflowing input travels into the
+/// solve and surfaces much later as a NaN in a residual, naming neither the
+/// input it came from nor the limit it broke.
+///
+/// `what` identifies the source (an asset array, a pin path, a collider), and
+/// `at` locates the value within it.
+fn check_position_domain(scaled: f64, what: &str, at: &str) -> f64 {
+    assert!(
+        scaled.is_finite() && scaled.abs() <= f64::from(f32::MAX),
+        "{what} {at} is at {scaled}, which is not a representable position. \
+         Every absolute position has to be finite and within the float range, \
+         including one an animation produces: move or rescale the geometry, or \
+         re-author the motion that leaves it. Note that with world-scaling in \
+         effect the bound applies after scaling."
+    );
+    scaled
+}
+
+/// Scale a matrix of world-space positions into solver coordinates.
+fn scale_mat<const C: usize>(
+    m: Matrix<f64, Const<C>, na::Dyn, VecStorage<f64, Const<C>, na::Dyn>>,
+    ws: f64,
+    what: &str,
+) -> Matrix<f32, Const<C>, na::Dyn, VecStorage<f32, Const<C>, na::Dyn>> {
+    m.map_with_location(|row, col, x| {
+        let at = format!("entry {col}, component {row}");
+        check_position_domain(x * ws, what, &at) as f32
+    })
+}
+
+/// Scale a single world-space position into solver coordinates.
+fn scale_vec(v: Vector3<f64>, ws: f64, what: &str) -> Vector3<f32> {
+    v.map_with_location(|row, _, x| {
+        let at = format!("component {row}");
+        check_position_domain(x * ws, what, &at) as f32
+    })
+}
+
+fn read_mat_from_file<T, const C: usize>(path: &str) -> MatReadResult<T, C>
+where
+    T: Pod + std::cmp::PartialEq + std::fmt::Debug,
+{
+    let mut file = File::open(path)?;
+    let mut buff = Vec::new();
+    file.read_to_end(&mut buff)?;
+    let width = std::mem::size_of::<T>();
+    if !buff.len().is_multiple_of(width) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path}: {} bytes is not a whole number of {width}-byte \
+                 elements ({} left over)",
+                buff.len(),
+                buff.len() % width,
+            ),
+        ));
+    }
+    // Decode per element rather than reinterpreting the byte buffer in place.
+    // `read_to_end` fills a `Vec<u8>`, aligned to 1, while `cast_slice` demands
+    // `align_of::<T>()`; whether that holds depends on the address the
+    // allocator returned, so an in-place cast reads these files correctly until
+    // one allocation lands on an odd boundary and the run dies inside bytemuck
+    // naming neither the file nor the field. The `to_vec` below always copied,
+    // so this costs the copy that was already being paid.
+    let data: Vec<T> = buff
+        .chunks_exact(width)
+        .map(bytemuck::pod_read_unaligned::<T>)
+        .collect();
+    if !data.len().is_multiple_of(C) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Data length is not a multiple of {C}"),
+        ));
+    }
+    let n_column = na::Dyn(data.len() / C);
+    let n_row = na::Const::<C>;
+    Ok(unsafe {
+        Matrix::<T, na::Const<C>, na::Dyn, VecStorage<T, na::Const<C>,na::Dyn >>::from_data_statically_unchecked(
+            VecStorage::new(n_row, n_column, data),
+        )
+    })
+}
+
+/// Read a session binary as a `Vec<T>`.
+///
+/// The bytes are decoded element by element with `pod_read_unaligned` rather
+/// than reinterpreted in place. `read_to_end` fills a `Vec<u8>`, whose buffer
+/// is only guaranteed to be 1-byte aligned, while `cast_slice::<u8, T>` demands
+/// `align_of::<T>()`. Whether that holds is decided by the address the
+/// allocator happens to return, so an in-place cast reads every one of these
+/// files correctly right up until an allocation lands on an odd boundary and
+/// the whole run dies inside bytemuck, with a message naming neither the file
+/// nor the field. That is a size- and allocator-dependent trap, not a property
+/// of the data, so it cannot be reproduced reliably or ruled out by testing.
+/// Decoding per element removes the alignment requirement entirely.
+///
+/// A length that is not a whole number of elements is a truncated or
+/// mismatched file, and is reported by name here instead of reaching bytemuck
+/// as `OutputSliceWouldHaveSlop`.
+fn read_vec<T>(path: &str) -> io::Result<Vec<T>>
+where
+    T: bytemuck::AnyBitPattern,
+{
+    let width = std::mem::size_of::<T>();
+    assert!(width > 0, "read_vec on a zero-sized element type");
+    let mut buff = Vec::new();
+    let mut file = File::open(path)?;
+    file.read_to_end(&mut buff)?;
+    if buff.len() % width != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path}: {} bytes is not a whole number of {width}-byte \
+                 elements ({} left over); the file is truncated or was \
+                 written at a different width",
+                buff.len(),
+                buff.len() % width,
+            ),
+        ));
+    }
+    Ok(buff
+        .chunks_exact(width)
+        .map(bytemuck::pod_read_unaligned::<T>)
+        .collect())
+}
+
+/// Material keys a `tri-` schedule may animate.
+///
+/// Two groups. The first lands only in `FaceParam`. The second also reaches
+/// the hinge, edge and vertex tables, which are averages of the faces
+/// (`builder.rs`); those are re-derived every frame from the animated face
+/// table by `rederive_animated_tables`, so they stay in step rather than
+/// holding their build-time values.
+///
+/// What is still absent, and why:
+///
+/// - `shrink-x`, `shrink-y`, `length-factor` change the REST SHAPE, which is
+///   `inv_rest` and not a material table at all. They belong to the streamed
+///   rest-shape path.
+/// - `model` and `bend-rest-from-geometry` are structural: one selects the
+///   energy, the other how a rest angle is initialized, and neither is a value
+///   to blend between two keyframes.
+/// - `density` changes mass, which is fixed at build and feeds the inertia
+///   term and the PDRD and grain inertia. It needs its own decision about what
+///   a mass change means for momentum, not just a schedule.
+const ANIMATABLE_TRI_KEYS: &[&str] = &[
+    // Face-only.
+    "pressure",
+    "young-mod",
+    "poiss-rat",
+    "deformation-damping",
+    "strain-limit",
+    // Also re-derived into the hinge, edge and vertex tables.
+    "bend",
+    "bend-warp",
+    "bend-weft",
+    "bending-damping",
+    "friction",
+    "contact-gap",
+    "contact-offset",
+    "plasticity",
+    "plasticity-threshold",
+    "bend-plasticity",
+    "bend-plasticity-threshold",
+];
+
+/// Linearly interpolate a per-element keyframe schedule to `time`.
+///
+/// Clamps to the nearest end outside the schedule, and a single keyframe holds
+/// its value, matching `interp_rest_shape` and the collider loops.
+fn interp_frames(times: &[f64], frames: &[Vec<f32>], time: f64) -> Vec<f32> {
+    debug_assert_eq!(times.len(), frames.len());
+    if frames.len() == 1 || time <= times[0] {
+        return frames[0].clone();
+    }
+    let last = frames.len() - 1;
+    if time >= times[last] {
+        return frames[last].clone();
+    }
+    let hi = times.partition_point(|t| *t < time);
+    let lo = hi - 1;
+    let (t0, t1) = (times[lo], times[hi]);
+    let alpha = if t1 > t0 {
+        ((time - t0) / (t1 - t0)) as f32
+    } else {
+        0.0
+    };
+    frames[lo]
+        .iter()
+        .zip(frames[hi].iter())
+        .map(|(a, b)| a + (b - a) * alpha)
+        .collect()
+}
+
+/// Load the animated material schedules from `bin/param_anim/`.
+///
+/// Returns `(times, tri_keys)`, both empty when the directory is absent, which
+/// is every scene that animates no material.
+fn read_param_anim(
+    session_path: &str,
+    n_tri: usize,
+) -> (Vec<f64>, Vec<(String, Vec<Vec<f32>>)>) {
+    let dir = format!("{session_path}/bin/param_anim");
+    if !std::path::Path::new(&dir).exists() {
+        return (Vec::new(), Vec::new());
+    }
+    let times_path = format!("{dir}/times.bin");
+    let times: Vec<f64> = read_vec(&times_path)
+        .unwrap_or_else(|e| panic!("{times_path}: {e}"));
+    assert!(
+        !times.is_empty(),
+        "{times_path}: an animated material needs at least one keyframe time"
+    );
+    assert!(
+        times.windows(2).all(|w| w[0] < w[1]),
+        "{times_path}: keyframe times must be strictly increasing, got {times:?}"
+    );
+
+    let mut tri_keys = Vec::new();
+    for entry in fs::read_dir(&dir).expect("Failed to read param_anim directory") {
+        let path = entry.expect("Failed to read entry").path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(".bin") || file_name == "times.bin" {
+            continue;
+        }
+        let Some(key) = file_name.strip_prefix("tri-") else {
+            panic!(
+                "{}: only 'tri-' material schedules are supported; a schedule \
+                 for another element kind has no reader yet",
+                path.display()
+            );
+        };
+        let key = key[..key.len() - 4].to_string();
+        assert!(
+            ANIMATABLE_TRI_KEYS.contains(&key.as_str()),
+            "{}: '{key}' is not an animatable material key. It is either a \
+             rest-shape parameter (which belongs to the streamed rest-shape \
+             path, not a material table), a structural one with nothing to \
+             blend between keyframes, or `density`, whose meaning under a mass \
+             change is undecided. Animatable: {:?}.",
+            path.display(),
+            ANIMATABLE_TRI_KEYS,
+        );
+        let flat: Vec<f32> = read_vec(&path.to_string_lossy())
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let expected = times.len() * n_tri;
+        assert_eq!(
+            flat.len(),
+            expected,
+            "{}: expected {} values ({} keyframes x {n_tri} triangles), got {}",
+            path.display(),
+            expected,
+            times.len(),
+            flat.len(),
+        );
+        let frames = flat.chunks_exact(n_tri).map(|c| c.to_vec()).collect();
+        tri_keys.push((key, frames));
+    }
+    (times, tri_keys)
+}
+
+/// Write one interpolated dynamic-parameter sample into `param`.
+///
+/// Returns false when `title` has no arm, or has none for a value of this
+/// shape. Callers must treat false as a defect rather than a no-op: a schedule
+/// that reaches the solver has already been checked against
+/// `Scene::DYN_PARAM_KEYS` at load, so the only way to get false is for that
+/// list and this function to have drifted apart.
+///
+/// Split out of `Scene::update_param` so the two can be tested against each
+/// other without building a Scene, which needs a session directory on disk.
+fn apply_dyn_param(title: &str, val: DynParamValue, param: &mut ParamSet) -> bool {
+    match (title, val) {
+        ("gravity", DynParamValue::Vec3(v)) => {
+            param.gravity = Vec3f::new(v[0] as f32, v[1] as f32, v[2] as f32);
+        }
+        // A scalar on `gravity` means the magnitude along Y, which is how a
+        // caller that only wants "less gravity" writes it.
+        ("gravity", DynParamValue::Scalar(v)) => {
+            param.gravity = Vec3f::new(0.0, v as f32, 0.0);
+        }
+        ("wind", DynParamValue::Vec3(v)) => {
+            param.wind = Vec3f::new(v[0] as f32, v[1] as f32, v[2] as f32);
+        }
+        ("air-density", DynParamValue::Scalar(v)) => param.air_density = v as f32,
+        ("air-friction", DynParamValue::Scalar(v)) => param.air_friction = v as f32,
+        ("isotropic-air-friction", DynParamValue::Scalar(v)) => {
+            param.isotropic_air_friction = v as f32
+        }
+        ("dt", DynParamValue::Scalar(v)) => param.dt = v as f32,
+        ("playback", DynParamValue::Scalar(v)) => param.playback = v as f32,
+        ("inactive-momentum", DynParamValue::Scalar(v)) => param.inactive_momentum = v > 0.0,
+        _ => return false,
+    }
+    true
+}
+
+fn read_dyn_param(path: &str) -> io::Result<DynParamTable> {
+    let mut result = Vec::new();
+    let mut curr_entry_name = String::new();
+    let mut curr_entry = Vec::new();
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim();
+
+        if line.starts_with('[') && line.ends_with(']') {
+            if !curr_entry_name.is_empty() {
+                result.push((curr_entry_name, curr_entry));
+                curr_entry = Vec::new();
+            }
+            curr_entry_name = line[1..line.len() - 1].to_string();
+        } else if !line.is_empty() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let parse_f64 = |field: &str, token: &str| -> io::Result<f64> {
+                token.parse::<f64>().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{path}: bad {field} in line '{line}': {e}"),
+                    )
+                })
+            };
+            let time = parse_f64("time", parts[0])?;
+            if parts.len() == 4 {
+                let x = parse_f64("x", parts[1])?;
+                let y = parse_f64("y", parts[2])?;
+                let z = parse_f64("z", parts[3])?;
+                curr_entry.push((time, DynParamValue::Vec3([x, y, z])));
+            } else if parts.len() == 2 {
+                let value = parse_f64("value", parts[1])?;
+                curr_entry.push((time, DynParamValue::Scalar(value)));
+            } else {
+                warn!(
+                    "{path}: skipping line with {} tokens: '{line}'",
+                    parts.len()
+                );
+            }
+        }
+    }
+    if !curr_entry_name.is_empty() {
+        result.push((curr_entry_name, curr_entry));
+    }
+    Ok(result)
+}
+
+impl Scene {
+    pub fn new(args: &ProgramArgs) -> Self {
+        assert!(std::path::Path::new(&args.path).exists());
+
+        let toml_path = format!("{}/info.toml", args.path);
+        let content = fs::read_to_string(toml_path).expect("Failed to read the TOML file");
+        let parsed: Value = content.parse::<Value>().expect("Failed to parse TOML");
+        let read_usize = |count: &Value, key: &str| {
+            count
+                .get(key)
+                .and_then(|v| v.as_integer())
+                .unwrap_or_else(|| panic!("Failed to read {key}")) as usize
+        };
+        let read_bool = |count: &Value, key: &str| {
+            count
+                .get(key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| panic!("Failed to read {key}"))
+        };
+        let read_f32 = |count: &Value, key: &str| {
+            count
+                .get(key)
+                .and_then(|v| v.as_float())
+                .unwrap_or_else(|| panic!("Failed to read {key}")) as f32
+        };
+        let read_f64 = |count: &Value, key: &str| {
+            count
+                .get(key)
+                .and_then(|v| v.as_float())
+                .unwrap_or_else(|| panic!("Failed to read {key}"))
+        };
+        // Optional bezier handles (4 floats) at keys
+        // `bezier_h_rx`, `bezier_h_ry`, `bezier_h_lx`, `bezier_h_ly`.
+        // Returns None when any of the keys is absent (older saves).
+        let read_bezier_handles = |count: &Value| -> Option<[f64; 4]> {
+            let rx = count.get("bezier_h_rx").and_then(|v| v.as_float())?;
+            let ry = count.get("bezier_h_ry").and_then(|v| v.as_float())?;
+            let lx = count.get("bezier_h_lx").and_then(|v| v.as_float())?;
+            let ly = count.get("bezier_h_ly").and_then(|v| v.as_float())?;
+            Some([rx, ry, lx, ly])
+        };
+        let read_string = |count: &Value, key: &str| {
+            count
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("Failed to read {key}"))
+                .to_string()
+        };
+        let read_optional_f32 = |count: &Value, key: &str| -> Option<f32> {
+            count.get(key).and_then(|v| v.as_float()).map(|x| x as f32)
+        };
+
+        let count = parsed.get("count").expect("Failed to read count");
+        let n_vert = read_usize(count, "vert");
+        let n_rod = read_usize(count, "rod");
+        let n_tri = read_usize(count, "tri");
+        let n_tet = read_usize(count, "tet");
+        let n_static_vert = read_usize(count, "static_vert");
+        let n_static_tri = read_usize(count, "static_tri");
+        let n_pin_block = read_usize(count, "pin_block");
+        let n_wall = read_usize(count, "wall");
+        let n_sphere = read_usize(count, "sphere");
+        let n_stitch = read_usize(count, "stitch");
+        let shell_count = read_usize(count, "shell_count");
+
+        let displacement_path = format!("{}/bin/displacement.bin", args.path);
+        let vert_dmap_path = format!("{}/bin/vert_dmap.bin", args.path);
+        let vert_path = format!("{}/bin/vert.bin", args.path);
+        let vel_path = format!("{}/bin/vel.bin", args.path);
+        let uv_path = format!("{}/bin/uv.bin", args.path);
+        let rod_path = format!("{}/bin/rod.bin", args.path);
+        let tri_path = format!("{}/bin/tri.bin", args.path);
+        let tet_path = format!("{}/bin/tet.bin", args.path);
+        let static_vert_dmap_path = format!("{}/bin/static_vert_dmap.bin", args.path);
+        let static_vert_path = format!("{}/bin/static_vert.bin", args.path);
+        let static_tri_path = format!("{}/bin/static_tri.bin", args.path);
+        let stitch_ind_path = format!("{}/bin/stitch_ind.bin", args.path);
+        let stitch_w_path = format!("{}/bin/stitch_w.bin", args.path);
+        let stitch_stiffness_path = format!("{}/bin/stitch_stiffness.bin", args.path);
+        let stitch_rest_length_path = format!("{}/bin/stitch_rest_length.bin", args.path);
+        let stitch_has_rest_length_path =
+            format!("{}/bin/stitch_has_rest_length.bin", args.path);
+
+        // Uniform world scaling: every input geometric position/length is scaled
+        // by `ws` on ingest (and the per-frame output is divided back by it in
+        // backend.rs). It is applied to the f64 value read from the file, before
+        // the narrowing to the simulation's scalar type, so no precision is
+        // lost. `ws == 1.0` (the default) is a no-op. Every world-space
+        // position, center, or delta read below is scaled at its read site; the
+        // velocity, keyframe translations, rest offset, and sphere radius are
+        // scaled explicitly. Directions, rotations, indices, weights,
+        // UVs, and physical params (gravity, absolute gaps) are NOT scaled.
+        // `args` is ProgramArgs (no sim params), so read world_scaling from
+        // param.toml now (the full Config loads again at its original site below;
+        // param.toml is tiny, so the extra parse is negligible).
+        let ws = {
+            let p = format!("{}/param.toml", args.path);
+            let c: Config =
+                toml::from_str(&fs::read_to_string(&p).expect("Failed to read param.toml"))
+                    .expect("Failed to parse param.toml");
+            c.param.world_scaling as f64
+        };
+        // ws must be strictly positive: 0 collapses the scene to the origin and a
+        // negative value mirror-flips all geometry (inverting winding/normals).
+        assert!(
+            ws > 0.0,
+            "world-scaling must be > 0 (got {ws}); 1.0 disables scaling"
+        );
+
+        let displacement_mat = scale_mat(
+            read_mat_from_file::<f64, 3>(&displacement_path).expect("Failed to read displacement"),
+            ws,
+            "the object placement (displacement.bin)",
+        );
+        let vert_dmap_mat = read_vec::<u32>(&vert_dmap_path).expect("Failed to read vert_dmap");
+        assert_eq!(vert_dmap_mat.len(), n_vert, "vert_dmap size mismatch");
+        for (vertex, &group) in vert_dmap_mat.iter().enumerate() {
+            assert!(
+                (group as usize) < displacement_mat.ncols(),
+                "vert_dmap[{vertex}] = {group} is outside displacement.bin's {} groups",
+                displacement_mat.ncols(),
+            );
+        }
+        // The frontend writes one f32 direction per displacement group. This
+        // is intentionally optional for older sessions. A zero vector means
+        // disabled; every other entry must already be normalized so malformed
+        // input is surfaced instead of being interpreted as a different axis.
+        // The stored value is normalized once more after validation so the
+        // device projector stays idempotent within float32 roundoff.
+        let translation_lock_path = format!("{}/bin/translation_lock.bin", args.path);
+        let translation_lock = decode_optional_lock_axes(
+            if std::path::Path::new(&translation_lock_path).exists() {
+                Some(
+                    read_vec::<f32>(&translation_lock_path)
+                        .expect("Failed to read translation_lock.bin"),
+                )
+            } else {
+                None
+            },
+            displacement_mat.ncols(),
+            "translation_lock.bin",
+        );
+        // Lock Rotation has the same displacement-group mapping and validation
+        // contract as Lock Translation. It remains optional so sessions built
+        // before the feature retain an all-disabled table.
+        let rotation_lock_path = format!("{}/bin/rotation_lock.bin", args.path);
+        let rotation_lock = decode_optional_lock_axes(
+            if std::path::Path::new(&rotation_lock_path).exists() {
+                Some(
+                    read_vec::<f32>(&rotation_lock_path).expect("Failed to read rotation_lock.bin"),
+                )
+            } else {
+                None
+            },
+            displacement_mat.ncols(),
+            "rotation_lock.bin",
+        );
+        // The mode table is optional for existing sessions. Its zero default
+        // preserves allow-only behavior whenever a rotation axis is enabled.
+        let rotation_lock_mode_path = format!("{}/bin/rotation_lock_mode.bin", args.path);
+        let rotation_lock_mode = decode_optional_rotation_lock_modes(
+            if std::path::Path::new(&rotation_lock_mode_path).exists() {
+                Some(
+                    read_vec::<u32>(&rotation_lock_mode_path)
+                        .expect("Failed to read rotation_lock_mode.bin"),
+                )
+            } else {
+                None
+            },
+            displacement_mat.ncols(),
+            "rotation_lock_mode.bin",
+        );
+        // Lock Translation carries a mode table mirroring the rotation pair
+        // beside it. It is optional, and its zero default is the single-axis
+        // behavior, so a session directory without the file describes a scene
+        // whose translation locks are all single-axis.
+        let translation_lock_mode_path = format!("{}/bin/translation_lock_mode.bin", args.path);
+        let translation_lock_mode = decode_optional_translation_lock_modes(
+            if std::path::Path::new(&translation_lock_mode_path).exists() {
+                Some(
+                    read_vec::<u32>(&translation_lock_mode_path)
+                        .expect("Failed to read translation_lock_mode.bin"),
+                )
+            } else {
+                None
+            },
+            displacement_mat.ncols(),
+            "translation_lock_mode.bin",
+        );
+        assert_lock_modes_match_axes(
+            &translation_lock,
+            &translation_lock_mode,
+            TRANSLATION_LOCK_ALL,
+            "translation_lock.bin",
+            "translation_lock_mode.bin",
+        );
+        assert_lock_modes_match_axes(
+            &rotation_lock,
+            &rotation_lock_mode,
+            ROTATION_LOCK_ALL,
+            "rotation_lock.bin",
+            "rotation_lock_mode.bin",
+        );
+        let vert_mat = scale_mat(
+            read_mat_from_file::<f64, 3>(&vert_path).expect("Failed to read vert"),
+            ws,
+            "a vertex position (vert.bin)",
+        );
+        // Velocity has units length/time; scale it with the geometry so seeded
+        // motion stays consistent after the output is divided back by `ws`.
+        let vel_mat = read_mat_from_file::<f32, 3>(&vel_path)
+            .expect("Failed to read velocity")
+            .map(|x| (x as f64 * ws) as f32);
+        let has_rest_vert = count
+            .get("has_rest_vert")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Time-varying rest shape (the captured pull-pin deformation). Optional
+        // and absent on legacy payloads, so the flag read must not panic.
+        let has_rest_vert_anim = count
+            .get("has_rest_vert_anim")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // The mask is shared between the static rest_vert and the time-varying
+        // schedule (make_mesh / rest_shape_schedule both consult it), so load
+        // it whenever either source is present.
+        let rest_vert_mask = if has_rest_vert || has_rest_vert_anim {
+            let rest_vert_mask_path = format!("{}/bin/rest_vert_mask.bin", args.path);
+            let mask_bytes =
+                read_vec::<u8>(&rest_vert_mask_path).expect("Failed to read rest_vert_mask");
+            let mask: Vec<bool> = mask_bytes.iter().map(|&b| b != 0).collect();
+            assert_eq!(mask.len(), n_vert, "rest_vert_mask size mismatch");
+            mask
+        } else {
+            vec![false; n_vert]
+        };
+        let rest_vert_mat = if has_rest_vert {
+            let rest_vert_path = format!("{}/bin/rest_vert.bin", args.path);
+            let mat = scale_mat(
+                read_mat_from_file::<f64, 3>(&rest_vert_path).expect("Failed to read rest_vert"),
+                ws,
+                "a rest-shape vertex (rest_vert.bin)",
+            );
+            assert_eq!(mat.ncols(), n_vert, "rest_vert size mismatch");
+            Some(mat)
+        } else {
+            None
+        };
+        // Stored frame-major in rest_vert_anim.bin as (n_frames * n_vert)
+        // columns of 3 rows, split here into one Matrix3xX per keyframe.
+        let rest_vert_schedule = if has_rest_vert_anim {
+            let n_frames = read_usize(count, "rest_vert_anim_frames");
+            let anim_path = format!("{}/bin/rest_vert_anim.bin", args.path);
+            let times_path = format!("{}/bin/rest_vert_times.bin", args.path);
+            let flat = scale_mat(
+                read_mat_from_file::<f64, 3>(&anim_path).expect("Failed to read rest_vert_anim"),
+                ws,
+                "an animated rest-shape vertex (rest_vert_anim.bin)",
+            );
+            assert_eq!(
+                flat.ncols(),
+                n_frames * n_vert,
+                "rest_vert_anim size mismatch"
+            );
+            let times = read_vec::<f64>(&times_path).expect("Failed to read rest_vert_times");
+            assert_eq!(times.len(), n_frames, "rest_vert_times size mismatch");
+            let frames: Vec<Matrix3xX<f32>> = (0..n_frames)
+                .map(|k| flat.columns(k * n_vert, n_vert).into_owned())
+                .collect();
+            Some(RestVertSchedule { times, frames })
+        } else {
+            None
+        };
+        // Bending reference rest shape (optional, absent on legacy payloads).
+        let has_bend_rest_vert = count
+            .get("has_bend_rest_vert")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (bend_rest_vert, bend_rest_vert_mask) = if has_bend_rest_vert {
+            let vert_path = format!("{}/bin/bend_rest_vert.bin", args.path);
+            let mat = scale_mat(
+                read_mat_from_file::<f64, 3>(&vert_path).expect("Failed to read bend_rest_vert"),
+                ws,
+                "a vertex position (vert.bin)",
+            );
+            assert_eq!(mat.ncols(), n_vert, "bend_rest_vert size mismatch");
+            let mask_path = format!("{}/bin/bend_rest_vert_mask.bin", args.path);
+            let mask_bytes =
+                read_vec::<u8>(&mask_path).expect("Failed to read bend_rest_vert_mask");
+            let mask: Vec<bool> = mask_bytes.iter().map(|&b| b != 0).collect();
+            assert_eq!(mask.len(), n_vert, "bend_rest_vert_mask size mismatch");
+            (Some(mat), mask)
+        } else {
+            (None, Vec::new())
+        };
+        // Animated bending reference rest shape (optional). Stored frame-major
+        // in bend_rest_vert_anim.bin as (n_frames * n_vert) columns, like
+        // rest_vert_anim.bin. It rides on the static reference: the mask that
+        // selects which hinges it drives is bend_rest_vert_mask.
+        let has_bend_rest_vert_anim = count
+            .get("has_bend_rest_vert_anim")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let bend_rest_vert_schedule = if has_bend_rest_vert_anim {
+            assert!(
+                has_bend_rest_vert,
+                "has_bend_rest_vert_anim requires has_bend_rest_vert: the \
+                 animated bending rest shape is masked by bend_rest_vert_mask"
+            );
+            let n_frames = read_usize(count, "bend_rest_vert_anim_frames");
+            let anim_path = format!("{}/bin/bend_rest_vert_anim.bin", args.path);
+            let times_path = format!("{}/bin/bend_rest_vert_times.bin", args.path);
+            let flat = scale_mat(
+                read_mat_from_file::<f64, 3>(&anim_path)
+                    .expect("Failed to read bend_rest_vert_anim"),
+                ws,
+                "an animated bending rest vertex (bend_rest_vert_anim.bin)",
+            );
+            assert_eq!(
+                flat.ncols(),
+                n_frames * n_vert,
+                "bend_rest_vert_anim size mismatch"
+            );
+            let times =
+                read_vec::<f64>(&times_path).expect("Failed to read bend_rest_vert_times");
+            assert_eq!(times.len(), n_frames, "bend_rest_vert_times size mismatch");
+            assert!(
+                times.windows(2).all(|w| w[0] < w[1]),
+                "bend_rest_vert_times must be strictly increasing"
+            );
+            let frames: Vec<Matrix3xX<f32>> = (0..n_frames)
+                .map(|k| flat.columns(k * n_vert, n_vert).into_owned())
+                .collect();
+            Some(RestVertSchedule { times, frames })
+        } else {
+            None
+        };
+        // Optional: absent for a scene with no STATIC collider in the solved
+        // namespace, and intentionally optional for older sessions. An empty
+        // mask reads as "no colliders".
+        let collider_vert_path = format!("{}/bin/collider_vert.bin", args.path);
+        let collider_vert_mask = if std::path::Path::new(&collider_vert_path).exists() {
+            let m = read_vec::<u8>(&collider_vert_path).expect("Failed to read collider_vert");
+            assert_eq!(m.len(), n_vert, "collider_vert size mismatch");
+            m
+        } else {
+            Vec::new()
+        };
+        // Source-object identity per dynamic vertex. Optional for the same
+        // reason as the collider mask above: a session directory that does not
+        // carry this file has no object boundaries, and an empty vector reads
+        // as "unknown", under which no self- or inter-object allowance can
+        // apply and every intersecting pair is reported. Such a session still
+        // runs; a scene that actually asks for an allowance is caught in
+        // `builder::build`, which refuses an allowance it cannot evaluate.
+        let object_vert_path = format!("{}/bin/object_vert.bin", args.path);
+        let object_vert_index = if std::path::Path::new(&object_vert_path).exists() {
+            let m = read_vec::<u32>(&object_vert_path).expect("Failed to read object_vert");
+            assert_eq!(m.len(), n_vert, "object_vert size mismatch");
+            m
+        } else {
+            Vec::new()
+        };
+        // Written only when some object asks for the inter-group allowance,
+        // the one thing that reads it. Absent, every vertex is in one group.
+        let group_vert_path = format!("{}/bin/group_vert.bin", args.path);
+        let group_vert_index = if std::path::Path::new(&group_vert_path).exists() {
+            let m = read_vec::<u32>(&group_vert_path).expect("Failed to read group_vert");
+            assert_eq!(m.len(), n_vert, "group_vert size mismatch");
+            m
+        } else {
+            Vec::new()
+        };
+        // Allow Existing Intersections. Written only when the build linked
+        // something. Every index is checked against the two pools here, where
+        // the file can still be named, rather than trusted into a device table.
+        let start_link_path = format!("{}/bin/start_link.bin", args.path);
+        let start_link = if std::path::Path::new(&start_link_path).exists() {
+            let m = read_vec::<u32>(&start_link_path).expect("Failed to read start_link");
+            assert!(
+                m.len() % 2 == 0,
+                "start_link.bin holds {} indices, which is not a whole number of pairs",
+                m.len()
+            );
+            let pool = n_vert + n_static_vert;
+            if let Some(&bad) = m.iter().find(|&&v| v as usize >= pool) {
+                panic!(
+                    "start_link.bin names vertex {bad}, past the {n_vert} dynamic and \
+                     {n_static_vert} collision-mesh vertices of this scene"
+                );
+            }
+            m
+        } else {
+            Vec::new()
+        };
+        // Written only when some object actually asks for an allowance, so
+        // absent is the common case and reads as "nothing is allowed".
+        let intersect_policy_path = format!("{}/bin/intersect_policy.bin", args.path);
+        let intersect_policy = if std::path::Path::new(&intersect_policy_path).exists() {
+            let m =
+                read_vec::<u8>(&intersect_policy_path).expect("Failed to read intersect_policy");
+            assert_eq!(m.len(), n_vert, "intersect_policy size mismatch");
+            m
+        } else {
+            Vec::new()
+        };
+        let uv_mat = if std::path::Path::new(&uv_path).exists() {
+            let data = read_vec::<f32>(&uv_path).expect("Failed to read uv");
+            assert_eq!(data.len(), shell_count * 6, "UV data length mismatch");
+            let mat = (0..shell_count)
+                .map(|i| {
+                    let start = i * 6;
+                    let end = start + 6;
+                    Matrix2x3::<f32>::from_vec(data[start..end].to_vec())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(mat.len(), shell_count, "UV matrix length mismatch");
+            Some(mat)
+        } else {
+            None
+        };
+        let rod_mat = if n_rod > 0 {
+            read_mat_from_file::<usize, 2>(&rod_path).expect("Failed to read rod")
+        } else {
+            Matrix2xX::<usize>::zeros(0)
+        };
+        let tri_mat = if n_tri > 0 {
+            read_mat_from_file::<usize, 3>(&tri_path).expect("Failed to read tri")
+        } else {
+            Matrix3xX::<usize>::zeros(0)
+        };
+        let tet_mat = if n_tet > 0 {
+            read_mat_from_file::<usize, 4>(&tet_path).expect("Failed to read tet")
+        } else {
+            Matrix4xX::<usize>::zeros(0)
+        };
+        let (static_vert_dmap_mat, static_vert_mat) = if n_static_vert > 0 {
+            (
+                read_vec::<u32>(&static_vert_dmap_path).expect("Failed to read static_vert_dmap"),
+                scale_mat(
+                    read_mat_from_file::<f64, 3>(&static_vert_path)
+                        .expect("Failed to read static_vert"),
+                    ws,
+                    "a collision-mesh vertex (static_vert.bin)",
+                ),
+            )
+        } else {
+            (Vec::new(), Matrix3xX::<f32>::zeros(0))
+        };
+        let static_tri_mat = if n_static_tri > 0 {
+            read_mat_from_file::<usize, 3>(&static_tri_path).expect("Failed to read static_tri")
+        } else {
+            Matrix3xX::<usize>::zeros(0)
+        };
+        let (stitch_ind_mat, stitch_w_mat, stitch_stiffness_vec) = if n_stitch > 0 {
+            (
+                read_mat_from_file::<usize, 6>(&stitch_ind_path)
+                    .expect("Failed to read stitch_ind"),
+                read_mat_from_file::<f32, 6>(&stitch_w_path).expect("Failed to read stitch_w"),
+                // Per-stitch stiffness (M,). Legacy scenes built before
+                // per-object stitch stiffness lack this file; default to 1.0.
+                read_vec::<f32>(&stitch_stiffness_path).unwrap_or_else(|_| vec![1.0f32; n_stitch]),
+            )
+        } else {
+            (
+                Matrix6xX::<usize>::zeros(0),
+                Matrix6xX::<f32>::zeros(0),
+                Vec::new(),
+            )
+        };
+        // Per-stitch authored rest lengths and their presence flags, written
+        // as a PAIR or not at all. A scene with neither file has no authored
+        // rest length anywhere, which is every scene written before the field
+        // existed and every scene that names none, so every stitch derives its
+        // rest length from its contact gaps. One file without the other is a
+        // writer that broke the pair, and is refused rather than guessed at.
+        //
+        // The length is a GEOMETRIC length, the distance the spring holds its
+        // two endpoints at, so it scales with the geometry under World Scaling
+        // as the sphere radius and the wall thickness do. The contact gaps the
+        // derived rest length comes from are physical parameters and do not.
+        let (stitch_rest_length_vec, stitch_has_rest_length_vec) = if n_stitch > 0 {
+            let lengths = read_vec::<f32>(&stitch_rest_length_path);
+            let flags = read_vec::<u8>(&stitch_has_rest_length_path);
+            match (lengths, flags) {
+                (Ok(lengths), Ok(flags)) => {
+                    assert_eq!(
+                        lengths.len(),
+                        n_stitch,
+                        "stitch_rest_length.bin holds {} entries for {n_stitch} stitches",
+                        lengths.len()
+                    );
+                    assert_eq!(
+                        flags.len(),
+                        n_stitch,
+                        "stitch_has_rest_length.bin holds {} entries for {n_stitch} stitches",
+                        flags.len()
+                    );
+                    let has: Vec<bool> = flags
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &flag)| match flag {
+                            0 => false,
+                            1 => true,
+                            other => panic!(
+                                "stitch_has_rest_length.bin entry {i} is {other}; a presence \
+                                 flag is 0 or 1"
+                            ),
+                        })
+                        .collect();
+                    let scaled: Vec<f32> = lengths
+                        .iter()
+                        .zip(&has)
+                        .enumerate()
+                        .map(|(i, (&length, &given))| {
+                            if !given {
+                                return 0.0;
+                            }
+                            let value = (length as f64 * ws) as f32;
+                            assert!(
+                                value.is_finite() && value > 0.0,
+                                "stitch {i} carries the rest length {length} (after World \
+                                 Scaling {value}); a rest length is a finite positive distance"
+                            );
+                            value
+                        })
+                        .collect();
+                    (scaled, has)
+                }
+                (Err(_), Err(_)) => (vec![0.0f32; n_stitch], vec![false; n_stitch]),
+                (Ok(_), Err(e)) | (Err(e), Ok(_)) => panic!(
+                    "the stitch rest lengths and their presence flags are written as a pair, \
+                     and only one of stitch_rest_length.bin and stitch_has_rest_length.bin \
+                     reads: {e}"
+                ),
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // One reader for both kinds of pin block, `pin` for the solver's pins
+        // and `display-pin` for the positions written out for display: they
+        // share the TOML tables and the op bins, named after the section.
+        let read_pin_block = |section: &str, i: usize| -> Pin {
+            let title = format!("{section}-{i}");
+            let count = parsed
+                .get(&title)
+                .unwrap_or_else(|| panic!("Failed to read {section} {i}"));
+            let n_pin = read_usize(count, "pin");
+            let operation_count = read_usize(count, "operation_count");
+            let unpin_time = count.get("unpin_time").and_then(|v| v.as_float());
+            let pull_w = read_f32(count, "pull");
+            // Defaults to 1.0 (no scaling) when absent so older saved
+            // states without the key keep their original pin force.
+            let pin_group_id = count
+                .get("pin_group_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Absent in a payload that does not carry the key, which reads as
+            // "this pin claims nothing" and tolerates no intersection.
+            let allow_intersection = count
+                .get("allow_intersection")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let pin_ind_path = format!("{}/bin/{section}-ind-{i}.bin", args.path);
+
+            let pin_ind = read_vec::<usize>(&pin_ind_path).expect("Failed to read pin index");
+            assert_eq!(pin_ind.len(), n_pin);
+
+            // Optional per-vertex pull weights (aligned to pin_ind). Present
+            // only for partially-pinned pull holders; probed by file
+            // existence so older payloads (scalar `pull` only) keep working.
+            let pullw_path = format!("{}/bin/{section}-pullw-{i}.bin", args.path);
+            let pull_weights = std::path::Path::new(&pullw_path).exists().then(|| {
+                let v = read_vec::<f32>(&pullw_path).expect("Failed to read pin pull weights");
+                assert_eq!(
+                    v.len(),
+                    n_pin,
+                    "pin-pullw length must match pin index count"
+                );
+                v
+            });
+
+            // Read operations in order
+            let mut operations = Vec::new();
+            for j in 0..operation_count {
+                let op_title = format!("{section}-{i}-op-{j}");
+                let op_entry = parsed
+                    .get(&op_title)
+                    .unwrap_or_else(|| panic!("Failed to read operation {j} for {section} {i}"));
+
+                let op_type = read_string(op_entry, "type");
+
+                match op_type.as_str() {
+                    "move_by" => {
+                        let t_start = read_f64(op_entry, "t_start");
+                        let t_end = read_f64(op_entry, "t_end");
+                        let transition = read_string(op_entry, "transition");
+                        let bezier_handles = read_bezier_handles(op_entry);
+                        let delta_path = format!("{}/bin/{section}-{i}-op-{j}.bin", args.path);
+                        let delta = scale_mat(
+                            read_mat_from_file::<f64, 3>(&delta_path)
+                                .expect("Failed to read move_by delta"),
+                            ws,
+                            "move_by delta",
+                        );
+                        operations.push(PinOperation::MoveBy {
+                            delta,
+                            t_start,
+                            t_end,
+                            transition,
+                            bezier_handles,
+                        });
+                    }
+                    "move_to" => {
+                        let t_start = read_f64(op_entry, "t_start");
+                        let t_end = read_f64(op_entry, "t_end");
+                        let transition = read_string(op_entry, "transition");
+                        let bezier_handles = read_bezier_handles(op_entry);
+                        let target_path = format!("{}/bin/{section}-{i}-op-{j}.bin", args.path);
+                        let target = scale_mat(
+                            read_mat_from_file::<f64, 3>(&target_path)
+                                .expect("Failed to read move_to target"),
+                            ws,
+                            "move_to target",
+                        );
+                        operations.push(PinOperation::MoveTo {
+                            target,
+                            t_start,
+                            t_end,
+                            transition,
+                            bezier_handles,
+                        });
+                    }
+                    "spin" => {
+                        let center_x = read_f32(op_entry, "center_x");
+                        let center_y = read_f32(op_entry, "center_y");
+                        let center_z = read_f32(op_entry, "center_z");
+                        let center = scale_vec(
+                            Vector3::new(center_x as f64, center_y as f64, center_z as f64),
+                            ws,
+                            "a spin center",
+                        );
+                        let axis_x = read_f32(op_entry, "axis_x");
+                        let axis_y = read_f32(op_entry, "axis_y");
+                        let axis_z = read_f32(op_entry, "axis_z");
+                        let angular_velocity = read_f32(op_entry, "angular_velocity");
+                        let t_start = read_f64(op_entry, "t_start");
+                        let t_end = read_f64(op_entry, "t_end");
+                        let axis = Vector3::new(axis_x, axis_y, axis_z);
+                        operations.push(PinOperation::Spin {
+                            center,
+                            axis,
+                            angular_velocity,
+                            t_start,
+                            t_end,
+                        });
+                    }
+                    "scale" => {
+                        let center_x = read_f32(op_entry, "center_x");
+                        let center_y = read_f32(op_entry, "center_y");
+                        let center_z = read_f32(op_entry, "center_z");
+                        let center = scale_vec(
+                            Vector3::new(center_x as f64, center_y as f64, center_z as f64),
+                            ws,
+                            "a spin center",
+                        );
+                        let factor = read_f32(op_entry, "factor");
+                        let t_start = read_f64(op_entry, "t_start");
+                        let t_end = read_f64(op_entry, "t_end");
+                        let transition = read_string(op_entry, "transition");
+                        let bezier_handles = read_bezier_handles(op_entry);
+                        operations.push(PinOperation::Scale {
+                            center,
+                            factor,
+                            t_start,
+                            t_end,
+                            transition,
+                            bezier_handles,
+                        });
+                    }
+                    "torque" => {
+                        let axis_component = read_usize(op_entry, "axis_component") as u32;
+                        let magnitude = read_f32(op_entry, "magnitude");
+                        let hint_vertex = read_usize(op_entry, "hint_vertex");
+                        let t_start = read_f64(op_entry, "t_start");
+                        let t_end = read_f64(op_entry, "t_end");
+                        operations.push(PinOperation::Torque {
+                            axis_component,
+                            magnitude,
+                            hint_vertex,
+                            t_start,
+                            t_end,
+                        });
+                    }
+                    "transform_keyframes" => {
+                        let keyframe_count = read_usize(op_entry, "keyframe_count");
+                        let _ = read_f64(op_entry, "t_start");
+                        let _ = read_f64(op_entry, "t_end");
+                        let rest_t = [
+                            read_f64(op_entry, "rest_tx") * ws,
+                            read_f64(op_entry, "rest_ty") * ws,
+                            read_f64(op_entry, "rest_tz") * ws,
+                        ];
+                        let base = format!("{}/bin/{section}-{i}-op-{j}", args.path);
+                        let local = scale_mat(
+                            read_mat_from_file::<f64, 3>(&format!("{base}.bin"))
+                                .expect("Failed to read transform_keyframes local verts"),
+                            ws,
+                            "transform_keyframes local verts",
+                        );
+                        let times = read_vec::<f64>(&format!("{base}-time.bin"))
+                            .expect("Failed to read keyframe times");
+                        assert_eq!(times.len(), keyframe_count);
+                        let t_flat = read_vec::<f64>(&format!("{base}-translation.bin"))
+                            .expect("Failed to read keyframe translations");
+                        assert_eq!(t_flat.len(), 3 * keyframe_count);
+                        let translations: Vec<[f64; 3]> = t_flat
+                            .chunks_exact(3)
+                            .map(|c| [c[0] * ws, c[1] * ws, c[2] * ws])
+                            .collect();
+                        let q_flat = read_vec::<f64>(&format!("{base}-quaternion.bin"))
+                            .expect("Failed to read keyframe quaternions");
+                        assert_eq!(q_flat.len(), 4 * keyframe_count);
+                        let quaternions: Vec<[f64; 4]> = q_flat
+                            .chunks_exact(4)
+                            .map(|c| [c[0], c[1], c[2], c[3]])
+                            .collect();
+                        let s_flat = read_vec::<f64>(&format!("{base}-scale.bin"))
+                            .expect("Failed to read keyframe scales");
+                        assert_eq!(s_flat.len(), 3 * keyframe_count);
+                        let scales: Vec<[f64; 3]> =
+                            s_flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                        let interps = if keyframe_count > 1 {
+                            let v = read_vec::<u8>(&format!("{base}-interp.bin"))
+                                .expect("Failed to read segment interp codes");
+                            assert_eq!(v.len(), keyframe_count - 1);
+                            v
+                        } else {
+                            Vec::new()
+                        };
+                        let handles = if keyframe_count > 1 {
+                            let h_flat = read_vec::<f64>(&format!("{base}-handles.bin"))
+                                .expect("Failed to read segment handles");
+                            assert_eq!(h_flat.len(), 4 * (keyframe_count - 1));
+                            h_flat
+                                .chunks_exact(4)
+                                .map(|c| [c[0], c[1], c[2], c[3]])
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        operations.push(PinOperation::TransformKeyframes {
+                            local,
+                            times,
+                            translations,
+                            quaternions,
+                            scales,
+                            interps,
+                            handles,
+                            rest_t,
+                        });
+                    }
+                    _ => panic!("Unknown operation type: {op_type}"),
+                }
+            }
+
+            Pin {
+                index: pin_ind,
+                operations,
+                unpin_time,
+                pull_w,
+                pull_weights,
+                pin_group_id,
+                allow_intersection,
+            }
+        };
+        let pin: Vec<Pin> = (0..n_pin_block).map(|i| read_pin_block("pin", i)).collect();
+
+        // Display pins are optional: a session exported without any reads as
+        // having none, the same way an absent pin-pullw bin reads as no
+        // per-vertex weights.
+        let n_display_pin_block = count
+            .get("display_pin_block")
+            .and_then(|v| v.as_integer())
+            .map_or(0, |n| {
+                usize::try_from(n).expect("display_pin_block must not be negative")
+            });
+        let display_pin: Vec<DisplayPin> = (0..n_display_pin_block)
+            .map(|i| {
+                let block = read_pin_block("display-pin", i);
+                assert!(
+                    block.pull_w == 0.0 && block.pull_weights.is_none(),
+                    "display-pin-{i} must be an exact pin (pull = 0)"
+                );
+                let n = block.index.len();
+                let rest = scale_mat(
+                    read_mat_from_file::<f64, 3>(&format!(
+                        "{}/bin/display-pin-rest-{i}.bin",
+                        args.path
+                    ))
+                    .expect("Failed to read display pin rest positions"),
+                    ws,
+                    "display pin rest positions",
+                );
+                assert_eq!(
+                    rest.ncols(),
+                    n,
+                    "display-pin-rest-{i} must hold one position per vertex"
+                );
+                let dmap =
+                    read_vec::<u32>(&format!("{}/bin/display-pin-dmap-{i}.bin", args.path))
+                        .expect("Failed to read display pin displacement groups");
+                assert_eq!(
+                    dmap.len(),
+                    n,
+                    "display-pin-dmap-{i} must hold one group per vertex"
+                );
+                for &group in &dmap {
+                    assert!(
+                        (group as usize) < displacement_mat.ncols(),
+                        "display-pin-dmap-{i} names group {group}, outside \
+                         displacement.bin's {} groups",
+                        displacement_mat.ncols(),
+                    );
+                }
+                DisplayPin {
+                    rest,
+                    dmap,
+                    operations: block.operations,
+                    unpin_time: block.unpin_time,
+                }
+            })
+            .collect();
+
+        let mut wall = Vec::new();
+        for i in 0..n_wall {
+            let title = format!("wall-{i}");
+            let count = parsed
+                .get(&title)
+                .unwrap_or_else(|| panic!("Failed to read wall {i}"));
+            let n_keyframe = read_usize(count, "keyframe");
+            if n_keyframe > 0 {
+                let nx = read_f32(count, "nx");
+                let ny = read_f32(count, "ny");
+                let nz = read_f32(count, "nz");
+                let transition = read_string(count, "transition");
+                // The normal must be finite and long enough to normalize in
+                // f32 (its squared length must not underflow), and must stay
+                // finite after it: a NaN or zero normal makes the wall's height
+                // NaN everywhere.
+                let mut normal = Vector3::new(nx, ny, nz);
+                assert!(
+                    normal.iter().all(|v| v.is_finite()) && normal.norm_squared() > f32::MIN_POSITIVE,
+                    "wall {i}: normal ({nx}, {ny}, {nz}) is not finite and normalizable"
+                );
+                normal.normalize_mut();
+                assert!(
+                    normal.iter().all(|v| v.is_finite()),
+                    "wall {i}: normal ({nx}, {ny}, {nz}) did not normalize"
+                );
+                let position = scale_mat(
+                    read_mat_from_file::<f64, 3>(&format!("{}/bin/wall-pos-{}.bin", args.path, i))
+                        .expect("Failed to read pos_path"),
+                    ws,
+                    "pos_path",
+                );
+                let wall_timing =
+                    read_vec::<f64>(&format!("{}/bin/wall-timing-{}.bin", args.path, i))
+                        .expect("Failed to read wall timing");
+                let contact_gap = read_f32(count, "contact-gap");
+                let friction = read_f32(count, "friction");
+                let active_duration = read_optional_f32(count, "active-duration").unwrap_or(-1.0);
+                let thickness = read_optional_f32(count, "thickness").unwrap_or(1.0) * ws as f32;
+                assert_gt!(
+                    thickness,
+                    0.0,
+                    "invisible wall thickness must be > 0 (got {})",
+                    thickness
+                );
+                assert_eq!(position.ncols(), n_keyframe);
+                assert_eq!(wall_timing.len(), n_keyframe);
+                wall.push(InvisibleWall {
+                    normal,
+                    position,
+                    timing: wall_timing,
+                    transition,
+                    contact_gap,
+                    friction,
+                    active_duration,
+                    thickness,
+                });
+            }
+        }
+
+        let mut sphere = Vec::new();
+        for i in 0..n_sphere {
+            let title = format!("sphere-{i}");
+            let count = parsed
+                .get(&title)
+                .unwrap_or_else(|| panic!("Failed to read sphere {i}"));
+            let inverted = read_bool(count, "invert");
+            let hemisphere = read_bool(count, "hemisphere");
+            let transition = read_string(count, "transition");
+            let n_keyframe = read_usize(count, "keyframe");
+            if n_keyframe > 0 {
+                let center = scale_mat(
+                    read_mat_from_file::<f64, 3>(&format!(
+                        "{}/bin/sphere-pos-{}.bin",
+                        args.path, i
+                    ))
+                    .expect("Failed to read sphere pos_path"),
+                    ws,
+                    "sphere pos_path",
+                );
+                // Sphere collider radius is a world-space length: scale it so the
+                // collider keeps its size relative to the scaled mesh.
+                let radius: Vec<f32> =
+                    read_vec::<f32>(&format!("{}/bin/sphere-radius-{}.bin", args.path, i))
+                        .expect("Failed to read sphere radius")
+                        .iter()
+                        .map(|r| (*r as f64 * ws) as f32)
+                        .collect();
+                let timing = read_vec::<f64>(&format!("{}/bin/sphere-timing-{}.bin", args.path, i))
+                    .expect("Failed to read sphere timing");
+                let contact_gap = read_f32(count, "contact-gap");
+                let friction = read_f32(count, "friction");
+                let active_duration = read_optional_f32(count, "active-duration").unwrap_or(-1.0);
+                let thickness = read_optional_f32(count, "thickness").unwrap_or(1.0) * ws as f32;
+                assert_gt!(
+                    thickness,
+                    0.0,
+                    "invisible sphere thickness must be > 0 (got {})",
+                    thickness
+                );
+                assert_eq!(center.ncols(), n_keyframe);
+                assert_eq!(radius.len(), n_keyframe);
+                assert!(
+                    radius.iter().all(|r| r.is_finite() && *r >= 0.0),
+                    "sphere {i}: every radius must be finite and non-negative ({radius:?})"
+                );
+                assert_eq!(timing.len(), n_keyframe);
+                sphere.push(InvisibleSphere {
+                    center,
+                    radius,
+                    timing,
+                    inverted,
+                    hemisphere,
+                    transition,
+                    contact_gap,
+                    friction,
+                    active_duration,
+                    thickness,
+                });
+            }
+        }
+
+        assert_eq!(vert_mat.ncols(), n_vert);
+        assert_eq!(vel_mat.ncols(), n_vert);
+        assert_eq!(rod_mat.ncols(), n_rod);
+        assert_eq!(tri_mat.ncols(), n_tri);
+        assert_eq!(tet_mat.ncols(), n_tet);
+        assert_eq!(static_vert_mat.ncols(), n_static_vert);
+        assert_eq!(
+            static_vert_dmap_mat.len(),
+            n_static_vert,
+            "static_vert_dmap size mismatch"
+        );
+        assert_eq!(static_tri_mat.ncols(), n_static_tri);
+        assert_eq!(stitch_ind_mat.ncols(), n_stitch);
+        assert_eq!(stitch_w_mat.ncols(), n_stitch);
+        assert_eq!(stitch_stiffness_vec.len(), n_stitch);
+        assert_eq!(stitch_rest_length_vec.len(), n_stitch);
+        assert_eq!(stitch_has_rest_length_vec.len(), n_stitch);
+
+        // Tie constraints: three files written together or not at all.
+        let (tie_vertex_vec, tie_ind_vec, tie_w_vec) = {
+            let vertex = read_vec::<u32>(&format!("{}/bin/tie_vertex.bin", args.path));
+            let ind = read_vec::<u32>(&format!("{}/bin/tie_ind.bin", args.path));
+            let w = read_vec::<f32>(&format!("{}/bin/tie_w.bin", args.path));
+            match (vertex, ind, w) {
+                (Ok(vertex), Ok(ind), Ok(w)) => {
+                    let slots = crate::driver::tie::TIE_SLOTS;
+                    assert!(
+                        ind.len() == slots * vertex.len() && w.len() == slots * vertex.len(),
+                        "tie_ind.bin and tie_w.bin hold {} and {} entries for {} ties; \
+                         each tie carries {slots} controller slots",
+                        ind.len(),
+                        w.len(),
+                        vertex.len()
+                    );
+                    (vertex, ind, w)
+                }
+                (Err(_), Err(_), Err(_)) => (Vec::new(), Vec::new(), Vec::new()),
+                _ => panic!(
+                    "the tie files are written as a set, and only some of tie_vertex.bin, \
+                     tie_ind.bin and tie_w.bin are present"
+                ),
+            }
+        };
+
+        let args_path = format!("{}/param.toml", args.path);
+        let file_content = fs::read_to_string(args_path).unwrap();
+        let config: Config = toml::from_str(&file_content).unwrap();
+        // THE STEP-SIZE LIMIT, refused here rather than stepped past
+        // (`ppf_cts_core::datamodel::params::MAX_STEP_SIZE` says why).
+        if let Err(refusal) =
+            ppf_cts_core::datamodel::params::check_step_size(f64::from(config.param.dt))
+        {
+            panic!("{refusal}");
+        }
+
+        let dyn_args = Self::load_dyn_param(&args.path);
+
+        let param_dir = format!("{}/bin/param", args.path);
+        // Animated material schedules live beside the static params, one file
+        // per animated key with the SAME per-element layout repeated once per
+        // keyframe. Reusing the static layout is deliberate: the per-frame
+        // values then go through the identical assembly, so an animated
+        // material cannot mean something different from a static one.
+        let (param_anim_times, tri_param_anim) = read_param_anim(&args.path, n_tri);
+        let mut rod_param = Vec::new();
+        let mut tri_param = Vec::new();
+        let mut tet_param = Vec::new();
+        let mut static_param = Vec::new();
+        let mut sand_param = Vec::new();
+
+        for entry in fs::read_dir(&param_dir).expect("Failed to read param directory") {
+            let entry = entry.expect("Failed to read entry");
+            let path = entry.path();
+            if path.is_file() {
+                let file_name = path.file_name().unwrap().to_str().unwrap();
+
+                // SAND params are scalar (len 1), not per-element, so they are
+                // read on a separate channel that skips the `len == n_element`
+                // assert below. Every grain in the cloud shares one mass /
+                // radius / gap / friction.
+                if file_name.starts_with("sand-") && file_name.ends_with(".bin") {
+                    let name = file_name["sand-".len()..file_name.len() - 4].to_string();
+                    let values = read_vec::<f32>(&path.to_string_lossy())
+                        .expect("Failed to read sand values");
+                    sand_param.push((name, ParamValueList::Value(values)));
+                    continue;
+                }
+
+                let (target_param, prefix, n_element) = if file_name.starts_with("rod-") {
+                    (&mut rod_param, "rod-", n_rod)
+                } else if file_name.starts_with("tri-") {
+                    (&mut tri_param, "tri-", n_tri)
+                } else if file_name.starts_with("tet-") {
+                    (&mut tet_param, "tet-", n_tet)
+                } else if file_name.starts_with("static-") {
+                    (&mut static_param, "static-", n_static_tri)
+                } else {
+                    continue;
+                };
+
+                if file_name.ends_with(".bin") {
+                    let name = file_name[prefix.len()..file_name.len() - 4].to_string();
+                    if name == "model" {
+                        let values = read_vec::<u8>(&path.to_string_lossy())
+                            .expect("Failed to read model values");
+                        let values = values
+                            .iter()
+                            .map(|&k| {
+                                Model::from_id(k)
+                                    .unwrap_or_else(|| panic!("Unknown model type: {k}"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(values.len(), n_element, "path: {}", path.display());
+                        target_param.push((name, ParamValueList::Model(values)));
+                    } else {
+                        let values = read_vec::<f32>(&path.to_string_lossy())
+                            .expect("Failed to read values");
+                        assert_eq!(values.len(), n_element, "path: {}", path.display());
+                        target_param.push((name, ParamValueList::Value(values)));
+                    }
+                }
+            }
+        }
+
+        // Optional PDRD inputs. Absent files are equivalent to "no
+        // PDRD bodies in this scene" and the solver falls through.
+        let pdrd_body_path = format!("{}/bin/pdrd_body.bin", args.path);
+        let pdrd_body_rows = if std::path::Path::new(&pdrd_body_path).exists() {
+            let mut raw = read_vec::<f32>(&pdrd_body_path).expect("Failed to read pdrd_body.bin");
+            // Row layout: PDRD_BODY_ROW_LEN floats per body (vertex_start,
+            // vertex_count, volume, centroid[3], rest_gram_inv[9],
+            // mass_per_vertex, joint_mode, joint_axis[3], joint_pin[3]).
+            assert!(
+                raw.len() % PDRD_BODY_ROW_LEN == 0,
+                "pdrd_body.bin length {} not a multiple of {}",
+                raw.len(),
+                PDRD_BODY_ROW_LEN,
+            );
+            // Uniform world scaling. pdrd_body.bin is precomputed in the addon
+            // from the UNSCALED mesh, but the live vertices it is matched
+            // against were multiplied by `ws` on ingest. Each geometric field
+            // carries a power of length and must be rescaled by that power of
+            // `ws` so the shape-match dynamics stay consistent:
+            //   volume          (length^3) -> * ws^3
+            //   rest_centroid   (length^1) -> * ws       world position
+            //   rest_gram_inv   (length^-2)-> * 1/ws^2   see derivation below
+            //   mass_per_vertex (prop. volume) -> * ws^3
+            //   joint_pin       (length^1) -> * ws       world pivot
+            // vertex_start/count (indices/counts), joint_mode (enum) and
+            // joint_axis (a UNIT vector) are dimensionless and left untouched.
+            //
+            // rest_gram_inv derivation: it is stored as the inverse of the rest
+            // Gram `Sbar = sum_k ybar_k ybar_k^T` (length^2), where ybar_k are
+            // the centered rest positions (pdrd_rest_centered, scaled by ws
+            // below). The mass is factored out separately into mass_per_vertex,
+            // so Sbar is a pure geometric second moment (no mass weighting).
+            // Scaling ybar by ws sends Sbar -> ws^2 Sbar, hence the stored
+            // inverse -> ws^-2. This keeps the recovered reference inertia
+            // Iref = m (tr(Sbar) I - Sbar) ~ ws^3 * ws^2 = ws^5 = mass*length^2,
+            // the physically correct moment-of-inertia scaling. The best-fit
+            // rotation R is the polar factor of the cross-covariance
+            // M = sum_k y_k ybar_k^T and does NOT use rest_gram_inv; with both
+            // y_k and ybar_k scaled by ws, M -> ws^2 M leaves its polar factor
+            // (the rotation) invariant, so R is scale-invariant as required.
+            //
+            // ws == 1.0 (the default) is a no-op; skip the round-trip so the
+            // unscaled path stays byte-for-byte identical.
+            if (ws - 1.0).abs() > 1e-12 {
+                let ws3 = ws * ws * ws;
+                let inv_ws2 = 1.0 / (ws * ws);
+                let n_bodies = raw.len() / PDRD_BODY_ROW_LEN;
+                for b in 0..n_bodies {
+                    let row = &mut raw[PDRD_BODY_ROW_LEN * b..PDRD_BODY_ROW_LEN * (b + 1)];
+                    row[2] = (row[2] as f64 * ws3) as f32; // volume (length^3)
+                    for c in &mut row[3..6] {
+                        *c = (*c as f64 * ws) as f32; // rest_centroid (length)
+                    }
+                    for g in &mut row[6..15] {
+                        *g = (*g as f64 * inv_ws2) as f32; // rest_gram_inv (length^-2)
+                    }
+                    row[15] = (row[15] as f64 * ws3) as f32; // mass_per_vertex (~ volume)
+                    for p in &mut row[20..23] {
+                        *p = (*p as f64 * ws) as f32; // joint_pin (length)
+                    }
+                }
+            }
+            raw
+        } else {
+            Vec::new()
+        };
+        let pdrd_vert_index_path = format!("{}/bin/pdrd_vert_index.bin", args.path);
+        let pdrd_vert_index = if std::path::Path::new(&pdrd_vert_index_path).exists() {
+            let v =
+                read_vec::<u32>(&pdrd_vert_index_path).expect("Failed to read pdrd_vert_index.bin");
+            assert_eq!(v.len(), n_vert, "pdrd_vert_index size mismatch");
+            v
+        } else {
+            vec![0u32; n_vert]
+        };
+        let pdrd_vert_list_path = format!("{}/bin/pdrd_vert_list.bin", args.path);
+        let pdrd_vert_list = if std::path::Path::new(&pdrd_vert_list_path).exists() {
+            read_vec::<u32>(&pdrd_vert_list_path).expect("Failed to read pdrd_vert_list.bin")
+        } else {
+            Vec::new()
+        };
+        let pdrd_rest_centered_path = format!("{}/bin/pdrd_rest_centered.bin", args.path);
+        let pdrd_rest_centered = if std::path::Path::new(&pdrd_rest_centered_path).exists() {
+            let mut v = read_vec::<f32>(&pdrd_rest_centered_path)
+                .expect("Failed to read pdrd_rest_centered.bin");
+            assert_eq!(
+                v.len(),
+                3 * pdrd_vert_list.len(),
+                "pdrd_rest_centered length mismatch (expected 3 * vert_list = {}, got {})",
+                3 * pdrd_vert_list.len(),
+                v.len(),
+            );
+            // Centered rest positions ybar_k are a world length (length^1), so
+            // scale by ws to match the live (ws-scaled) vertices they are fit
+            // against. The reconstruct x_v = centroid + R * ybar_k would
+            // otherwise rebuild the body at its unscaled size, corrupting the
+            // shape match. ws == 1.0 is a no-op (skip the round-trip).
+            if (ws - 1.0).abs() > 1e-12 {
+                for y in &mut v {
+                    *y = (*y as f64 * ws) as f32;
+                }
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        let cosserat_edge_path = format!("{}/bin/cosserat_edge.bin", args.path);
+        let cosserat_edge = if std::path::Path::new(&cosserat_edge_path).exists() {
+            let v = read_vec::<u8>(&cosserat_edge_path).expect("Failed to read cosserat_edge.bin");
+            assert_eq!(
+                v.len(),
+                n_rod,
+                "cosserat_edge.bin holds {} entries for {} rod edges; it is one byte per rod edge",
+                v.len(),
+                n_rod,
+            );
+            v
+        } else {
+            vec![0; n_rod]
+        };
+        let cosserat_tilt_path = format!("{}/bin/cosserat_tilt.bin", args.path);
+        let cosserat_tilt = if std::path::Path::new(&cosserat_tilt_path).exists() {
+            let v = read_vec::<f32>(&cosserat_tilt_path).expect("Failed to read cosserat_tilt.bin");
+            assert_eq!(
+                v.len(),
+                n_vert,
+                "cosserat_tilt.bin holds {} entries for {} vertices; it is one float per vertex",
+                v.len(),
+                n_vert,
+            );
+            v
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            args: config.param,
+            dyn_args,
+            displacement: displacement_mat,
+            vert_dmap: vert_dmap_mat,
+            translation_lock,
+            translation_lock_mode,
+            rotation_lock,
+            rotation_lock_mode,
+            vert: vert_mat,
+            vel: vel_mat,
+            uv: uv_mat,
+            rod: rod_mat,
+            tri: tri_mat,
+            tet: tet_mat,
+            static_vert_dmap: static_vert_dmap_mat,
+            static_vert: static_vert_mat,
+            static_tri: static_tri_mat,
+            stitch_ind: stitch_ind_mat,
+            stitch_w: stitch_w_mat,
+            stitch_stiffness: stitch_stiffness_vec,
+            stitch_rest_length: stitch_rest_length_vec,
+            stitch_has_rest_length: stitch_has_rest_length_vec,
+            tie_vertex: tie_vertex_vec,
+            tie_ind: tie_ind_vec,
+            tie_w: tie_w_vec,
+            pin,
+            display_pin,
+            wall,
+            sphere,
+            rest_vert: rest_vert_mat,
+            rest_vert_mask,
+            rest_vert_schedule,
+            bend_rest_vert,
+            bend_rest_vert_mask,
+            bend_rest_vert_schedule,
+            collider_vert_mask,
+            object_vert_index,
+            group_vert_index,
+            intersect_policy,
+            start_link,
+            shell_count,
+            rod_param,
+            tri_param,
+            param_anim_times,
+            tri_param_anim,
+            tet_param,
+            static_param,
+            sand_param,
+            pdrd_body_rows,
+            pdrd_vert_index,
+            pdrd_vert_list,
+            pdrd_rest_centered,
+            cosserat_edge,
+            cosserat_tilt,
+        }
+    }
+
+    pub fn export_param_summary(
+        &self,
+        args: &ProgramArgs,
+        props: &Props,
+        face_area: &[f32],
+        tet_volume: &[f32],
+    ) {
+        // Write the summary next to param.toml in the session directory
+        let summary_path = format!("{}/param_summary.txt", args.path);
+        let mut file = match File::create(&summary_path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to create parameter summary file: {e}");
+                return;
+            }
+        };
+
+        let mut content = String::new();
+
+        // Write Shell/Triangle parameters summary
+        if self.tri.ncols() > 0 {
+            content.push_str(&format!(
+                "=== Shells ({} elements) ===\n\n",
+                self.tri.ncols()
+            ));
+            self.write_param_stats(&mut content, &self.tri_param);
+
+            // Add mass and area statistics for shells
+            if !props.face.is_empty() && !face_area.is_empty() {
+                let masses: Vec<f32> = props.face.iter().map(|p| p.mass).collect();
+                if !masses.is_empty() {
+                    let min_mass = masses.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max_mass = masses.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum_mass: f64 = masses.iter().map(|&v| v as f64).sum();
+                    let mean_mass = (sum_mass / masses.len() as f64) as f32;
+
+                    content.push_str(&format!(
+                        "mass: (max: {max_mass:.4e}, min: {min_mass:.4e}, mean: {mean_mass:.4e})\n"
+                    ));
+                }
+
+                let areas: Vec<f32> = face_area.to_vec();
+                if !areas.is_empty() {
+                    let min_area = areas.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max_area = areas.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let sum_area: f64 = areas.iter().map(|&v| v as f64).sum();
+                    let mean_area = (sum_area / areas.len() as f64) as f32;
+
+                    content.push_str(&format!(
+                        "area: (max: {max_area:.4e}, min: {min_area:.4e}, mean: {mean_area:.4e})\n"
+                    ));
+                }
+            }
+            content.push('\n');
+        }
+
+        // Write Solid/Tetrahedral parameters summary
+        if self.tet.ncols() > 0 {
+            content.push_str(&format!(
+                "=== Solids ({} elements) ===\n\n",
+                self.tet.ncols()
+            ));
+            self.write_param_stats(&mut content, &self.tet_param);
+
+            // Add mass and volume statistics for solids
+            if !props.tet.is_empty() {
+                let masses: Vec<f32> = props.tet.iter().map(|p| p.mass).collect();
+                let min_mass = masses.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_mass = masses.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_mass: f64 = masses.iter().map(|&v| v as f64).sum();
+                let mean_mass = (sum_mass / masses.len() as f64) as f32;
+
+                let min_volume = tet_volume.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_volume = tet_volume.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_volume: f64 = tet_volume.iter().map(|&v| v as f64).sum();
+                let mean_volume = (sum_volume / tet_volume.len() as f64) as f32;
+
+                content.push_str(&format!(
+                    "mass: (max: {max_mass:.4e}, min: {min_mass:.4e}, mean: {mean_mass:.4e})\n"
+                ));
+                content.push_str(&format!(
+                    "volume: (max: {max_volume:.4e}, min: {min_volume:.4e}, mean: {mean_volume:.4e})\n"
+                ));
+            }
+            content.push('\n');
+        }
+
+        // Write Rod parameters summary
+        if self.rod.ncols() > 0 {
+            content.push_str(&format!("=== Rods ({} elements) ===\n\n", self.rod.ncols()));
+            self.write_param_stats(&mut content, &self.rod_param);
+
+            // Add mass statistics for rods. At summary time props.edge holds
+            // only rod entries (non-rod edges are appended later), so its
+            // length matches the rod count exactly.
+            debug_assert_eq!(
+                props.edge.len(),
+                self.rod.ncols(),
+                "param summary runs before non-rod edges are appended to props.edge"
+            );
+            let rod_count = self.rod.ncols();
+            if rod_count > 0 {
+                let rod_props = &props.edge[0..rod_count];
+                let masses: Vec<f32> = rod_props.iter().map(|p| p.mass).collect();
+                let min_mass = masses.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_mass = masses.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum_mass: f64 = masses.iter().map(|&v| v as f64).sum();
+                let mean_mass = (sum_mass / masses.len() as f64) as f32;
+
+                content.push_str(&format!(
+                    "mass: (max: {max_mass:.4e}, min: {min_mass:.4e}, mean: {mean_mass:.4e})\n"
+                ));
+            }
+            content.push('\n');
+        }
+
+        // Write Static object parameters summary
+        if self.static_tri.ncols() > 0 {
+            content.push_str(&format!(
+                "=== Static Objects ({} elements) ===\n\n",
+                self.static_tri.ncols()
+            ));
+            self.write_param_stats(&mut content, &self.static_param);
+            content.push('\n');
+        }
+
+        if let Err(e) = file.write_all(content.as_bytes()) {
+            eprintln!("Failed to write parameter summary: {e}");
+        } else {
+            println!("Parameter summary written to: {summary_path}");
+        }
+    }
+
+    fn write_param_stats(&self, content: &mut String, params: &[(String, ParamValueList)]) {
+        for (name, values) in params {
+            match values {
+                ParamValueList::Model(models) => {
+                    // Count occurrences of each model type
+                    let mut model_counts = HashMap::new();
+                    for model in models {
+                        *model_counts.entry(format!("{model:?}")).or_insert(0) += 1;
+                    }
+                    // Sort by name so the breakdown is stable across runs
+                    // (std HashMap iteration order is randomized).
+                    let mut model_counts: Vec<(String, i32)> = model_counts.into_iter().collect();
+                    model_counts.sort_by(|a, b| a.0.cmp(&b.0));
+
+                    content.push_str(&format!("{name}: ("));
+                    let mut first = true;
+                    for (model_name, count) in model_counts {
+                        if !first {
+                            content.push_str(", ");
+                        }
+                        content.push_str(&format!(
+                            "{}: {} elements",
+                            model_name.to_lowercase(),
+                            count
+                        ));
+                        first = false;
+                    }
+                    content.push_str(")\n");
+                }
+                ParamValueList::Value(vals) => {
+                    if vals.is_empty() {
+                        continue;
+                    }
+
+                    let min = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let max = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+                    // Use double precision for accurate mean calculation
+                    let sum: f64 = vals.iter().map(|&v| v as f64).sum();
+                    let mean = (sum / vals.len() as f64) as f32;
+
+                    content.push_str(&format!(
+                        "{name}: (max: {max:.4e}, min: {min:.4e}, mean: {mean:.4e})\n"
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn args(&self) -> SimArgs {
+        self.args.clone()
+    }
+
+    /// Resolve the scalar SAND material params (`sand-*.bin`) into a
+    /// `SandParams`, or `None` when the scene has no SAND object. The grain
+    /// radius / contact gap are sent on the standard `contact-offset` /
+    /// `contact-gap` keys (a grain's physical contact skin), while mass and
+    /// friction come from the `sand-*` keys. Every grain in the cloud shares
+    /// these scalars.
+    fn sand_params(&self) -> Option<SandParams> {
+        if self.sand_param.is_empty() {
+            return None;
+        }
+        let get = |key: &str| -> Option<f32> {
+            self.sand_param
+                .iter()
+                .find(|(name, _)| name.as_str() == key)
+                .map(|(_, value)| as_value(value, 0, key))
+        };
+        let particle_mass =
+            get("particle-mass").expect("SAND object missing 'sand-particle-mass' param");
+        let grain_radius =
+            get("grain-radius").expect("SAND object missing 'sand-grain-radius' param");
+        let contact_gap = get("contact-gap").expect("SAND object missing 'sand-contact-gap' param");
+        let friction = get("friction").expect("SAND object missing 'sand-friction' param");
+        assert_gt!(particle_mass, 0.0, "Sand particle mass must be positive");
+        assert_ge!(grain_radius, 0.0, "Sand grain radius must be non-negative");
+        assert_gt!(contact_gap, 0.0, "Sand contact gap must be positive");
+        assert_ge!(friction, 0.0, "Sand friction must be non-negative");
+        Some(SandParams {
+            particle_mass,
+            grain_radius,
+            contact_gap,
+            friction,
+        })
+    }
+
+    /// Keyframe times of the material schedules, seconds.
+    pub fn param_anim_times(&self) -> &[f64] {
+        &self.param_anim_times
+    }
+
+    /// True when this scene animates at least one material parameter.
+    pub fn has_material_animation(&self) -> bool {
+        !self.tri_param_anim.is_empty()
+    }
+
+    /// Whether the face param table is built one entry per face.
+    ///
+    /// Deduplication collapses by VALUE, so an animated table's size and order
+    /// would change frame to frame while `FaceProp::param_index` is written
+    /// once at build. Expanding fixes the mapping to the identity.
+    fn expand_face_params(&self) -> bool {
+        self.has_material_animation()
+    }
+
+    /// The `tri` material lists as of `time`, with every animated key replaced
+    /// by its interpolated frame and every other key left at its build value.
+    ///
+    /// Times outside the schedule clamp to the nearest end, matching the
+    /// rest-shape and collider schedules.
+    fn tri_param_at(&self, time: f64) -> Vec<(String, ParamValueList)> {
+        let mut out = self.tri_param.clone();
+        for (key, frames) in self.tri_param_anim.iter() {
+            let values = interp_frames(&self.param_anim_times, frames, time);
+            match out.iter_mut().find(|(name, _)| name == key) {
+                Some((_, slot)) => *slot = ParamValueList::Value(values),
+                // The static file is what the schedule animates around, so a
+                // schedule with no static counterpart means the frontend wrote
+                // one and not the other.
+                None => panic!(
+                    "animated material key '{key}' has no matching \
+                     bin/param/tri-{key}.bin to animate"
+                ),
+            }
+        }
+        out
+    }
+
+    /// Rebuild the props and material tables at `time`.
+    ///
+    /// Only the face params actually vary today (see `ANIMATABLE_TRI_KEYS`),
+    /// but the whole assembly is re-run rather than the face table patched in
+    /// place: it is the same code path the static build takes, so the animated
+    /// values cannot be assembled by a different rule than the build-time ones.
+    pub fn make_props_at(
+        &self,
+        time: f64,
+        mesh: &MeshSet,
+        face_area: &[f32],
+        tet_volume: &[f32],
+    ) -> Props {
+        self.make_props_from(
+            mesh,
+            face_area,
+            tet_volume,
+            &self.rod_param,
+            &self.tri_param_at(time),
+            &self.tet_param,
+            self.expand_face_params(),
+        )
+    }
+
+    pub fn make_props(&self, mesh: &MeshSet, face_area: &[f32], tet_volume: &[f32]) -> Props {
+        self.make_props_from(
+            mesh,
+            face_area,
+            tet_volume,
+            &self.rod_param,
+            &self.tri_param,
+            &self.tet_param,
+            self.expand_face_params(),
+        )
+    }
+
+    /// `make_props` with the material lists supplied by the caller.
+    ///
+    /// The per-frame animation path passes interpolated lists here so it runs
+    /// the SAME assembly the static path runs. Duplicating the assembly for
+    /// animated materials is what would let the two drift, and a drift there
+    /// is invisible: both produce a plausible material and only the animated
+    /// one is wrong.
+    ///
+    /// `expand_face` turns off face-param deduplication, giving one table entry
+    /// per face and `param_index == face index`. A scene with an animated face
+    /// material needs that: dedup collapses by VALUE, so the table's size and
+    /// order would change from frame to frame as values cross each other,
+    /// while `FaceProp::param_index` is written once at build. Fixing the
+    /// mapping to the identity costs `size_of::<FaceParam>()` per face and is
+    /// paid only by a scene that actually animates one.
+    #[allow(clippy::too_many_arguments)]
+    fn make_props_from(
+        &self,
+        mesh: &MeshSet,
+        face_area: &[f32],
+        tet_volume: &[f32],
+        rod_param: &[(String, ParamValueList)],
+        tri_param: &[(String, ParamValueList)],
+        tet_param: &[(String, ParamValueList)],
+        expand_face: bool,
+    ) -> Props {
+        // Build edge props and params with deduplication
+        let mut edge_param_map: HashMap<EdgeParam, u32> = HashMap::new();
+        let mut edge_params = Vec::new();
+        let edge = (0..self.rod.ncols())
+            .map(|i| {
+                let mut ghat = None;
+                let mut offset = None;
+                let mut friction = None;
+                let mut stiffness = None;
+                let mut bend = None;
+                let mut length_factor = None;
+                let mut strainlimit = None;
+                let mut bend_plasticity = None;
+                let mut bend_plasticity_threshold = None;
+                let mut bend_rest_from_geometry = None;
+                let mut deform_damping = None;
+                let mut bend_damping = None;
+                let mut cosserat_shear = None;
+                let mut cosserat_bend = None;
+                let mut cosserat_twist = None;
+                let mut cosserat_rest_twist = None;
+                let mut cosserat_fix_ends = None;
+                let mut cosserat_end_twist_rate = None;
+                let mut cosserat_straight_rest = None;
+                let rod = mesh.mesh.mesh.edge.column(i);
+                let x0 = mesh.vertex.column(rod[0]);
+                let x1 = mesh.vertex.column(rod[1]);
+                let mut length = (x1 - x0).map(f32::from).norm();
+                let initial_length = length;
+                let mut density = None;
+                for (name, value) in rod_param {
+                    if name == "contact-gap" {
+                        ghat = Some(as_value(value, i, name));
+                    } else if name == "contact-offset" {
+                        offset = Some(as_value(value, i, name));
+                    } else if name == "friction" {
+                        friction = Some(as_value(value, i, name));
+                    } else if name == "young-mod" {
+                        stiffness = Some(as_value(value, i, name));
+                    } else if name == "density" {
+                        density = Some(as_value(value, i, name));
+                    } else if name == "bend" {
+                        bend = Some(as_value(value, i, name));
+                    } else if name == "length-factor" {
+                        length_factor = Some(as_value(value, i, name));
+                    } else if name == "strain-limit" {
+                        strainlimit = Some(as_value(value, i, name));
+                    } else if name == "bend-plasticity" {
+                        bend_plasticity = Some(as_value(value, i, name));
+                    } else if name == "bend-plasticity-threshold" {
+                        bend_plasticity_threshold = Some(as_value(value, i, name));
+                    } else if name == "bend-rest-from-geometry" {
+                        bend_rest_from_geometry = Some(as_value(value, i, name) != 0.0);
+                    } else if name == "deformation-damping" {
+                        deform_damping = Some(as_value(value, i, name));
+                    } else if name == "bending-damping" {
+                        bend_damping = Some(as_value(value, i, name));
+                    } else if name == "pressure" {
+                        // Pressure is a tri-only parameter; ignore for rods.
+                    } else if name == "cosserat-shear" {
+                        cosserat_shear = Some(as_value(value, i, name));
+                    } else if name == "cosserat-bend" {
+                        cosserat_bend = Some(as_value(value, i, name));
+                    } else if name == "cosserat-twist" {
+                        cosserat_twist = Some(as_value(value, i, name));
+                    } else if name == "cosserat-rest-twist" {
+                        cosserat_rest_twist = Some(as_value(value, i, name));
+                    } else if name == "cosserat-fix-ends" {
+                        cosserat_fix_ends = Some(as_value(value, i, name));
+                    } else if name == "cosserat-end-twist-rate" {
+                        cosserat_end_twist_rate = Some(as_value(value, i, name));
+                    } else if name == "cosserat-straight-rest" {
+                        cosserat_straight_rest = Some(as_value(value, i, name));
+                    } else {
+                        panic!("Unknown rod parameter: {name}");
+                    }
+                }
+                let ghat = ghat.unwrap();
+                let offset = offset.unwrap();
+                let friction = friction.unwrap();
+                let stiffness = stiffness.unwrap();
+                let bend = bend.unwrap();
+                let length_factor = length_factor.unwrap();
+                let density = density.unwrap();
+                let strainlimit = strainlimit.unwrap_or(0.0);
+                let bend_plasticity = bend_plasticity.unwrap_or(0.0);
+                let bend_plasticity_threshold = bend_plasticity_threshold.unwrap_or(0.0);
+                let bend_rest_from_geometry = bend_rest_from_geometry.unwrap_or(false);
+                let deform_damping = deform_damping.unwrap_or(0.0);
+                let bend_damping = bend_damping.unwrap_or(0.0);
+                // A plain rod beside a Cosserat one carries the cosserat-* keys
+                // at zero, and a scene with no Cosserat rod carries none.
+                let cosserat_shear = cosserat_shear.unwrap_or(0.0);
+                let cosserat_bend = cosserat_bend.unwrap_or(0.0);
+                let cosserat_twist = cosserat_twist.unwrap_or(0.0);
+                let cosserat_rest_twist = cosserat_rest_twist.unwrap_or(0.0);
+                let cosserat_fix_ends = cosserat_fix_ends.unwrap_or(0.0);
+                let cosserat_end_twist_rate = cosserat_end_twist_rate.unwrap_or(0.0);
+                let cosserat_straight_rest = cosserat_straight_rest.unwrap_or(0.0);
+                assert_ge!(cosserat_shear, 0.0, "Cosserat shear stiffness must be non-negative");
+                assert_ge!(cosserat_bend, 0.0, "Cosserat bend stiffness must be non-negative");
+                assert_ge!(cosserat_twist, 0.0, "Cosserat twist stiffness must be non-negative");
+                assert_ge!(
+                    deform_damping,
+                    0.0,
+                    "Deformation damping must be non-negative"
+                );
+                assert_ge!(bend_damping, 0.0, "Bending damping must be non-negative");
+                assert_gt!(density, 0.0, "Density must be positive");
+                assert_gt!(stiffness, 0.0, "Stiffness must be positive");
+                assert_gt!(length, 0.0, "Length must be positive");
+                assert_ge!(friction, 0.0, "Friction must be non-negative");
+                assert_ge!(bend, 0.0, "Bend modulus must be non-negative");
+                assert_ge!(strainlimit, 0.0, "Strain limit must be non-negative");
+                assert_ge!(bend_plasticity, 0.0, "Bend plasticity must be non-negative");
+                assert_ge!(
+                    bend_plasticity_threshold,
+                    0.0,
+                    "Bend plasticity threshold must be non-negative"
+                );
+                assert_gt!(ghat, 0.0, "Contact gap must be positive");
+                let mass = density * length;
+                length *= length_factor;
+
+                // Create param and deduplicate
+                let param = EdgeParam {
+                    stiffness,
+                    bend,
+                    ghat,
+                    offset,
+                    friction,
+                    strainlimit,
+                    plasticity: bend_plasticity,
+                    plasticity_threshold: bend_plasticity_threshold,
+                    bend_rest_from_geometry,
+                    deform_damping,
+                    bend_damping,
+                    cosserat_shear,
+                    cosserat_bend,
+                    cosserat_twist,
+                    cosserat_rest_twist,
+                    cosserat_fix_ends,
+                    cosserat_end_twist_rate,
+                    cosserat_straight_rest,
+                };
+                let param_idx = dedup_param(&mut edge_param_map, &mut edge_params, param);
+
+                EdgeProp {
+                    length,
+                    initial_length,
+                    mass,
+                    fixed: false,
+                    param_index: param_idx,
+                    // Derived in builder::build once the constraint set is
+                    // known; there are no pins here yet.
+                    pin_allow_intersection: false,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Build face props and params with deduplication
+        let mut face_param_map: HashMap<FaceParam, u32> = HashMap::new();
+        let mut face_params = Vec::new();
+        let face = (0..mesh.mesh.mesh.face.ncols())
+            .map(|i| {
+                let area = face_area[i];
+                let mut model = None;
+                let mut young_mod = None;
+                let mut poiss_rat = None;
+                let mut bend = None;
+                let mut shrink_x = None;
+                let mut shrink_y = None;
+                let mut strainlimit = None;
+                let mut ghat = None;
+                let mut offset = None;
+                let mut friction = None;
+                let mut density = None;
+                let mut pressure = None;
+                let mut plasticity = None;
+                let mut plasticity_threshold = None;
+                let mut bend_plasticity = None;
+                let mut bend_plasticity_threshold = None;
+                let mut bend_rest_from_geometry = None;
+                let mut deform_damping = None;
+                let mut bend_damping = None;
+                let mut bend_warp = None;
+                let mut bend_weft = None;
+                for (name, value) in tri_param {
+                    if name == "contact-gap" {
+                        ghat = Some(as_value(value, i, name));
+                    } else if name == "contact-offset" {
+                        offset = Some(as_value(value, i, name));
+                    } else if name == "friction" {
+                        friction = Some(as_value(value, i, name));
+                    } else if name == "strain-limit" {
+                        strainlimit = Some(as_value(value, i, name));
+                    } else if name == "bend" {
+                        bend = Some(as_value(value, i, name));
+                    } else if name == "shrink-x" {
+                        shrink_x = Some(as_value(value, i, name));
+                    } else if name == "shrink-y" {
+                        shrink_y = Some(as_value(value, i, name));
+                    } else if name == "model" {
+                        model = Some(as_model(value, i, name));
+                    } else if name == "density" {
+                        density = Some(as_value(value, i, name));
+                    } else if name == "young-mod" {
+                        young_mod = Some(as_value(value, i, name));
+                    } else if name == "poiss-rat" {
+                        poiss_rat = Some(as_value(value, i, name));
+                    } else if name == "pressure" {
+                        pressure = Some(as_value(value, i, name));
+                    } else if name == "plasticity" {
+                        plasticity = Some(as_value(value, i, name));
+                    } else if name == "plasticity-threshold" {
+                        plasticity_threshold = Some(as_value(value, i, name));
+                    } else if name == "bend-plasticity" {
+                        bend_plasticity = Some(as_value(value, i, name));
+                    } else if name == "bend-plasticity-threshold" {
+                        bend_plasticity_threshold = Some(as_value(value, i, name));
+                    } else if name == "bend-rest-from-geometry" {
+                        bend_rest_from_geometry = Some(as_value(value, i, name) != 0.0);
+                    } else if name == "deformation-damping" {
+                        deform_damping = Some(as_value(value, i, name));
+                    } else if name == "bending-damping" {
+                        bend_damping = Some(as_value(value, i, name));
+                    } else if name == "bend-warp" {
+                        bend_warp = Some(as_value(value, i, name));
+                    } else if name == "bend-weft" {
+                        bend_weft = Some(as_value(value, i, name));
+                    } else {
+                        panic!("Unknown face parameter: {name}");
+                    }
+                }
+                let model = model.unwrap();
+                let young_mod = young_mod.unwrap();
+                let poiss_rat = poiss_rat.unwrap();
+                let bend = bend.unwrap();
+                let shrink_x = shrink_x.unwrap();
+                let shrink_y = shrink_y.unwrap();
+                let strainlimit = strainlimit.unwrap();
+                let ghat = ghat.unwrap();
+                let offset = offset.unwrap();
+                let friction = friction.unwrap();
+                let density = density.unwrap();
+                let pressure = pressure.unwrap_or(0.0);
+                let plasticity = plasticity.unwrap_or(0.0);
+                let plasticity_threshold = plasticity_threshold.unwrap_or(0.0);
+                let bend_plasticity = bend_plasticity.unwrap_or(0.0);
+                let bend_plasticity_threshold = bend_plasticity_threshold.unwrap_or(0.0);
+                let bend_rest_from_geometry = bend_rest_from_geometry.unwrap_or(false);
+                let deform_damping = deform_damping.unwrap_or(0.0);
+                let bend_damping = bend_damping.unwrap_or(0.0);
+                // 0.0 adds nothing, so a scene predating these keys decodes
+                // to exactly today's isotropic behavior.
+                let bend_warp = bend_warp.unwrap_or(0.0);
+                let bend_weft = bend_weft.unwrap_or(0.0);
+                assert_ge!(deform_damping, 0.0, "Deformation damping must be non-negative");
+                assert_ge!(bend_damping, 0.0, "Bending damping must be non-negative");
+                assert_gt!(density, 0.0, "Density must be positive");
+                assert_gt!(area, 0.0, "Area must be positive");
+                assert_ge!(pressure, 0.0, "Pressure must be non-negative");
+                assert_ge!(friction, 0.0, "Friction must be non-negative");
+                assert_gt!(ghat, 0.0, "Contact gap must be positive");
+                // PDRD faces carry zero placeholders for elastic terms
+                // (young_mod, poiss_rat, bend, shrink) so the per-face
+                // expansion remains key-compatible with shells; their
+                // values are ignored by the elastic dispatch (gated on
+                // Model::Pdrd). Only validate the elastic terms on
+                // non-PDRD faces.
+                if model != Model::Pdrd {
+                    assert_gt!(young_mod, 0.0, "Young's modulus must be positive");
+                    assert_ge!(bend, 0.0, "Bend modulus must be non-negative");
+                    // The hinge stiffness is bend + warp*sin^2 + weft*cos^2
+                    // with sin^2 and cos^2 both non-negative, so keeping the
+                    // three terms non-negative is the whole condition: it
+                    // cannot go negative at any orientation, and the hinge
+                    // block stays PSD as SPD-by-assembly requires. A negative
+                    // input would flip the sign at some orientation and hand
+                    // the solver an indefinite block.
+                    assert_ge!(bend_warp, 0.0, "Warp bending stiffness must be non-negative");
+                    assert_ge!(bend_weft, 0.0, "Weft bending stiffness must be non-negative");
+                    assert_gt!(poiss_rat, 0.0, "Poisson's ratio must be positive");
+                    assert_lt!(poiss_rat, 0.5, "Poisson's ratio must be less than 0.5");
+                }
+                // The shrink factors scale the rest tangent matrix that
+                // `invert_rest_or_panic2` inverts, so a non-positive one makes
+                // that matrix singular and is reported as collinear geometry.
+                // Refuse it here, where the parameter can be named.
+                assert_gt!(shrink_x, 0.0, "Shrink factor along U must be positive");
+                assert_gt!(shrink_y, 0.0, "Shrink factor along V must be positive");
+                // The strain limiter's own gate is `strainlimit > 0`, so a
+                // negative value switches it off rather than tightening it.
+                // The rod loop already refuses one; the face loop is where a
+                // spatial map can deliver it per element.
+                assert_ge!(strainlimit, 0.0, "Strain limit must be non-negative");
+                let (mu, lambda) = if model == Model::Pdrd {
+                    // PDRD faces contribute no elastic energy; the
+                    // face elastic body (`energy/face_force.kernel.cpp`)
+                    // gates on `mu > 0.0f`, so zero here is the natural
+                    // skip-everything path.
+                    (0.0f32, 0.0f32)
+                } else {
+                    convert_prop(young_mod, poiss_rat)
+                };
+                // PDRD bodies use VOLUMETRIC mass (ρ·V) distributed
+                // over per-body vertices in the PDRD builder pass.
+                // Zero out the per-face contribution here so the
+                // face-mass aggregation in builder.rs doesn't
+                // double-count.
+                let mass = if model == Model::Pdrd {
+                    0.0f32
+                } else {
+                    density * area
+                };
+
+                // Create param and deduplicate
+                let param = FaceParam {
+                    model,
+                    mu,
+                    lambda,
+                    friction,
+                    ghat,
+                    offset,
+                    bend,
+                    strainlimit,
+                    shrink_x,
+                    shrink_y,
+                    pressure,
+                    plasticity,
+                    plasticity_threshold,
+                    bend_plasticity,
+                    bend_plasticity_threshold,
+                    bend_rest_from_geometry,
+                    deform_damping,
+                    bend_damping,
+                    bend_warp,
+                    bend_weft,
+                };
+                // One entry per face when a face material is animated, so
+                // `param_index` is the face index and stays valid however the
+                // values move; deduplicated otherwise, which is the whole
+                // point of the table for a static scene.
+                let param_idx = if expand_face {
+                    face_params.push(param);
+                    (face_params.len() - 1) as u32
+                } else {
+                    dedup_param(&mut face_param_map, &mut face_params, param)
+                };
+
+                FaceProp {
+                    area,
+                    mass,
+                    fixed: false,
+                    rest_excluded: false,
+                    collider: false,
+                    param_index: param_idx,
+                    // Derived in builder::build once the constraint set is
+                    // known; there are no pins here yet.
+                    pin_allow_intersection: false,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Build tet props and params with deduplication
+        let mut tet_param_map: HashMap<TetParam, u32> = HashMap::new();
+        let mut tet_params = Vec::new();
+        let tet = (0..self.tet.ncols())
+            .map(|i| {
+                let mut model = None;
+                let mut density = None;
+                let mut young_mod = None;
+                let mut poiss_rat = None;
+                let mut shrink = None;
+                let mut plasticity = None;
+                let mut plasticity_threshold = None;
+                let mut deform_damping = None;
+                for (name, value) in tet_param {
+                    if name == "model" {
+                        model = Some(as_model(value, i, name));
+                    } else if name == "density" {
+                        density = Some(as_value(value, i, name));
+                    } else if name == "young-mod" {
+                        young_mod = Some(as_value(value, i, name));
+                    } else if name == "poiss-rat" {
+                        poiss_rat = Some(as_value(value, i, name));
+                    } else if name == "shrink" {
+                        shrink = Some(as_value(value, i, name));
+                    } else if name == "pressure" {
+                        // Pressure is a tri-only parameter; ignore for tets.
+                    } else if name == "plasticity" {
+                        plasticity = Some(as_value(value, i, name));
+                    } else if name == "plasticity-threshold" {
+                        plasticity_threshold = Some(as_value(value, i, name));
+                    } else if name == "deformation-damping" {
+                        deform_damping = Some(as_value(value, i, name));
+                    } else if name == "bending-damping" {
+                        // Bending damping is a shell/rod-only key; tets have no
+                        // bending energy. The frontend clears it from the tet
+                        // param set, so this is a defensive ignore (mirrors the
+                        // tri-only "pressure" branch above).
+                    } else {
+                        panic!("Unknown tet parameter: {name}");
+                    }
+                }
+                let model = model.unwrap();
+                let density = density.unwrap();
+                let young_mod = young_mod.unwrap();
+                let poiss_rat = poiss_rat.unwrap();
+                let shrink = shrink.unwrap();
+                let plasticity = plasticity.unwrap_or(0.0);
+                let plasticity_threshold = plasticity_threshold.unwrap_or(0.0);
+                let deform_damping = deform_damping.unwrap_or(0.0);
+                assert_ge!(
+                    deform_damping,
+                    0.0,
+                    "Deformation damping must be non-negative"
+                );
+                let volume = tet_volume[i];
+                assert_gt!(density, 0.0, "Density must be positive");
+                assert_gt!(young_mod, 0.0, "Young's modulus must be positive");
+                assert_gt!(poiss_rat, 0.0, "Poisson's ratio must be positive");
+                assert_lt!(poiss_rat, 0.5, "Poisson's ratio must be less than 0.5");
+                assert_gt!(shrink, 0.0, "Shrink factor must be positive");
+                assert_gt!(volume, 0.0, "Volume must be positive");
+                let (mu, lambda) = convert_prop(young_mod, poiss_rat);
+                let mass = density * volume;
+
+                // Create param and deduplicate
+                let param = TetParam {
+                    model,
+                    mu,
+                    lambda,
+                    shrink,
+                    plasticity,
+                    plasticity_threshold,
+                    deform_damping,
+                };
+                let param_idx = dedup_param(&mut tet_param_map, &mut tet_params, param);
+
+                TetProp {
+                    mass,
+                    volume,
+                    fixed: false,
+                    rest_excluded: false,
+                    param_index: param_idx,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Props {
+            edge,
+            face,
+            tet,
+            edge_params,
+            face_params,
+            tet_params,
+            sand: self.sand_params(),
+            animated_materials: expand_face,
+        }
+    }
+
+    pub fn get_initial_velocity(&self) -> Matrix3xX<f32> {
+        self.vel.clone()
+    }
+
+    /// Build the constraint set for a step that runs from `prev_time` to
+    /// `time`. Pins are evaluated at `time` (the step's target end), and a
+    /// kinematic fix pin also records the displacement it covers from
+    /// `prev_time` in `FixPair::step_delta`, so the solver can stop it partway
+    /// along that displacement when the CCD line search truncates the step.
+    /// Pass `prev_time == time` for a standalone snapshot with no step.
+    pub fn make_constraint(&self, time: f64, prev_time: f64) -> Constraint {
+        let collision_mesh = if self.static_vert.ncols() > 0 {
+            let mut vert = self.static_vert.clone();
+            apply_displacement(&mut vert, &self.displacement, &self.static_vert_dmap);
+
+            // Build face props and params with deduplication
+            let mut face_param_map: HashMap<FaceParam, u32> = HashMap::new();
+            let mut face_params = Vec::new();
+            let face_props = (0..self.static_tri.ncols())
+                .map(|i| {
+                    let mut contact_gap = None;
+                    let mut contact_offset = None;
+                    let mut friction = None;
+                    for (name, value) in self.static_param.iter() {
+                        if name == "contact-gap" {
+                            contact_gap = Some(as_value(value, i, name));
+                        } else if name == "contact-offset" {
+                            contact_offset = Some(as_value(value, i, name));
+                        } else if name == "friction" {
+                            friction = Some(as_value(value, i, name));
+                        }
+                    }
+                    let area = super::triutils::area(&vert, &self.static_tri, i);
+                    let ghat = contact_gap.unwrap();
+                    let offset = contact_offset.unwrap();
+                    let friction = friction.unwrap();
+                    assert_gt!(area, 0.0, "Area of static triangle {} is zero", i);
+                    assert_gt!(ghat, 0.0, "Contact gap must be positive");
+
+                    // Create param and deduplicate
+                    let param = FaceParam {
+                        model: Model::default(),
+                        mu: 0.0,
+                        lambda: 0.0,
+                        friction,
+                        ghat,
+                        offset,
+                        bend: 0.0,
+                        strainlimit: 0.0,
+                        shrink_x: 1.0,
+                        shrink_y: 1.0,
+                        pressure: 0.0,
+                        plasticity: 0.0,
+                        plasticity_threshold: 0.0,
+                        bend_plasticity: 0.0,
+                        bend_plasticity_threshold: 0.0,
+                        bend_rest_from_geometry: false,
+                        deform_damping: 0.0,
+                        bend_damping: 0.0,
+                        // A static collider carries no bending energy at all
+                        // (bend is 0.0 above), so these add nothing.
+                        bend_warp: 0.0,
+                        bend_weft: 0.0,
+                    };
+                    let param_idx = dedup_param(&mut face_param_map, &mut face_params, param);
+
+                    FaceProp {
+                        area,
+                        mass: 0.0,
+                        fixed: false,
+                        rest_excluded: false,
+                        collider: false,
+                        param_index: param_idx,
+                        // Static collision-mesh face: driven, never pinned.
+                        pin_allow_intersection: false,
+                    }
+                })
+                .collect::<Vec<_>>();
+            make_collision_mesh(&vert, &self.static_tri, &face_props, &face_params)
+        } else {
+            CollisionMesh::new()
+        };
+        let calc_coefficient =
+            |time: f64, timings: &[f64], transition: &str| -> ([usize; 2], f32) {
+                if timings.is_empty() {
+                    ([0, 0], 1.0)
+                } else {
+                    let last_time = timings[timings.len() - 1];
+                    if time >= last_time {
+                        ([timings.len() - 1, timings.len() - 1], 1.0)
+                    } else {
+                        for i in 0..timings.len() - 1 {
+                            let t0 = timings[i];
+                            let t1 = timings[i + 1];
+                            if time >= t0 && time < t1 {
+                                let mut w = (time - t0) / (t1 - t0);
+                                if transition == "smooth" {
+                                    w = w * w * (3.0 - 2.0 * w);
+                                }
+                                return ([i, i + 1], w as f32);
+                            }
+                        }
+                        panic!("Failed to calculate coefficient")
+                    }
+                }
+            };
+        // Shared blend decision for the wall and sphere keyframe loops: a
+        // single keyframe holds at column 0 (non-kinematic), otherwise the
+        // pair (j, k) and weight w come from calc_coefficient (kinematic).
+        let blend_coeff = |timing: &[f64], transition: &str| -> (usize, usize, f32, bool) {
+            if timing.len() <= 1 {
+                assert_eq!(timing[0], 0.0);
+                (0, 0, 0.0, false)
+            } else {
+                let coeff = calc_coefficient(time, timing, transition);
+                (coeff.0[0], coeff.0[1], coeff.1, true)
+            }
+        };
+        let mut fix = Vec::new();
+        let mut pull = Vec::new();
+
+        for pin in self.pin.iter() {
+            // Check if this pin should be active at current time
+            if let Some(unpin_t) = pin.unpin_time {
+                if time >= unpin_t {
+                    continue; // Skip this pin, it's been unpinned
+                }
+            }
+
+            // If pin has ONLY torque operations, skip fix/pull; vertices are
+            // free to move and receive force from the torque kernel instead.
+            let torque_only = !pin.operations.is_empty()
+                && pin
+                    .operations
+                    .iter()
+                    .all(|op| matches!(op, PinOperation::Torque { .. }));
+            if torque_only {
+                continue;
+            }
+
+            for (i, &ind) in pin.index.iter().enumerate() {
+                let dx = self.displacement.column(self.vert_dmap[ind] as usize);
+
+                let mut kinematic = false;
+                let mut position: Vector3<f32> = self.vert.column(ind).into();
+
+                for op in pin.operations.iter() {
+                    let (new_pos, did_move) = apply_pin_op(op, position, i, time);
+                    position = new_pos;
+                    kinematic = kinematic || did_move;
+                }
+
+                // Run the same op chain at the step's start time to get the
+                // displacement this pin is scheduled to cover. `advance` walks a
+                // kinematic fix pin back along it when the line search truncates
+                // the step, so a driven collider advances in lockstep with the
+                // clock instead of jumping to the full step's pose and snapping
+                // back on the next step.
+                //
+                // What leaves here is the DIFFERENCE of the two posed positions,
+                // never either position itself: two nearby coordinates far from
+                // the origin cancel their leading digits, so a delta recovered
+                // downstream from an absolute pose would keep only round-off.
+                let step_delta = if kinematic {
+                    let mut start: Vector3<f32> = self.vert.column(ind).into();
+                    for op in pin.operations.iter() {
+                        let (new_pos, _) = apply_pin_op(op, start, i, prev_time);
+                        start = new_pos;
+                    }
+                    (position - start).map(f32::from)
+                } else {
+                    // A static pin holds still, so it has nowhere to be walked
+                    // back to.
+                    Vec3f::zeros()
+                };
+
+                // Per-vertex pull weight overrides the scalar when present.
+                // The decoder drops weight-~0 verts from `index`, so every
+                // member of a per-vertex-weighted holder has w > 0 and takes
+                // the pull branch (a zero weight here would otherwise route a
+                // vertex to the hard `fix` branch and lock it).
+                let w = pin
+                    .pull_weights
+                    .as_ref()
+                    .map(|v| v[i])
+                    .unwrap_or(pin.pull_w);
+
+                if w > 0.0 {
+                    pull.push(PullPair {
+                        position: position + dx,
+                        index: ind as u32,
+                        weight: w,
+                        allow_intersection: pin.allow_intersection,
+                    });
+                } else {
+                    fix.push(FixPair {
+                        position: position + dx,
+                        step_delta,
+                        ghat: self.args.constraint_ghat,
+                        index: ind as u32,
+                        kinematic,
+                        allow_intersection: pin.allow_intersection,
+                    });
+                }
+            }
+        }
+
+        // Build torque groups and vertex arrays (PCA + force computed on GPU)
+        // Group by pin_group_id (Blender vertex group) so all vertices from
+        // the same vertex group share one centroid and PCA axis.
+        let mut torque_groups: Vec<TorqueGroup> = Vec::new();
+        let mut torque_vertices: Vec<TorqueVertex> = Vec::new();
+        {
+            use std::collections::HashMap;
+            // Key: pin_group_id string → (group index, axis_component, magnitude, hint_vertex).
+            // The map is for lookup only: the groups are emitted in the order
+            // they are first seen (`group_info`, indexed by group), since the
+            // group order sets each group's id and vertex range on the device
+            // and must not follow a HashMap's per-process random seed.
+            let mut group_map: HashMap<String, (u32, u32, f32, usize)> = HashMap::new();
+            let mut group_verts: Vec<Vec<usize>> = Vec::new();
+            let mut group_info: Vec<(u32, f32, usize)> = Vec::new();
+
+            for pin in self.pin.iter() {
+                if let Some(unpin_t) = pin.unpin_time {
+                    if time >= unpin_t {
+                        continue;
+                    }
+                }
+                for op in pin.operations.iter() {
+                    if let PinOperation::Torque {
+                        axis_component,
+                        magnitude,
+                        hint_vertex,
+                        t_start,
+                        t_end,
+                    } = op
+                    {
+                        // Torque is full power inside window, zero outside
+                        if time < *t_start || time > *t_end {
+                            continue;
+                        }
+                        let key = pin.pin_group_id.clone();
+                        let gid = if let Some(&(existing, _, _, _)) = group_map.get(&key) {
+                            existing
+                        } else {
+                            let new_id = group_verts.len() as u32;
+                            group_map
+                                .insert(key, (new_id, *axis_component, *magnitude, *hint_vertex));
+                            group_verts.push(Vec::new());
+                            group_info.push((*axis_component, *magnitude, *hint_vertex));
+                            new_id
+                        };
+                        for &ind in pin.index.iter() {
+                            group_verts[gid as usize].push(ind);
+                        }
+                    }
+                }
+            }
+
+            // Build final arrays
+            for (gid, &(axis_component, magnitude, hint_vertex)) in group_info.iter().enumerate() {
+                let verts = &group_verts[gid];
+                let group_id = torque_groups.len() as u32;
+                let vertex_start = torque_vertices.len() as u32;
+                for &ind in verts.iter() {
+                    torque_vertices.push(TorqueVertex {
+                        magnitude,
+                        index: ind as u32,
+                        group_id,
+                    });
+                }
+                torque_groups.push(TorqueGroup {
+                    axis_component,
+                    vertex_start,
+                    vertex_count: verts.len() as u32,
+                    hint_vertex: hint_vertex as u32,
+                });
+            }
+        }
+
+        let stitch = {
+            let mut stitch = Vec::new();
+            for i in 0..self.stitch_ind.ncols() {
+                stitch.push(Stitch {
+                    index: Vec6u::from_iterator(
+                        self.stitch_ind.column(i).iter().map(|&x| x as u32),
+                    ),
+                    weight: Vec6f::from_iterator(self.stitch_w.column(i).iter().copied()),
+                    stiffness: self.stitch_stiffness[i],
+                    rest_length: self.stitch_rest_length[i],
+                    has_rest_length: u32::from(self.stitch_has_rest_length[i]),
+                });
+            }
+            stitch
+        };
+        let mut floor = Vec::new();
+        let mut sphere = Vec::new();
+        for wall in self.wall.iter() {
+            // Drop the wall from the contact set once it passes its active
+            // duration (opt-in via -1.0 sentinel).
+            if wall.active_duration >= 0.0 && (time as f32) >= wall.active_duration {
+                continue;
+            }
+            let normal = wall.normal;
+            let (j, k, w, kinematic) = blend_coeff(&wall.timing, &wall.transition);
+            let position = wall.position.column(j) * f32::from(1.0 - w)
+                + wall.position.column(k) * f32::from(w);
+            floor.push(Floor {
+                ground: position,
+                ghat: wall.contact_gap,
+                friction: wall.friction,
+                thickness: wall.thickness,
+                up: normal,
+                kinematic,
+            });
+        }
+        for s in self.sphere.iter() {
+            if s.active_duration >= 0.0 && (time as f32) >= s.active_duration {
+                continue;
+            }
+            let reverse = s.inverted;
+            let bowl = s.hemisphere;
+            let (j, k, w, kinematic) = blend_coeff(&s.timing, &s.transition);
+            let center = s.center.column(j) * f32::from(1.0 - w)
+                + s.center.column(k) * f32::from(w);
+            let radius = s.radius[j] * (1.0 - w) + s.radius[k] * w;
+            sphere.push(Sphere {
+                center,
+                ghat: s.contact_gap,
+                friction: s.friction,
+                radius,
+                thickness: s.thickness,
+                bowl,
+                reverse,
+                kinematic,
+            });
+        }
+        Constraint {
+            fix: CVec::from(&fix[..]),
+            pull: CVec::from(&pull[..]),
+            torque_groups: CVec::from(&torque_groups[..]),
+            torque_vertices: CVec::from(&torque_vertices[..]),
+            sphere: CVec::from(&sphere[..]),
+            floor: CVec::from(&floor[..]),
+            stitch: CVec::from(&stitch[..]),
+            mesh: collision_mesh,
+        }
+    }
+
+    /// Every dynamic-parameter key `update_param` below has an arm for.
+    ///
+    /// This is the whole set of SCENE-PARAMETER keys a `dyn()` schedule can
+    /// drive at runtime. `Scene::new` refuses a schedule naming anything
+    /// outside this list and `DYN_PARAM_PREFIXES` together. Adding an arm
+    /// below without adding its key here makes that arm unreachable, because
+    /// `update_param` skips every key that is not listed. The reverse, a key
+    /// listed with no arm written, trips the assert in `update_param` the
+    /// first time such a schedule is stepped. Both directions are guarded
+    /// by an assert rather than by a unit test because constructing a
+    /// `ParamSet` outside a real run means fabricating a 39-field `SimArgs`,
+    /// and a fixture that large goes stale faster than the pair it watches.
+    /// Namespaced dynamic-parameter prefixes, each consumed by its own loop
+    /// over `dyn_args` rather than by `update_param`.
+    ///
+    /// `dyn_param.txt` is a shared table, not a scene-parameter schedule: an
+    /// entry named `velocity:3` drives one object's velocity override and
+    /// never reaches `update_param` at all. A key carrying one of these
+    /// prefixes is validated by the loop that reads it (which parses the index
+    /// after the colon), so the check at load only has to recognize the
+    /// namespace.
+    pub const DYN_PARAM_PREFIXES: &'static [&'static str] = &[
+        "velocity:",
+        "angular_velocity:",
+        "angular_velocity_world:",
+        "collision_window:",
+    ];
+
+    pub const DYN_PARAM_KEYS: &'static [&'static str] = &[
+        "gravity",
+        "wind",
+        "air-density",
+        "air-friction",
+        "isotropic-air-friction",
+        "dt",
+        "playback",
+        "inactive-momentum",
+    ];
+
+    pub fn update_param(&self, _: &SimArgs, time: f64, param: &mut ParamSet) {
+        for (title, entries) in self.dyn_args.iter() {
+            // `dyn_args` is one table shared by five readers: this one plus the
+            // velocity, angular-velocity, world angular-velocity and
+            // collision-window loops, each of which owns a namespaced prefix.
+            // Skipping a key that is not a scene parameter is therefore
+            // correct, not a silent drop; the key has an owner, just not this
+            // loop. A key owned by NOBODY never reaches here: `Scene::new`
+            // refuses those at load, so by the time execution reaches here
+            // every remaining key belongs to someone.
+            if !Self::DYN_PARAM_KEYS.contains(&title.as_str()) {
+                continue;
+            }
+            // Clamp to this title's final keyframe independently. Use a
+            // per-title local so the clamp never carries over to titles
+            // processed later (each title has its own schedule).
+            let t = time.min(
+                entries
+                    .iter()
+                    .fold(0.0_f64, |max_time, (kt, _)| max_time.max(*kt)),
+            );
+            let mut apply = |val: DynParamValue| {
+                // The key is in DYN_PARAM_KEYS by the guard above, so a
+                // missing arm here is a defect in this file: either the arm
+                // was never written, or the keyframe's shape does not match
+                // its key (a vec3 on a scalar key). Both would otherwise leave
+                // a scene parameter that exports a schedule and never moves.
+                assert!(
+                    apply_dyn_param(title.as_str(), val, param),
+                    "dynamic parameter '{title}' has no runtime arm for a {} \
+                     value; DYN_PARAM_KEYS and update_param disagree",
+                    match val {
+                        DynParamValue::Vec3(_) => "vec3",
+                        DynParamValue::Scalar(_) => "scalar",
+                    }
+                );
+            };
+            // windows(2) yields no pairs for 0- or 1-element schedules, so
+            // there is no usize underflow on a bare/empty section. A single
+            // keyframe holds its value constant (mirrors the collider loops).
+            match entries.as_slice() {
+                [] => continue,
+                [(_, v)] => apply(*v),
+                many => {
+                    for w in many.windows(2) {
+                        let (t0, v0) = w[0];
+                        let (t1, v1) = w[1];
+                        if t >= t0 && t <= t1 {
+                            let delta_t = t1 - t0;
+                            let weight = if delta_t > 0.0 {
+                                (t - t0) / delta_t
+                            } else {
+                                1.0
+                            };
+                            apply(v0.lerp(v1, weight));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Vertices that are strict `fix` constraints at time `t0` (now exact
+    /// Dirichlet BCs, so their DOF are eliminated) and therefore excluded from
+    /// velocity overrides.
+    ///
+    /// This MUST agree, vertex for vertex, with the fix/pull split in the
+    /// pin-building loop, so it applies the same per-vertex rule: a per-vertex
+    /// `pull_weights` entry overrides the scalar `pull_w`, and `w == 0` is what
+    /// makes a vertex a fix. Classifying by the pin-level `pull_w` alone would
+    /// diverge for a holder that carries per-vertex weights, and a vertex
+    /// misclassified here gets a velocity override it must not have (its
+    /// position is prescribed) or is denied one it should get.
+    fn hard_pinned_at(&self, t0: f64) -> std::collections::HashSet<usize> {
+        self.pin
+            .iter()
+            .filter(|pin| pin.unpin_time.is_none_or(|ut| t0 < ut))
+            .filter(|pin| {
+                let torque_only = !pin.operations.is_empty()
+                    && pin
+                        .operations
+                        .iter()
+                        .all(|op| matches!(op, PinOperation::Torque { .. }));
+                !torque_only
+            })
+            .flat_map(|pin| {
+                pin.index.iter().enumerate().filter_map(move |(i, &ind)| {
+                    let w = pin
+                        .pull_weights
+                        .as_ref()
+                        .map(|v| v[i])
+                        .unwrap_or(pin.pull_w);
+                    (w == 0.0).then_some(ind)
+                })
+            })
+            .collect()
+    }
+
+    /// Dynamic (non-hard-pinned) vertices of displacement group `dmap_idx` at
+    /// time `t0`. Shared by the linear and angular velocity overrides.
+    fn override_indices(&self, dmap_idx: u32, t0: f64) -> Vec<u32> {
+        let hard_pinned = self.hard_pinned_at(t0);
+        self.vert_dmap
+            .iter()
+            .enumerate()
+            .filter(|(j, &dm)| dm == dmap_idx && !hard_pinned.contains(j))
+            .map(|(j, _)| j as u32)
+            .collect()
+    }
+
+    /// Compute velocity overrides that fire during this time step.
+    /// Only returns overrides for keyframes crossed in [time, time + dt).
+    /// Hard-pinned vertices (strict kinematic `fix` constraints) are excluded;
+    /// weak pins (pull) and torque-only pins still receive the override since
+    /// those vertices remain dynamic.
+    pub fn get_velocity_overrides(&self, time: f64, dt: f32) -> Vec<(Vec<u32>, f32, f32, f32)> {
+        let mut result = Vec::new();
+        let time_end = time + dt as f64;
+        for (title, entries) in self.dyn_args.iter() {
+            if !title.starts_with("velocity:") {
+                continue;
+            }
+            let dmap_idx: u32 = match title["velocity:".len()..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for (t0, v0) in entries.iter() {
+                // Fire only when this step crosses the keyframe time
+                if *t0 >= time && *t0 < time_end {
+                    if let DynParamValue::Vec3(vel) = v0 {
+                        let indices = self.override_indices(dmap_idx, *t0);
+                        if !indices.is_empty() {
+                            result.push((indices, vel[0] as f32, vel[1] as f32, vel[2] as f32));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute angular velocity overrides that fire during this time step.
+    /// Mirrors [`get_velocity_overrides`] but for `angular_velocity:` keys.
+    /// Each firing entry carries the chosen principal-axis index (0/1/2) and a
+    /// signed angular speed (rad/s) packed as `[pca_index, speed, _]`; the
+    /// actual world-space spin axis is resolved by the caller from the body's
+    /// live geometry so it tracks the simulated (rotated / deformed) pose.
+    /// Returns `(vertex indices, pca_index, speed_rad_per_s)`.
+    pub fn get_angular_velocity_overrides(&self, time: f64, dt: f32) -> Vec<(Vec<u32>, u32, f32)> {
+        let mut result = Vec::new();
+        let time_end = time + dt as f64;
+        for (title, entries) in self.dyn_args.iter() {
+            if !title.starts_with("angular_velocity:") {
+                continue;
+            }
+            let dmap_idx: u32 = match title["angular_velocity:".len()..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for (t0, v0) in entries.iter() {
+                if *t0 >= time && *t0 < time_end {
+                    if let DynParamValue::Vec3(vel) = v0 {
+                        let indices = self.override_indices(dmap_idx, *t0);
+                        if !indices.is_empty() {
+                            let pca_index = vel[0].round().clamp(0.0, 2.0) as u32;
+                            let speed = vel[1] as f32;
+                            result.push((indices, pca_index, speed));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Compute fixed world-axis angular velocity overrides that fire during
+    /// this time step. Counterpart to [`get_angular_velocity_overrides`] for
+    /// the World X/Y/Z and Custom axis modes: each entry already carries the
+    /// full world-space angular velocity vector `ω` (rad/s), so no per-firing
+    /// principal-axis resolution is needed. Returns `(vertex indices, ω)`.
+    pub fn get_angular_velocity_world_overrides(
+        &self,
+        time: f64,
+        dt: f32,
+    ) -> Vec<(Vec<u32>, [f32; 3])> {
+        let mut result = Vec::new();
+        let time_end = time + dt as f64;
+        for (title, entries) in self.dyn_args.iter() {
+            if !title.starts_with("angular_velocity_world:") {
+                continue;
+            }
+            let dmap_idx: u32 = match title["angular_velocity_world:".len()..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for (t0, v0) in entries.iter() {
+                if *t0 >= time && *t0 < time_end {
+                    if let DynParamValue::Vec3(w) = v0 {
+                        let indices = self.override_indices(dmap_idx, *t0);
+                        if !indices.is_empty() {
+                            result.push((indices, [w[0] as f32, w[1] as f32, w[2] as f32]));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Read and validate `<session>/dyn_param.txt`, or an empty table when
+    /// the session has none.
+    fn load_dyn_param(session: &str) -> DynParamTable {
+        let dyn_args_path = format!("{session}/dyn_param.txt");
+        let dyn_args = if std::path::Path::new(&dyn_args_path).exists() {
+            read_dyn_param(&dyn_args_path).unwrap()
+        } else {
+            Vec::new()
+        };
+        // Refuse a schedule the solver cannot honor, here at load, rather than
+        // stepping past it every frame. The frontend validates a `dyn()` key
+        // against the whole app-parameter registry, which is a much larger set
+        // than the one with a runtime arm, so a schedule on (say) `cg-tol`
+        // exports cleanly and then does nothing at all. Naming the key and the
+        // set is what turns "my keyframes had no effect" into a fixable
+        // message.
+        for (title, _) in dyn_args.iter() {
+            let known = Self::DYN_PARAM_KEYS.contains(&title.as_str())
+                || Self::DYN_PARAM_PREFIXES
+                    .iter()
+                    .any(|prefix| title.starts_with(prefix));
+            assert!(
+                known,
+                "dynamic parameter '{title}' is not animatable: the solver \
+                 honors a schedule for {:?}, or for a key namespaced {:?}. \
+                 Set it once instead, or remove the schedule.",
+                Self::DYN_PARAM_KEYS,
+                Self::DYN_PARAM_PREFIXES,
+            );
+        }
+        // An animated step size meets the same limit as a set one, at every
+        // keyframe, so a schedule cannot step past it partway through a run.
+        for (title, entries) in dyn_args.iter().filter(|(title, _)| title == "dt") {
+            for (time, value) in entries {
+                if let DynParamValue::Scalar(dt) = value {
+                    if let Err(refusal) = ppf_cts_core::datamodel::params::check_step_size(*dt) {
+                        panic!("dynamic parameter '{title}' at t = {time}: {refusal}");
+                    }
+                }
+            }
+        }
+        dyn_args
+    }
+
+    /// Re-read the scene-wide schedule a held run's caller rewrote.
+    ///
+    /// Every per-step reader of the table (`update_param` and the velocity
+    /// overrides) sees the new schedule from the next step on. The collision
+    /// windows are NOT rebuilt: their table is installed once at initialize,
+    /// so a schedule that adds or changes a `collision_window:` key is refused
+    /// here rather than silently ignored.
+    pub fn reload_dyn_param(&mut self, session: &str) {
+        let fresh = Self::load_dyn_param(session);
+        let windows = |table: &DynParamTable| -> Vec<String> {
+            table
+                .iter()
+                .filter(|(title, _)| title.starts_with("collision_window:"))
+                .map(|(title, entries)| format!("{title}{entries:?}"))
+                .collect()
+        };
+        assert!(
+            windows(&fresh) == windows(&self.dyn_args),
+            "a held run's updated dyn_param.txt changes a collision window; \
+             collision windows are installed once at initialize and cannot be \
+             changed mid-run"
+        );
+        self.dyn_args = fresh;
+    }
+
+    pub fn build_collision_window_table(&self) -> CollisionWindowTable {
+        // Single source of truth for the cap: the device side reads the
+        // flat window table with the same stride, which
+        // `utility/collision_window.kernel.cpp` documents.
+        const MAX_WINDOWS: usize = ppf_cts_core::datamodel::object::MAX_COLLISION_WINDOWS;
+
+        // Find all collision_window entries
+        let mut windows_by_dmap: HashMap<u32, Vec<(f64, f64)>> = HashMap::new();
+        for (title, entries) in self.dyn_args.iter() {
+            if !title.starts_with("collision_window:") {
+                continue;
+            }
+            let dmap_idx: u32 = match title["collision_window:".len()..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let all_wins: Vec<(f64, f64)> = entries
+                .iter()
+                .filter_map(|(t_start, v)| {
+                    if let DynParamValue::Scalar(t_end) = v {
+                        Some((*t_start, *t_end))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if all_wins.len() > MAX_WINDOWS {
+                // Loud: a FixedScene built outside the Python builder's
+                // ValueError guard reaches here, and silently dropping
+                // windows changes simulation results invisibly.
+                error!(
+                    "collision_window:{} has {} windows, exceeding the cap of {}; \
+                        extra windows are dropped",
+                    dmap_idx,
+                    all_wins.len(),
+                    MAX_WINDOWS
+                );
+            }
+            let wins: Vec<(f64, f64)> = all_wins.into_iter().take(MAX_WINDOWS).collect();
+            if !wins.is_empty() {
+                windows_by_dmap.insert(dmap_idx, wins);
+            }
+        }
+
+        if windows_by_dmap.is_empty() {
+            return CollisionWindowTable::empty();
+        }
+
+        let n_groups = self.displacement.ncols() as u32;
+
+        // Build flat window table: n_groups * MAX_WINDOWS * 2
+        let mut windows = vec![0.0f32; n_groups as usize * MAX_WINDOWS * 2];
+        let mut window_counts = vec![0u32; n_groups as usize];
+
+        for (&dm, wins) in &windows_by_dmap {
+            if (dm as usize) < n_groups as usize {
+                let count = wins.len().min(MAX_WINDOWS);
+                window_counts[dm as usize] = count as u32;
+                for (w, (t_start, t_end)) in wins.iter().enumerate().take(count) {
+                    windows[dm as usize * MAX_WINDOWS * 2 + w * 2] = *t_start as f32;
+                    windows[dm as usize * MAX_WINDOWS * 2 + w * 2 + 1] = *t_end as f32;
+                }
+            }
+        }
+
+        CollisionWindowTable {
+            vert_dmap: self.vert_dmap.clone(),
+            windows,
+            window_counts,
+            n_groups,
+            has_windows: true,
+        }
+    }
+
+    /// The initial vertices with per-vertex instancing displacement applied
+    /// (`self.vert + displacement[dmap]`), the base the simulation starts from.
+    fn displaced_vert(&self) -> Matrix3xX<f32> {
+        let mut vert = self.vert.clone();
+        apply_displacement(&mut vert, &self.displacement, &self.vert_dmap);
+        vert
+    }
+
+    /// Apply the same per-vertex instancing displacement to a rest-vertex set
+    /// that `make_mesh` applies to the static rest pose: masked entries take
+    /// `base + displacement`, unmasked entries fall back to the displaced
+    /// initial vert (`vert`). Shared by the static `rest_vert` and the
+    /// per-frame `rest_vert_schedule` so both stay in the same space.
+    fn displaced_rest(
+        &self,
+        base: &Matrix3xX<f32>,
+        vert: &Matrix3xX<f32>,
+        mask: &[bool],
+    ) -> Matrix3xX<f32> {
+        let mut rest = base.clone();
+        for (i, mut x) in rest.column_iter_mut().enumerate() {
+            if mask[i] {
+                x += self.displacement.column(self.vert_dmap[i] as usize);
+            } else {
+                x.copy_from(&vert.column(i));
+            }
+        }
+        rest
+    }
+
+    /// Per-body PDRD rows as written by the Python frontend. Each row
+    /// is 16 f32s: `[vertex_start, vertex_count, volume, centroid.x,
+    /// centroid.y, centroid.z, gram_inv[0..9 row-major],
+    /// mass_per_vertex]`. Empty Vec means "no PDRD bodies."
+    pub fn pdrd_body_rows(&self) -> &[f32] {
+        &self.pdrd_body_rows
+    }
+
+    /// Per-vertex 1-based PDRD body id (0 = not in any PDRD body).
+    pub fn pdrd_vert_index(&self) -> &[u32] {
+        &self.pdrd_vert_index
+    }
+
+    /// Flat list of global vertex indices participating in PDRD
+    /// bodies (body-major).
+    pub fn pdrd_vert_list(&self) -> &[u32] {
+        &self.pdrd_vert_list
+    }
+
+    /// Centered rest position per entry of `pdrd_vert_list`, packed
+    /// (x, y, z). Length 3 * pdrd_vert_list.len().
+    pub fn pdrd_rest_centered(&self) -> &[f32] {
+        &self.pdrd_rest_centered
+    }
+
+    /// The tie constraints: held vertices, controller slots and weights.
+    pub fn ties(&self) -> (&[u32], &[u32], &[f32]) {
+        (&self.tie_vertex, &self.tie_ind, &self.tie_w)
+    }
+
+    pub fn cosserat_edge(&self) -> &[u8] {
+        &self.cosserat_edge
+    }
+
+    pub fn cosserat_tilt(&self) -> &[f32] {
+        &self.cosserat_tilt
+    }
+
+    /// One normalized solver-space center-of-mass lock axis per displacement
+    /// group. Read it together with [`Self::translation_lock_modes`]: under
+    /// `TRANSLATION_LOCK_AXIS` a zero vector disables the group, and under
+    /// `TRANSLATION_LOCK_ALL` the axis is meaningless and is exactly zero
+    /// while the group IS locked.
+    pub fn translation_locks(&self) -> &[Vec3f] {
+        &self.translation_lock
+    }
+
+    /// One translation-lock mode per displacement group, aligned with
+    /// [`Self::translation_locks`]. `TRANSLATION_LOCK_AXIS` (0) holds the
+    /// center of mass on the line through its axis, `TRANSLATION_LOCK_ALL`
+    /// (1) holds it at a point. Zero is the mode value, NOT an off flag: the
+    /// enable bit is the axis under `TRANSLATION_LOCK_AXIS` and the mode
+    /// itself under `TRANSLATION_LOCK_ALL`.
+    pub fn translation_lock_modes(&self) -> &[u32] {
+        &self.translation_lock_mode
+    }
+
+    /// One normalized solver-space best-fit angular lock axis per displacement
+    /// group. Read it together with [`Self::rotation_lock_modes`] on the same
+    /// terms as the translation pair above: a zero vector disables the group
+    /// in the two axis modes, and is required in `ROTATION_LOCK_ALL`, where
+    /// the group is locked.
+    pub fn rotation_locks(&self) -> &[Vec3f] {
+        &self.rotation_lock
+    }
+
+    /// One rotation-lock mode per displacement group. `0` preserves only the
+    /// selected axis, `1` prohibits only the selected axis, and `2` forbids
+    /// rotation about every axis.
+    pub fn rotation_lock_modes(&self) -> &[u32] {
+        &self.rotation_lock_mode
+    }
+
+    /// Per-vertex displacement-group membership, shared with aggregate locks.
+    pub fn vert_dmap(&self) -> &[u32] {
+        &self.vert_dmap
+    }
+
+    pub fn make_mesh(&mut self) -> MeshSet {
+        let vert = self.displaced_vert();
+        // Capture the vertex count before `vert` is moved into the MeshSet so
+        // a faceless particle cloud sizes its neighbor tables to the real
+        // vertex buffer (see Mesh::new).
+        let n_vert = vert.ncols();
+        let rest_vertex = self
+            .rest_vert
+            .as_ref()
+            .map(|rv| self.displaced_rest(rv, &vert, &self.rest_vert_mask));
+        // Bending reference rest shape: same instancing-displacement
+        // treatment as `rest_vertex`, but gated on its own per-vertex mask
+        // (the objects that opted into a reference rest angle). Unmasked
+        // entries fall back to the displaced initial vert, so a hinge on a
+        // non-reference object computes the same angle whether or not any
+        // reference exists in the scene.
+        let bend_rest_vertex = self
+            .bend_rest_vert
+            .as_ref()
+            .map(|bv| self.displaced_rest(bv, &vert, &self.bend_rest_vert_mask));
+        MeshSet {
+            vertex: vert,
+            uv: self.uv.clone(),
+            mesh: SimMesh::new(
+                self.rod.clone(),
+                self.tri.clone(),
+                self.tet.clone(),
+                self.shell_count,
+                n_vert,
+            ),
+            rest_vertex,
+            bend_rest_vertex,
+            bend_rest_vertex_mask: self.bend_rest_vert_mask.clone(),
+            collider_vertex_mask: self.collider_vert_mask.clone(),
+            object_vertex_index: self.object_vert_index.clone(),
+            group_vertex_index: self.group_vert_index.clone(),
+            intersect_policy: self.intersect_policy.clone(),
+            start_link: self.start_link.clone(),
+        }
+    }
+
+    /// The streamed time-varying rest shape, if any: keyframe times (seconds)
+    /// and per-keyframe rest-vertex sets in the same coordinate space as
+    /// `make_mesh`'s `rest_vertex` (instancing displacement applied). The
+    /// backend recomputes `inv_rest` from each frame via
+    /// `builder::compute_inv_rest` and interpolates between them per step.
+    pub fn rest_shape_schedule(&self) -> Option<(Vec<f64>, Vec<Matrix3xX<f32>>)> {
+        let sched = self.rest_vert_schedule.as_ref()?;
+        let vert = self.displaced_vert();
+        let frames = sched
+            .frames
+            .iter()
+            .map(|f| self.displaced_rest(f, &vert, &self.rest_vert_mask))
+            .collect();
+        Some((sched.times.clone(), frames))
+    }
+
+    /// The animated bending reference rest shape, if any: keyframe times
+    /// (seconds) and per-keyframe vertex sets in the same space as
+    /// `make_mesh`'s `bend_rest_vertex` (instancing displacement applied,
+    /// unmasked entries at the displaced initial vert), with the per-vertex
+    /// mask that selects the hinges it drives. The backend measures each
+    /// keyframe's hinge rest angles with `builder::hinge_rest_angle` and
+    /// interpolates them per step.
+    pub fn bend_rest_schedule(
+        &self,
+    ) -> Option<(Vec<f64>, Vec<Matrix3xX<f32>>, &[bool])> {
+        let sched = self.bend_rest_vert_schedule.as_ref()?;
+        let vert = self.displaced_vert();
+        let frames = sched
+            .frames
+            .iter()
+            .map(|f| self.displaced_rest(f, &vert, &self.bend_rest_vert_mask))
+            .collect();
+        Some((sched.times.clone(), frames, &self.bend_rest_vert_mask))
+    }
+
+    /// Where the prescribed path puts each fix-pinned vertex at `time`, as
+    /// (vertex index, position). A fix pin is an exact Dirichlet BC, so its
+    /// vertex sits on a pose that is a known function of time; an output frame
+    /// can place it at the exact frame time instead of interpolating between
+    /// the two solver steps that happen to bracket it
+    /// (`Backend::write_frame_outputs`).
+    ///
+    /// Pull pins are deliberately absent: they are soft springs, so their
+    /// vertex is not expected to sit at the target and its offset from it is
+    /// neither small nor smooth. This mirrors, vertex for vertex, the
+    /// fix/pull split in `make_constraint` (a per-vertex `pull_weights` entry
+    /// overrides the scalar `pull_w`, and `w == 0` is what makes a fix). It is
+    /// only the pin evaluation, without the collision-mesh rebuild
+    /// `make_constraint` also does, because it runs per output frame rather
+    /// than per step.
+    pub fn fix_pin_positions(&self, time: f64) -> Vec<(u32, Vec3f)> {
+        let mut out = Vec::new();
+        for pin in self.pin.iter() {
+            if let Some(unpin_t) = pin.unpin_time {
+                if time >= unpin_t {
+                    continue;
+                }
+            }
+            let torque_only = !pin.operations.is_empty()
+                && pin
+                    .operations
+                    .iter()
+                    .all(|op| matches!(op, PinOperation::Torque { .. }));
+            if torque_only {
+                continue;
+            }
+            for (i, &ind) in pin.index.iter().enumerate() {
+                let w = pin
+                    .pull_weights
+                    .as_ref()
+                    .map(|v| v[i])
+                    .unwrap_or(pin.pull_w);
+                if w > 0.0 {
+                    continue;
+                }
+                let mut position: Vector3<f32> = self.vert.column(ind).into();
+                for op in pin.operations.iter() {
+                    let (new_pos, _) = apply_pin_op(op, position, i, time);
+                    position = new_pos;
+                }
+                let dx = self.displacement.column(self.vert_dmap[ind] as usize);
+                out.push((ind as u32, position + dx));
+            }
+        }
+        out
+    }
+
+    /// Whether the scene carries any display pins (see `DisplayPin`).
+    pub fn has_display_pins(&self) -> bool {
+        !self.display_pin.is_empty()
+    }
+
+    /// Evaluate every display pin at `time`. Returns, per block, whether it is
+    /// still pinned (a block at or past its `unpin_time` is not, and its
+    /// vertices are left to the tetrahedral surface), and the scripted position
+    /// of each of its vertices, blocks in order. A position is the block's
+    /// operations applied to its rest position plus its displacement group,
+    /// exactly as `fix_pin_positions` places a fix-pinned vertex. A block that
+    /// is no longer pinned still reports positions, so every frame has one
+    /// fixed layout.
+    pub fn display_pin_positions(&self, time: f64) -> (Vec<bool>, Vec<Vec3f>) {
+        let mut active = Vec::with_capacity(self.display_pin.len());
+        let mut out = Vec::new();
+        for pin in self.display_pin.iter() {
+            active.push(pin.unpin_time.is_none_or(|ut| time < ut));
+            for i in 0..pin.rest.ncols() {
+                let mut position: Vector3<f32> = pin.rest.column(i).into();
+                for op in pin.operations.iter() {
+                    let (new_pos, _) = apply_pin_op(op, position, i, time);
+                    position = new_pos;
+                }
+                let dx = self.displacement.column(pin.dmap[i] as usize);
+                out.push(position + dx);
+            }
+        }
+        (active, out)
+    }
+}
+
+// Bridge into the centralized primitive-typed helpers in
+// `ppf_cts_core::datamodel::pin_apply`. Both this solver crate and the
+// frontend's preview kernels call into the same module so preview and
+// simulation produce identical positions for the same input.
+use ppf_cts_core::datamodel::pin_apply;
+
+fn to_arr(v: Vector3<f32>) -> [f64; 3] {
+    [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]
+}
+
+/// Convert a driven pin position, checking it is representable.
+///
+/// This is the runtime counterpart to the ingest guards: every pin operation
+/// (move, spin, scale, keyframed transform) returns its result through here,
+/// once per driven vertex per Newton step. The ingest check cannot cover these,
+/// because what leaves the domain is not an input but an ACCUMULATED value: a
+/// move that keeps travelling, a spin whose reach is |center| + radius, or a
+/// scale that multiplies an offset position outward. All of those can start
+/// from representable inputs and walk out mid-run.
+fn from_arr(a: [f64; 3]) -> Vector3<f32> {
+    Vector3::new(
+        check_position_domain(a[0], "a driven pin position", "component 0") as f32,
+        check_position_domain(a[1], "a driven pin position", "component 1") as f32,
+        check_position_domain(a[2], "a driven pin position", "component 2") as f32,
+    )
+}
+
+/// Advance `position` through one pin operation as of `time`. Returns the new
+/// position and whether the op actually drives the vertex (i.e. the pin is
+/// kinematic at this time). Shared by `make_constraint`, which builds the
+/// step's constraint set, and by `fix_pin_positions`, which asks the same
+/// question at an arbitrary output-frame time.
+fn apply_pin_op(
+    op: &PinOperation,
+    position: Vector3<f32>,
+    vert_idx: usize,
+    time: f64,
+) -> (Vector3<f32>, bool) {
+    match op {
+        PinOperation::MoveBy {
+            delta,
+            t_start,
+            t_end,
+            transition,
+            bezier_handles,
+        } => {
+            if time < *t_start {
+                return (position, false);
+            }
+            let progress = if time >= *t_end {
+                1.0
+            } else {
+                pin_apply::progress_at(time, *t_start, *t_end, transition, *bezier_handles)
+            };
+            let d_col = delta.column(vert_idx);
+            let d = [
+                f64::from(d_col[0]),
+                f64::from(d_col[1]),
+                f64::from(d_col[2]),
+            ];
+            let r = pin_apply::move_by_step(to_arr(position), d, progress);
+            (from_arr(r), true)
+        }
+        PinOperation::MoveTo {
+            target,
+            t_start,
+            t_end,
+            transition,
+            bezier_handles,
+        } => {
+            if time < *t_start {
+                return (position, false);
+            }
+            if time >= *t_end {
+                return (target.column(vert_idx).into(), true);
+            }
+            let progress =
+                pin_apply::progress_at(time, *t_start, *t_end, transition, *bezier_handles);
+            let t_col = target.column(vert_idx);
+            let t = [
+                f64::from(t_col[0]),
+                f64::from(t_col[1]),
+                f64::from(t_col[2]),
+            ];
+            let r = pin_apply::move_to_step(to_arr(position), t, progress);
+            (from_arr(r), true)
+        }
+        PinOperation::Spin {
+            center,
+            axis,
+            angular_velocity,
+            t_start,
+            t_end,
+        } => {
+            // Gated on the ELAPSED time, not on the angle: a negative angular
+            // velocity turns the other way and its angle is negative once the
+            // spin has begun.
+            if time.min(*t_end) - *t_start <= 0.0 {
+                return (position, false);
+            }
+            let angle = pin_apply::spin_angle_rad(*angular_velocity as f64, *t_start, *t_end, time);
+            let c = to_arr(*center);
+            let ax = [axis[0] as f64, axis[1] as f64, axis[2] as f64];
+            let r = pin_apply::spin_step(to_arr(position), c, ax, angle);
+            (from_arr(r), true)
+        }
+        PinOperation::Scale {
+            center,
+            factor,
+            t_start,
+            t_end,
+            transition,
+            bezier_handles,
+        } => {
+            if time < *t_start {
+                return (position, false);
+            }
+            let cur = pin_apply::scale_factor_at(
+                time,
+                *t_start,
+                *t_end,
+                *factor as f64,
+                transition,
+                *bezier_handles,
+            );
+            let r = pin_apply::scale_step(to_arr(position), to_arr(*center), cur);
+            (from_arr(r), true)
+        }
+        PinOperation::Torque { .. } => {
+            // Torque is a force, not kinematic. Handled separately.
+            (position, false)
+        }
+        PinOperation::TransformKeyframes {
+            local,
+            times,
+            translations,
+            quaternions,
+            scales,
+            interps,
+            handles,
+            rest_t,
+        } => {
+            if times.is_empty() {
+                return (position, false);
+            }
+            // Evaluate the sparse TRS keyframe timeline through the shared core
+            // helper so this branch stays bit-identical with the frontend
+            // preview path (slerp on Q, optional Bezier easing,
+            // R*S*local + T - rest_t).
+            let lv = local.column(vert_idx);
+            let l = [f64::from(lv[0]), f64::from(lv[1]), f64::from(lv[2])];
+            let out = ppf_cts_core::datamodel::quat::transform_keyframes_step(
+                l,
+                times,
+                translations,
+                quaternions,
+                scales,
+                interps,
+                handles,
+                *rest_t,
+                time,
+            );
+            (from_arr(out), true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pin_op_tests {
+    use super::*;
+
+    fn spin(angular_velocity: f32) -> PinOperation {
+        PinOperation::Spin {
+            center: from_arr([0.0, 0.0, 0.0]),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            angular_velocity,
+            t_start: 1.0,
+            t_end: 2.0,
+        }
+    }
+
+    #[test]
+    fn a_spin_waits_for_its_start() {
+        let (p, active) = apply_pin_op(&spin(90.0), from_arr([1.0, 0.0, 0.0]), 0, 0.5);
+        assert!(!active);
+        assert_eq!(to_arr(p), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_negative_angular_velocity_turns_the_other_way() {
+        // One second at -90 deg/s about +z carries (1, 0, 0) to (0, -1, 0).
+        let (p, active) = apply_pin_op(&spin(-90.0), from_arr([1.0, 0.0, 0.0]), 0, 2.0);
+        let p = to_arr(p);
+        assert!(active);
+        assert!(p[0].abs() < 1e-6 && (p[1] + 1.0).abs() < 1e-6, "{p:?}");
+        let (q, _) = apply_pin_op(&spin(90.0), from_arr([1.0, 0.0, 0.0]), 0, 2.0);
+        let q = to_arr(q);
+        assert!(q[0].abs() < 1e-6 && (q[1] - 1.0).abs() < 1e-6, "{q:?}");
+    }
+}
+
+#[cfg(test)]
+mod lock_axis_tests {
+    use super::*;
+
+    #[test]
+    fn optional_lock_axes_default_to_disabled() {
+        let axes = decode_optional_lock_axes(None, 2, "rotation_lock.bin");
+        assert_eq!(axes, vec![Vec3f::zeros(), Vec3f::zeros()]);
+    }
+
+    #[test]
+    fn lock_axes_keep_zero_and_normalize_unit_values() {
+        let axes = decode_optional_lock_axes(
+            Some(vec![0.0, 0.0, 0.0, 0.0, 0.6, 0.8]),
+            2,
+            "rotation_lock.bin",
+        );
+        assert_eq!(axes[0], Vec3f::zeros());
+        assert!((axes[1] - Vec3f::new(0.0, 0.6, 0.8)).norm() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn lock_axes_reject_malformed_data() {
+        assert!(std::panic::catch_unwind(|| {
+            decode_optional_lock_axes(Some(vec![0.0, 0.0]), 1, "rotation_lock.bin")
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            decode_optional_lock_axes(Some(vec![2.0, 0.0, 0.0]), 1, "rotation_lock.bin")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn optional_rotation_lock_modes_default_to_allow_only() {
+        assert_eq!(
+            decode_optional_rotation_lock_modes(None, 2, "rotation_lock_mode.bin"),
+            vec![ROTATION_LOCK_ALLOW_ONLY, ROTATION_LOCK_ALLOW_ONLY]
+        );
+    }
+
+    #[test]
+    fn translation_lock_modes_default_to_the_axis_mode() {
+        // An absent file must decode to the single-axis behavior, or a session
+        // written before the mode table existed would change meaning.
+        assert_eq!(
+            decode_optional_translation_lock_modes(None, 2, "translation_lock_mode.bin"),
+            vec![TRANSLATION_LOCK_AXIS, TRANSLATION_LOCK_AXIS]
+        );
+        assert_eq!(
+            decode_optional_translation_lock_modes(
+                Some(vec![TRANSLATION_LOCK_ALL, TRANSLATION_LOCK_AXIS]),
+                2,
+                "translation_lock_mode.bin",
+            ),
+            vec![TRANSLATION_LOCK_ALL, TRANSLATION_LOCK_AXIS]
+        );
+        assert!(std::panic::catch_unwind(|| {
+            decode_optional_translation_lock_modes(Some(vec![2]), 1, "translation_lock_mode.bin")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn all_axes_mode_requires_an_exactly_zero_axis() {
+        // The canonical-record rule. A stale axis left beside an all-axes mode
+        // is the one way two encoders could spell the same lock differently,
+        // and every enable test downstream would then have to agree about
+        // which spelling wins.
+        assert_lock_modes_match_axes(
+            &[Vec3f::zeros(), Vec3f::new(1.0, 0.0, 0.0)],
+            &[TRANSLATION_LOCK_ALL, TRANSLATION_LOCK_AXIS],
+            TRANSLATION_LOCK_ALL,
+            "translation_lock.bin",
+            "translation_lock_mode.bin",
+        );
+        assert!(std::panic::catch_unwind(|| {
+            assert_lock_modes_match_axes(
+                &[Vec3f::new(1.0, 0.0, 0.0)],
+                &[TRANSLATION_LOCK_ALL],
+                TRANSLATION_LOCK_ALL,
+                "translation_lock.bin",
+                "translation_lock_mode.bin",
+            )
+        })
+        .is_err());
+        // An axis mode carrying a zero axis is DISABLED, not malformed, so it
+        // must pass: that is how a partially locked scene spells its unlocked
+        // groups.
+        assert_lock_modes_match_axes(
+            &[Vec3f::zeros()],
+            &[TRANSLATION_LOCK_AXIS],
+            TRANSLATION_LOCK_ALL,
+            "translation_lock.bin",
+            "translation_lock_mode.bin",
+        );
+    }
+
+    #[test]
+    fn rotation_lock_modes_reject_malformed_data() {
+        assert_eq!(
+            decode_optional_rotation_lock_modes(
+                Some(vec![ROTATION_LOCK_ALLOW_ONLY, ROTATION_LOCK_PROHIBIT_AXIS]),
+                2,
+                "rotation_lock_mode.bin",
+            ),
+            vec![ROTATION_LOCK_ALLOW_ONLY, ROTATION_LOCK_PROHIBIT_AXIS]
+        );
+        // 2 is ROTATION_LOCK_ALL and must DECODE, so the rejection case moves
+        // to the first value past the admissible set.
+        assert_eq!(
+            decode_optional_rotation_lock_modes(
+                Some(vec![ROTATION_LOCK_ALL]),
+                1,
+                "rotation_lock_mode.bin",
+            ),
+            vec![ROTATION_LOCK_ALL]
+        );
+        assert!(std::panic::catch_unwind(|| {
+            decode_optional_rotation_lock_modes(Some(vec![3]), 1, "rotation_lock_mode.bin")
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            decode_optional_rotation_lock_modes(Some(vec![0]), 2, "rotation_lock_mode.bin")
+        })
+        .is_err());
+    }
+}

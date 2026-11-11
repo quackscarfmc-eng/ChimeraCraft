@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Generator for the JupyterLab Python API parameter / log reference pages.
+
+Emits three auto-generated pages under ``docs/jupyterlab_api/``:
+
+* ``simulation_parameters.rst`` from :func:`frontend._param_.app_param`
+* ``material_parameters.rst`` from :func:`frontend._param_.object_param`
+* ``log_channels.rst`` from the ``//``-comment blocks parsed out of
+  ``crates/`` ``.cu`` / ``.rs`` sources by
+  :meth:`frontend._parse_.CppRustDocStringParser.get_logging_docstrings`
+
+Both ``_param_.py`` and ``_parse_.py`` wrap the ``_ppf_cts_py`` PyO3
+extension (the parameter defaults live in
+``crates/ppf-cts-core/src/datamodel/params.rs``; the log-channel scanner
+in ``crates/ppf-cts-core/src/parsers.rs``). ``docs/build.sh`` runs
+``cargo build --release -p ppf-cts-py`` before invoking this script, and
+the cdylib is loaded below by absolute path rather than installed.
+
+Run from anywhere::
+
+    python docs/generate_frontend_params_reference.py
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import ModuleType
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DOCS_DIR = REPO_ROOT / "docs"
+OUT_DIR = DOCS_DIR / "jupyterlab_api"
+CRATES_DIR = REPO_ROOT / "crates"
+
+
+def _escape_rst(text: str) -> str:
+    """Escape bare ``|`` so docutils does not read it as a substitution ref.
+
+    Parameter descriptions contain expressions like ``|S-1|`` and
+    ``|θ-θ_rest|`` which RST would otherwise parse as substitution
+    references and fail the ``-W`` build.
+    """
+    return text.replace("|", r"\|")
+
+
+def _render_param_table(name: str, rows: list[tuple[str, str]]) -> list[str]:
+    out: list[str] = [f"{name}", "-" * len(name), "", ".. list-table::", ""]
+    for label, value in rows:
+        out.append(f"   * - {label}")
+        out.append(f"     - {_escape_rst(value)}")
+    out.append("")
+    return out
+
+
+def _render_global(param_mod: ModuleType) -> str:
+    params = param_mod.app_param()
+    title = "⚙️ Simulation Parameters"
+    lines: list[str] = [
+        title,
+        "=" * (len(title) + 4),
+        "",
+        ".. This file is auto-generated from "
+        "``crates/ppf-cts-core/src/datamodel/params.rs``.",
+        ".. Regenerate via: python docs/generate_frontend_params_reference.py",
+        "",
+        "Application-wide simulation parameters. Accessed via "
+        ":meth:`frontend.App.get_default_param` and overridden per session "
+        "with ``session.param.set(key, value)`` / ``session.param.get(key)`` "
+        "(see :class:`frontend.ParamManager`). Keys use hyphens, not "
+        "underscores.",
+        "",
+    ]
+    for name, (value, short_desc, long_desc) in params.items():
+        rows = [
+            ("Key", f"``{name}``"),
+            ("Default", f"``{value!r}``"),
+            ("Label", short_desc),
+        ]
+        if long_desc:
+            rows.append(("Description", long_desc))
+        lines.extend(_render_param_table(name, rows))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_objects(param_mod: ModuleType) -> str:
+    obj_types = ("tri", "tet", "rod", "pdrd", "points")
+    all_params = {t: param_mod.object_param(t) for t in obj_types}
+
+    all_names: list[str] = []
+    seen: set[str] = set()
+    for t in obj_types:
+        for name in all_params[t]:
+            if name not in seen:
+                seen.add(name)
+                all_names.append(name)
+
+    title = "🔑 Material Parameter Keys"
+    lines: list[str] = [
+        title,
+        "=" * (len(title) + 4),
+        "",
+        ".. This file is auto-generated from "
+        "``crates/ppf-cts-core/src/datamodel/params.rs``.",
+        ".. Regenerate via: python docs/generate_frontend_params_reference.py",
+        "",
+        "Per-object material parameters. Set via ``object.param.set(key, "
+        "value)`` on a :class:`frontend.Object`. The solver exposes five "
+        "element types, each with its own defaults:",
+        "",
+        "- ``tri``: triangle shells (cloth).",
+        "- ``tet``: tetrahedral solids.",
+        "- ``rod``: rod / edge elements.",
+        "- ``pdrd``: exactly-rigid PDRD bodies built from a surface mesh.",
+        "- ``points``: granular (sand) particle clouds.",
+        "",
+        "``(not applicable)`` in a default column means the given element "
+        "type does not expose that parameter.",
+        "",
+    ]
+    for name in all_names:
+        rows: list[tuple[str, str]] = [("Key", f"``{name}``")]
+        short_desc: str | None = None
+        long_desc: str | None = None
+        for t in obj_types:
+            entry = all_params[t].get(name)
+            if entry is None:
+                rows.append((f"Default ({t})", "(not applicable)"))
+                continue
+            value, sd, ld = entry
+            rows.append((f"Default ({t})", f"``{value!r}``"))
+            if short_desc is None:
+                short_desc = sd
+                long_desc = ld
+        if short_desc:
+            rows.append(("Label", short_desc))
+        if long_desc:
+            rows.append(("Description", long_desc))
+        lines.extend(_render_param_table(name, rows))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_logs(parse_mod: ModuleType) -> str:
+    if not CRATES_DIR.is_dir():
+        print(
+            f"generate_frontend_params_reference: missing crates/ at {CRATES_DIR}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    entries = parse_mod.CppRustDocStringParser.get_logging_docstrings(
+        str(CRATES_DIR)
+    )
+    title = "📡 Log Channels"
+    lines: list[str] = [
+        title,
+        "=" * (len(title) + 4),
+        "",
+        ".. This file is auto-generated from ``crates/`` ``.cu`` / "
+        "``.rs`` sources.",
+        ".. Regenerate via: python docs/generate_frontend_params_reference.py",
+        "",
+        "Named log streams emitted by the solver "
+        "(the ``log::mark`` calls in the solver's Rust sources). Pull a "
+        "channel out of a finished session with "
+        "``session.get.log.numbers(name)`` for ``(x, y)`` pairs or "
+        "``session.get.log.number(name)`` for the latest scalar; "
+        "``session.get.log.stdout()`` / ``stderr()`` return the raw text "
+        "streams. See :class:`frontend.SessionGet`.",
+        "",
+    ]
+    if not entries:
+        lines.append("*(No logging docstrings found.)*")
+        lines.append("")
+    for name, doc in entries.items():
+        rows: list[tuple[str, str]] = []
+        for key, value in doc.items():
+            if key == "filename" or not value:
+                continue
+            rows.append((key, value))
+        lines.extend(_render_param_table(name, rows))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    # Bind directly to the `_ppf_cts_py` extension. The
+    # Python wrappers in `frontend/_param_.py` and `frontend/_parse_.py`
+    # are thin pass-throughs to these same symbols, but importing
+    # `frontend.*` here would trigger `frontend/__init__.py`, which
+    # pulls in pythreejs / numba / etc.; we don't want those weights
+    # in the docs venv. Source of truth is still the Rust crate.
+    # Load the tree-local cdylib directly by absolute path (built by
+    # `cargo build --release -p ppf-cts-py` into target/<profile>/), mirroring
+    # frontend/__init__.py. There is no maturin wheel installed in the venv.
+    import importlib.machinery as _mach  # noqa: PLC0415
+    import importlib.util as _ilu  # noqa: PLC0415
+
+    if sys.platform == "darwin":
+        _libname = "lib_ppf_cts_py.dylib"
+    elif sys.platform == "win32":
+        _libname = "_ppf_cts_py.dll"
+    else:
+        _libname = "lib_ppf_cts_py.so"
+    _libpath = None
+    for _profile in ("release", "debug"):
+        _cand = REPO_ROOT / "target" / _profile / _libname
+        if _cand.exists():
+            _libpath = str(_cand)
+            break
+    if _libpath is None:
+        raise SystemExit(
+            f"_ppf_cts_py cdylib ({_libname}) not found under "
+            f"{REPO_ROOT / 'target'}/(release|debug)/. "
+            "Build it with `cargo build --release -p ppf-cts-py`."
+        )
+    _loader = _mach.ExtensionFileLoader("_ppf_cts_py", _libpath)
+    _spec = _ilu.spec_from_file_location("_ppf_cts_py", _libpath, loader=_loader)
+    ext = _ilu.module_from_spec(_spec)  # noqa: PLC0415
+    _loader.exec_module(ext)
+
+    class param_mod:  # noqa: N801: mimics module shape for renderers below
+        app_param = staticmethod(ext.app_param_dict)
+        object_param = staticmethod(ext.object_param_dict)
+
+    class parse_mod:  # noqa: N801
+        class CppRustDocStringParser:
+            get_logging_docstrings = staticmethod(ext.get_logging_docstrings)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    outputs: list[tuple[Path, str]] = [
+        (OUT_DIR / "simulation_parameters.rst", _render_global(param_mod)),
+        (OUT_DIR / "material_parameters.rst", _render_objects(param_mod)),
+        (OUT_DIR / "log_channels.rst", _render_logs(parse_mod)),
+    ]
+    for path, body in outputs:
+        path.write_text(body)
+        print(f"wrote {path.relative_to(REPO_ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

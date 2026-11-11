@@ -1,0 +1,579 @@
+# File: group_ops.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import bpy  # pyright: ignore
+
+from bpy.types import Operator  # pyright: ignore
+from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_
+
+from ...models.collection_utils import safe_update_index
+from ...models.groups import get_addon_data
+from ..state import (
+    N_MAX_GROUPS,
+    ObjectGroup,
+    assign_display_indices,
+    find_available_group_slot,
+    iterate_active_object_groups,
+)
+from .utils import cleanup_group_references_for_object, get_group_from_index, reset_object_display
+
+
+class OBJECT_OT_CreateGroup(Operator):
+    """Create a new dynamics group"""
+
+    bl_idname = "object.create_group"
+    bl_label = "Create Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        slot_index = find_available_group_slot(scene)
+        if slot_index is None:
+            self.report({"WARNING"}, iface_("Maximum number of groups reached"))
+            return {"CANCELLED"}
+
+        prop_name = f"object_group_{slot_index}"
+        group: ObjectGroup = getattr(get_addon_data(scene), prop_name)
+        group.reset_to_defaults()
+        group.active = True
+        group.ensure_uuid()
+        # Don't set name - leave it empty so UI shows "Group N" dynamically
+
+        # Publish which group this call created. Callers cannot recover it by
+        # scanning: the slot allocated is the lowest free one, so once any
+        # group has been deleted it is no longer the highest active slot, and
+        # a scan would hand back some other group to be renamed and configured.
+        get_addon_data(scene).state.current_group_uuid = group.uuid
+
+        assign_display_indices(scene)
+
+        # Update overlays when creating a new group
+        from .overlay import apply_object_overlays
+
+        apply_object_overlays()
+
+        return {"FINISHED"}
+
+
+class OBJECT_OT_DeleteGroup(Operator):
+    """Delete the active group"""
+
+    bl_idname = "object.delete_group"
+    bl_label = "Delete Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(options={'HIDDEN'})  # pyright: ignore
+
+    def invoke(self, context, event):
+        group = get_group_from_index(context.scene, self.group_index)
+        if group and len(group.assigned_objects) > 0:
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
+
+    def execute(self, context):
+        from .overlay import apply_object_overlays
+
+        scene = context.scene
+        group = get_group_from_index(scene, self.group_index)
+        if group is None:
+            self.report({"ERROR"}, iface_("Group not found or not active"))
+            return {"CANCELLED"}
+
+        # Reset object display properties
+        for obj_ref in group.assigned_objects:
+            from ...core.uuid_registry import resolve_assigned
+            obj = resolve_assigned(obj_ref)
+            if obj:
+                reset_object_display(obj)
+
+        # Delete the group by resetting to defaults (which now sets active=False)
+        group.reset_to_defaults()
+        assign_display_indices(scene)
+        apply_object_overlays()
+
+        return {"FINISHED"}
+
+
+class OBJECT_OT_DuplicateGroup(Operator):
+    """Duplicate a dynamics group (material params only, no objects or pins)"""
+
+    bl_idname = "object.duplicate_group"
+    bl_label = "Duplicate Group"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(options={'HIDDEN'})  # pyright: ignore
+
+    @staticmethod
+    def _next_name(name: str) -> str:
+        """Generate incremented name: foo -> foo-1, foo-1 -> foo-2."""
+        import re
+
+        m = re.match(r"^(.*)-(\d+)$", name)
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)) + 1}"
+        return f"{name}-1" if name else ""
+
+    def execute(self, context):
+        from ...core.profile import apply_material_profile, read_material_profile
+        from .overlay import apply_object_overlays
+
+        scene = context.scene
+        src = get_group_from_index(scene, self.group_index)
+        if src is None:
+            self.report({"ERROR"}, iface_("Source group not found"))
+            return {"CANCELLED"}
+
+        slot_index = find_available_group_slot(scene)
+        if slot_index is None:
+            self.report({"WARNING"}, iface_("Maximum number of groups reached"))
+            return {"CANCELLED"}
+
+        addon_data = get_addon_data(scene)
+        dst = getattr(addon_data, f"object_group_{slot_index}")
+        dst.reset_to_defaults()
+        dst.active = True
+        dst.ensure_uuid()
+        dst.name = self._next_name(src.name)
+
+        # Copy material params only
+        mat_data = read_material_profile(src)
+        apply_material_profile(mat_data, dst)
+
+        assign_display_indices(scene)
+        apply_object_overlays()
+        return {"FINISHED"}
+
+
+class OBJECT_OT_DeleteAllGroups(Operator):
+    """Delete all groups"""
+
+    bl_idname = "object.delete_all_groups"
+    bl_label = "Delete All Groups"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        # iterate_active_object_groups already yields only active groups,
+        # so poll is True iff it yields at least one.
+        return next(iterate_active_object_groups(context.scene), None) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        from .overlay import apply_object_overlays
+
+        scene = context.scene
+
+        for i in range(N_MAX_GROUPS):
+            prop_name = f"object_group_{i}"
+            group: ObjectGroup | None = getattr(get_addon_data(scene), prop_name, None)
+            if group and group.active:
+                for obj_ref in group.assigned_objects:
+                    from ...core.uuid_registry import resolve_assigned
+                    obj = resolve_assigned(obj_ref)
+                    if obj:
+                        reset_object_display(obj)
+
+                group.reset_to_defaults()
+
+        get_addon_data(scene).state.current_group_uuid = ""
+        apply_object_overlays()
+
+        return {"FINISHED"}
+
+
+def _apply_hair_curves_defaults(group, obj, obj_uuid, is_first_object) -> list:
+    """Set what a Hair Curves object joining a Rod group implies, and return
+    one line per setting made so the operator can report it.
+
+    Three things about hair are already said by the object itself, so the
+    artist is not asked to say them again:
+
+    - Hair attached to a surface (``Curves.surface``) is held at its roots.
+      The ``Roots`` pin joins the pin list, where it can be removed.
+    - A groom is the shape the hair rests in. A group this object is the
+      first member of takes its rest angle from the initial geometry, so the
+      strands do not straighten.
+    - A strand is far thinner than anything a contact offset is meant to
+      describe. A group this object is the first member of takes a zero
+      contact offset, so the contact gap alone keeps a strand off the scalp
+      and off its neighbors. The offset a new Rod group starts with is the
+      radius of a rope, and hair combed closer to the head than that would
+      start inside it.
+
+    A group that already holds objects keeps the settings chosen for them.
+    """
+    from ...core.hair_curves import ROOTS_PIN_NAME
+    from ...core.uuid_registry import compute_vg_hash
+    from ...models.groups import encode_vertex_group_identifier
+    from .pin_ops import pin_already_exists
+
+    made = []
+    if obj.data.surface is not None and not pin_already_exists(
+        group, obj_uuid, ROOTS_PIN_NAME,
+    ):
+        pin = group.pin_vertex_groups.add()
+        pin.name = encode_vertex_group_identifier(obj.name, ROOTS_PIN_NAME)
+        pin.object_uuid = obj_uuid
+        pin.vg_hash = str(compute_vg_hash(obj, ROOTS_PIN_NAME))
+        made.append(
+            iface_(
+                "'{name}' is attached to '{surface}', so its roots are pinned"
+            ).format(name=obj.name, surface=obj.data.surface.name)
+        )
+    if is_first_object and group.bend_rest_angle_source == "FLAT":
+        group.bend_rest_angle_source = "FROM_GEOMETRY"
+        made.append(
+            iface_(
+                "Rest Angle set to From Initial Geometry so '{name}' keeps "
+                "its groom"
+            ).format(name=obj.name)
+        )
+    if is_first_object and (
+        group.contact_offset != 0.0 or group.contact_offset_rat != 0.0
+    ):
+        group.contact_offset = 0.0
+        group.contact_offset_rat = 0.0
+        made.append(
+            iface_(
+                "Contact Offset set to zero: a strand of '{name}' is held "
+                "off other surfaces by the Contact Gap alone"
+            ).format(name=obj.name)
+        )
+    return made
+
+
+class OBJECT_OT_AddObjectsToGroup(Operator):
+    """Add selected objects to the active group"""
+
+    bl_idname = "object.add_objects_to_group"
+    bl_label = "Add Selected Objects"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(options={'HIDDEN'})  # pyright: ignore
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.selected_objects) > 0
+
+    def execute(self, context):
+        from .overlay import apply_object_overlays
+
+        scene = context.scene
+        group = get_group_from_index(scene, self.group_index)
+        if group is not None:
+            from ...core.uuid_registry import get_or_create_object_uuid
+            existing_uuids = {a.uuid for a in group.assigned_objects if a.uuid}
+            group_uuid = group.ensure_uuid()
+
+            from ...core.utils import (
+                count_duplicate_faces,
+                find_linked_duplicate_siblings,
+            )
+            for obj in list(context.selected_objects):
+                # A ROD group also takes legacy Curves and Hair Curves,
+                # both of which are simulated as rods.
+                is_acceptable = obj.type == "MESH" or (
+                    obj.type in ("CURVE", "CURVES")
+                    and group.object_type == "ROD"
+                )
+                obj_uid = get_or_create_object_uuid(obj)
+                if not obj_uid:
+                    self.report(
+                        {"WARNING"},
+                        iface_("Object '{name}' is library-linked and cannot be assigned").format(name=obj.name),
+                    )
+                    continue
+                if not is_acceptable or obj_uid in existing_uuids:
+                    continue
+
+                # A SAND group accepts ONLY a committed particle mesh: a
+                # faceless cloud of loose vertices (grain centers) with the
+                # ``particle_mesh`` stamp, no polygons and no edges. A
+                # raw solid mesh must be converted first (Convert To Solid
+                # Particle Mesh in the group panel).
+                if group.object_type == "SAND":
+                    is_particle_mesh = (
+                        obj.type == "MESH"
+                        and obj.get("particle_mesh")
+                        and len(obj.data.polygons) == 0
+                        and len(obj.data.edges) == 0
+                    )
+                    if not is_particle_mesh:
+                        self.report(
+                            {"ERROR"},
+                            iface_("Object '{name}' is not a particle mesh. Convert to particle mesh first.").format(name=obj.name),
+                        )
+                        continue
+
+                # Reject shallow-copied (Alt-D / Linked Duplicate) objects
+                # before they can be assigned. Shared mesh data would let
+                # the encoder ship inconsistent vertex coords across two
+                # "different" assigned objects and silently corrupt PC2
+                # playback at fetch time; the only safe fix is for the
+                # user to make the duplicate single-user via Object > Make
+                # Single User > Object & Data.
+                siblings = find_linked_duplicate_siblings(obj)
+                if siblings:
+                    self.report(
+                        {"ERROR"},
+                        iface_("Object '{name}' is a Linked Duplicate (shares mesh data with {sibling!r}). Make it single-user (Object > Relations > Make Single User > Object & Data) before assigning.").format(name=obj.name, sibling=siblings[0]),
+                    )
+                    continue
+
+                # Reject doubled geometry (two triangles sharing the same
+                # three vertices). The solver builds a degenerate bending
+                # element from coincident faces and aborts at startup;
+                # this is the airbag/inflate "Merge by Distance leftover"
+                # case. Refuse it here rather than silently dropping faces
+                # the user may have placed intentionally.
+                dup_count = count_duplicate_faces(obj)
+                if dup_count > 0:
+                    self.report(
+                        {"ERROR"},
+                        iface_("Object '{name}' has {count} duplicate face(s) (two triangles sharing the same three vertices), usually from doubled geometry. Select the mesh in Edit Mode and run Mesh > Merge > By Distance (or delete the duplicate faces) before assigning.").format(name=obj.name, count=dup_count),
+                    )
+                    continue
+
+                in_other = False
+                for other_group in iterate_active_object_groups(scene):
+                    if other_group.ensure_uuid() != group_uuid:
+                        other_uuids = {a.uuid for a in other_group.assigned_objects if a.uuid}
+                        if obj_uid in other_uuids:
+                            self.report(
+                                {"WARNING"},
+                                iface_("Object '{name}' is already in another group").format(name=obj.name),
+                            )
+                            in_other = True
+                            break
+                if in_other:
+                    continue
+
+                is_first_object = len(group.assigned_objects) == 0
+                item = group.assigned_objects.add()
+                item.name = obj.name
+                item.uuid = get_or_create_object_uuid(obj)
+                if obj.type == "CURVES":
+                    for line in _apply_hair_curves_defaults(
+                        group, obj, item.uuid, is_first_object,
+                    ):
+                        self.report({"INFO"}, line)
+                if obj.type == "MESH":
+                    obj.show_wire = True
+                    obj.show_all_edges = True
+                    if group.object_type == "ROD" and not any(
+                        m.type == "WIREFRAME" for m in obj.modifiers
+                    ):
+                        wire = obj.modifiers.new(name="Wireframe", type="WIREFRAME")
+                        # Even-offset compensates sharp dihedrals by extruding
+                        # further; rod simulations fold/crease faces freely
+                        # (only edge length is constrained), and that turns
+                        # into wild visual jumps in the wireframe geometry.
+                        # Uniform thickness keeps the visualization stable.
+                        wire.use_even_offset = False
+                        new_idx = len(obj.modifiers) - 1
+                        if new_idx > 0:
+                            obj.modifiers.move(new_idx, 0)
+                # Set object color to group color if overlay is enabled
+                if group.show_overlay_color:
+                    obj.color = group.color
+
+            apply_object_overlays()
+
+            # The per-object overlay tint just written above only
+            # renders when the Solid shading sub-mode is OBJECT. The
+            # user signed up for the tint by clicking Add, so flip
+            # every Solid VIEW_3D's color sub-mode to OBJECT as a
+            # one-shot here. We do not touch non-SOLID modes
+            # (Material / Rendered previews use materials anyway),
+            # and we never re-flip on every redraw / undo — that was
+            # the prior bug fixed in overlay.py. See
+            # feedback_narrow_user_owned_state_writes for the rule:
+            # writes to user-owned viewport state are allowed inside
+            # an explicit user-invoked operator's execute().
+            if group.show_overlay_color:
+                for win in bpy.context.window_manager.windows:
+                    for area in win.screen.areas:
+                        if area.type != "VIEW_3D":
+                            continue
+                        for sp in area.spaces:
+                            if sp.type != "VIEW_3D":
+                                continue
+                            if sp.shading.type == "SOLID":
+                                sp.shading.color_type = "OBJECT"
+
+            return {"FINISHED"}
+
+        self.report({"ERROR"}, iface_("Group not found"))
+        return {"CANCELLED"}
+
+
+class OBJECT_OT_RemoveObjectFromGroup(Operator):
+    """Remove the selected object from the group"""
+
+    bl_idname = "object.remove_object_from_group"
+    bl_label = "Remove Object"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group_index: bpy.props.IntProperty(options={'HIDDEN'})  # pyright: ignore
+
+    def execute(self, context):
+        from .overlay import apply_object_overlays
+        from ...core.pc2 import cleanup_mesh_cache
+
+        scene = context.scene
+        group = get_group_from_index(scene, self.group_index)
+        if group is not None:
+            index = group.assigned_objects_index
+            if 0 <= index < len(group.assigned_objects):
+                assigned = group.assigned_objects[index]
+                from ...core.uuid_registry import resolve_assigned
+                obj = resolve_assigned(assigned)
+                obj_uuid = assigned.uuid
+                if obj:
+                    reset_object_display(obj)
+                    cleanup_mesh_cache(obj)
+
+                group.assigned_objects.remove(index)
+                cleanup_group_references_for_object(group, obj_uuid)
+                group.assigned_objects_index = safe_update_index(
+                    index, len(group.assigned_objects)
+                )
+
+            apply_object_overlays()
+            return {"FINISHED"}
+
+        self.report({"ERROR"}, iface_("Group not found"))
+        return {"CANCELLED"}
+
+
+_cleanup_scheduled = False
+
+
+def _apply_cleanup():
+    """Deferred cleanup body — runs from a timer, outside depsgraph context.
+
+    Blender 5.x forbids ID writes (collection mutation, obj.color) from
+    depsgraph_update_post. This timer tick fires after the depsgraph
+    evaluation completes, so the writes are allowed.
+    """
+    global _cleanup_scheduled
+    _cleanup_scheduled = False
+
+    from .overlay import apply_object_overlays
+    from ...core.uuid_registry import resolve_assigned
+
+    scene = bpy.context.scene
+    if scene is None:
+        return None
+    changed = False
+
+    for group in iterate_active_object_groups(scene):
+        indices_to_remove = []
+        for i in range(len(group.assigned_objects)):
+            assigned = group.assigned_objects[i]
+            # resolve_assigned() also calls _sync_all_names() when
+            # assigned.name drifts from obj.name, so every downstream
+            # reference (pin_items, merge_pairs, saved keyframes) is kept
+            # coherent through the single reconciler in core/uuid_registry.
+            # Do NOT write assigned.name directly here: it would skip siblings.
+            if resolve_assigned(assigned) is None:
+                indices_to_remove.append(i)
+        for i in reversed(indices_to_remove):
+            obj_uuid = group.assigned_objects[i].uuid
+            group.assigned_objects.remove(i)
+            cleanup_group_references_for_object(group, obj_uuid)
+            changed = True
+        if indices_to_remove:
+            group.assigned_objects_index = safe_update_index(
+                group.assigned_objects_index, len(group.assigned_objects)
+            )
+
+    # ``obj.color`` is NOT touched here. The add-on writes a display color
+    # only on an object that is in a group, and clears it while that object
+    # is still a member, at the point membership ends: every operator that
+    # disowns an object calls ``reset_object_display`` before dropping the
+    # assignment. An object that is not in a group is the user's, so a
+    # scene-wide pass has nothing it is allowed to write. Scanning for a
+    # stray tint instead of clearing it at the source is what made the
+    # Object Properties color field unsettable on every mesh in the file,
+    # since a non-member and a never-tinted object are indistinguishable
+    # from here.
+    #
+    # A copy made with Duplicate is the one case left uncovered: it
+    # inherits the color of the member it was copied from and belongs to no
+    # group, so it keeps that color until the user changes it. That is a
+    # stale color on an object the add-on does not own, which is the side
+    # to err on.
+
+    # Merge pairs are not scanned here. A pair ends with its object's
+    # membership, which the loop above ends through
+    # ``cleanup_group_references_for_object`` for a deleted object. A pair
+    # whose object sits in a DEACTIVATED group is the artist's, kept for when
+    # the group is switched back on, and Transfer refuses it by name meanwhile
+    # (``merge_pair_problem``).
+
+    if changed:
+        apply_object_overlays()
+    return None
+
+
+@bpy.app.handlers.persistent
+def _cleanup_deleted_objects(scene, depsgraph):
+    """Schedule deferred cleanup of stale group references.
+
+    Blender 5.x disallows ID writes from depsgraph handlers, so we only
+    mark that cleanup is needed and let a one-shot timer run the actual
+    mutations from a permissive context.
+    """
+    global _cleanup_scheduled
+    if _cleanup_scheduled:
+        return
+    _cleanup_scheduled = True
+    bpy.app.timers.register(_apply_cleanup, first_interval=0.0)
+
+
+classes = (
+    OBJECT_OT_CreateGroup,
+    OBJECT_OT_DeleteGroup,
+    OBJECT_OT_DuplicateGroup,
+    OBJECT_OT_DeleteAllGroups,
+    OBJECT_OT_AddObjectsToGroup,
+    OBJECT_OT_RemoveObjectFromGroup,
+)
+
+
+@bpy.app.handlers.persistent
+def _reset_cleanup_flag_on_load(*_args):
+    """Clear the single-shot guard when a new .blend loads.
+
+    If a file is saved mid-cycle (flag True), then reopened, the stale
+    flag would suppress the next legitimate cleanup scheduling.
+    """
+    global _cleanup_scheduled
+    _cleanup_scheduled = False
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.app.handlers.depsgraph_update_post.append(_cleanup_deleted_objects)
+    for h in list(bpy.app.handlers.load_post):
+        if getattr(h, "__name__", "") == "_reset_cleanup_flag_on_load":
+            bpy.app.handlers.load_post.remove(h)
+    bpy.app.handlers.load_post.append(_reset_cleanup_flag_on_load)
+
+
+def unregister():
+    # Remove all instances (handles reload where function identity changes)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for h in list(handlers):
+        if getattr(h, "__name__", "") == "_cleanup_deleted_objects":
+            handlers.remove(h)
+    for h in list(bpy.app.handlers.load_post):
+        if getattr(h, "__name__", "") == "_reset_cleanup_flag_on_load":
+            bpy.app.handlers.load_post.remove(h)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

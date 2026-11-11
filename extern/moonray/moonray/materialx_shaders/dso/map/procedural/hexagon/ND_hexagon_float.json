@@ -1,0 +1,27 @@
+{
+    "attributes" :
+    {
+        "centerAttr" :
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "center",
+            "type" : "Vec2f"
+        },
+        "radiusAttr" :
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "radius",
+            "type" : "Float"
+        },
+        "texcoordAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_hexagon_float",
+    "type" : "Map"
+}

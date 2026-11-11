@@ -1,0 +1,137 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+SceneVariables {
+    ["pixel_samples"] = 8,
+    ["image_width"] = 256,
+    ["image_height"] = 256,
+}
+
+Camera("cam") {
+    ["node_xform"] = translate(0, 1, 54),
+    ["focal"] = 50,
+}
+
+lightSet = LightSet("lights") {
+}
+
+geom0 = UsdGeometry("geom0") {
+    ["stage"] = rats_assets_dir.."/models/MoonRayWidget.usdc",
+    ["prim_path"] = "/widget",
+    ["node_xform"] = translate(-6, 4, 0) * rotate(20, 1, 0, 0),
+}
+
+geom1 = UsdGeometry("geom1") {
+    ["stage"] = rats_assets_dir.."/models/MoonRayWidget.usdc",
+    ["prim_path"] = "/widget",
+    ["node_xform"] = translate(6, 4, 0) * rotate(20, 1, 0, 0),
+}
+
+geom2 = UsdGeometry("geom2") {
+    ["stage"] = rats_assets_dir.."/models/MoonRayWidget.usdc",
+    ["prim_path"] = "/widget",
+    ["node_xform"] = translate(-6, -6, 3) * rotate(10, 1, 0, 0),
+}
+
+geom3 = UsdGeometry("geom3") {
+    ["stage"] = rats_assets_dir.."/models/MoonRayWidget.usdc",
+    ["prim_path"] = "/widget",
+    ["node_xform"] = translate(6, -6, 3) * rotate(10, 1, 0, 0),
+}
+
+ref = BoxGeometry("box") {
+    ["node_xform"] = translate(2, 10, 9),
+}
+
+GeometrySet("geometry") {
+    geom0,
+    geom1,
+    geom2,
+    geom3,
+    ref,
+}
+
+directional0 = DirectionalMap("directional0") {
+    ["prime_direction"] = 2,    -- "axis of object"
+    ["polarity"] = 0,
+    ["color_a"] = Rgb(1,0,0),
+    ["color_b"] = Rgb(0,1,0),
+    ["object_axis"] = 0,
+    ["clamping_behavior"] = 1,
+    ["use_smoothstep"] = true,
+    ["bias"] = 0.1,
+}
+
+directional1 = DirectionalMap("directional1") {
+    ["prime_direction"] = 3,    -- "look-at object"
+    ["polarity"] = 0,
+    ["color_a"] = Rgb(1,0,0),
+    ["color_b"] = Rgb(0,1,0),
+    ["object"] = ref,
+    ["clamping_behavior"] = 1,
+    ["use_smoothstep"] = true,
+    ["bias"] = 0.1,
+}
+
+directional2 = DirectionalMap("directional2") {
+    ["prime_direction"] = 0,    -- "observer direction"
+    ["polarity"] = 0,
+    ["color_a"] = Rgb(1,0,0),
+    ["color_b"] = Rgb(0,1,0),
+    ["clamping_behavior"] = 1,
+    ["use_smoothstep"] = true,
+    ["bias"] = 0.1,
+}
+
+directional3 = DirectionalMap("directional3") {
+    ["prime_direction"] = 1,    -- "custom direction"
+    ["polarity"] = 0,
+    ["color_a"] = Rgb(1,0,0),
+    ["color_b"] = Rgb(0,1,0),
+    ["custom_direction"] = Vec3(1,1,1),
+    ["clamping_behavior"] = 1,
+    ["use_smoothstep"] = true,
+    ["bias"] = 0.1,
+}
+
+mtl0 = DwaSolidDielectricMaterial("mtl0") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = bind(directional0, Rgb(1,1,1)),
+}
+
+mtl1 = DwaSolidDielectricMaterial("mtl1") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = bind(directional1, Rgb(1,1,1)),
+}
+
+mtl2 = DwaSolidDielectricMaterial("mtl2") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = bind(directional2, Rgb(1,1,1)),
+}
+
+mtl3 = DwaSolidDielectricMaterial("mtl3") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = bind(directional3, Rgb(1,1,1)),
+}
+
+white = DwaSolidDielectricMaterial("white") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = Rgb(1,1,1),
+}
+
+Layer("layer") {
+    { geom0, "", mtl0, lightSet },
+    { geom1, "", mtl1, lightSet },
+    { geom2, "", mtl2, lightSet },
+    { geom3, "", mtl3, lightSet },
+    { ref, "", white, lightSet },
+}

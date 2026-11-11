@@ -1,0 +1,51 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+SceneVariables {
+    ["pixel_samples"] = 8,
+    ["image_width"] = 256,
+    ["image_height"] = 256,
+}
+
+shotCam = Camera("/Scene/rendering/camera") {
+    ["node_xform"] = translate(0, 0, 5),
+}
+
+lightSet = LightSet("/Scene/lighting/lightSet") {
+}
+
+projGeom = BoxGeometry("projGeom") {
+    ["node_xform"] = rotate(45, 1, 0, 0) * translate(0, -2, -13),
+}
+
+projMap = ProjectSphericalMap("/Scene/surfacing/projMap") {
+   ["projector"] = projGeom,
+   ["use_reference_space"] = false
+}
+
+checkerMap = CheckerboardMap("/Scene/surfacing/checkerMap") {
+    ["color_A"] = Rgb(0, 0, 1),
+    ["color_B"] = Rgb(0.5, 0.5, 0),
+    ["texture_coordinates"] = 1,
+    ["input_texture_coordinates"] = bind(projMap)
+}
+
+mtl = DwaSolidDielectricMaterial("mtl") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = false,
+    ["show_emission"] = true,
+    ["emission"] = bind(checkerMap, Rgb(1,1,1)),
+}
+
+geom = UsdGeometry("geom") {
+    ["stage"] = rats_assets_dir .. "/models/MoonRayWidget.usdc",
+    ["prim_path"] = "/widget",
+    ["node_xform"] = rotate(45, 1, 0, 0) * translate(0, -2, -13),
+}
+
+GeometrySet("geometrySet") {
+    geom,
+}
+
+Layer("layer") {
+    { geom, "", mtl, lightSet },
+}

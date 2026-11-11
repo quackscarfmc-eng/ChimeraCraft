@@ -1,0 +1,39 @@
+{
+    "attributes" : 
+    {
+        "amplitudeAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amplitude",
+            "type" : "Rgba",
+            "comment" : "the center-to-peak amplitude of the noise"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "pivot",
+            "type" : "Float",
+            "comment" : "the center value of the output noise"
+        },
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position", 
+            "type" : "Vec3f",
+            "comment" : "the 3D position at which the noise is evaluated"
+        }
+    },
+    "name" : "ND_noise3d_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

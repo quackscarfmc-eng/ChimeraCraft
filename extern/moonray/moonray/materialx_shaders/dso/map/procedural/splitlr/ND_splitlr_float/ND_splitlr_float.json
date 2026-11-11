@@ -1,0 +1,40 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "texcoordAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "valuelAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuel",
+            "type" : "Float"
+        },
+        "valuerAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "valuer",
+            "type" : "Float"
+        },
+        "centerAttr" : 
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "center",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_splitlr_float",
+    "type" : "Map"
+}

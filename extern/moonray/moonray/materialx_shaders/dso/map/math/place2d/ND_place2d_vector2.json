@@ -1,0 +1,61 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "offsetAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "offset",
+            "type" : "Vec2f"
+        },
+        "operationorderAttr" : 
+        {
+            "default" : 0,
+            "enum" : 
+            {
+                "SRT" : 0,
+                "TRS" : 1
+            },
+            "flags" : "FLAGS_BINDABLE| FLAGS_ENUMERABLE",
+            "name" : "operationorder",
+            "type" : "Int"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "pivot",
+            "type" : "Vec2f"
+        },
+        "rotateAttr" : 
+        {
+            "comment" : "Unit is degrees.",
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "rotate",
+            "type" : "Float"
+        },
+        "scaleAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "scale",
+            "type" : "Vec2f"
+        },
+        "texcoordAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_place2d_vector2",
+    "type" : "Map"
+}

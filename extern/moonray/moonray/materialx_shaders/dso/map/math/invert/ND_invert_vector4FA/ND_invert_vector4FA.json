@@ -1,0 +1,35 @@
+{
+    "attributes" : 
+    {
+        "amountAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec4f"
+        }
+    },
+    "name" : "ND_invert_vector4FA",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Vec4f"
+        }
+    },
+    "type" : "Map"
+}

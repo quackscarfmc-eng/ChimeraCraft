@@ -1,0 +1,61 @@
+{
+    "attributes" : 
+{
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "inLowAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inlow",
+            "type" : "Rgb"
+        },
+        "inHighAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inhigh",
+            "type" : "Rgb"
+        },
+        "outLowAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outlow",
+            "type" : "Rgb"
+        },
+        "outHighAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outhigh",
+            "type" : "Rgb"
+        },
+        "gammaAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Rgb"
+        },
+        "doClampAttr" : 
+        {
+            "default" : 0,
+            "name" : "doclamp",
+            "type" : "Bool"
+        }
+    },
+    "name" : "ND_range_color3",
+    "type" : "Map"
+}

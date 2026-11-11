@@ -1,0 +1,387 @@
+# File: events.py
+# Code: Claude Code
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+#
+# Typed, frozen event classes for the event-driven state machine.
+# Every external stimulus (user action, server response, background I/O
+# completion, error) is modeled as an ``Event`` subclass.  Events carry
+# data but have *no* behavior -- they are pure descriptions of "what happened."
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+
+class Event:
+    """Base class for all events in the state machine."""
+
+
+# ---------------------------------------------------------------------------
+# Connection events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ConnectRequested(Event):
+    """User requested a connection (SSH, Docker, local, win_native, mac_native)."""
+    backend_type: str = ""       # "ssh" | "docker" | "local" | "win_native" | "mac_native"
+    config: dict = field(default_factory=dict)
+    server_port: int = 0
+
+
+@dataclass(frozen=True)
+class Connected(Event):
+    """Background thread successfully established the connection.
+
+    ``session_id`` and ``saved_session_id`` are computed by the
+    ``EffectRunner`` (which owns the uuid mint and the ``bpy`` read) and
+    passed in as data so the ``transition()`` arm that consumes them stays
+    pure and deterministic. ``session_id`` is the freshly minted id for
+    this connect; ``saved_session_id`` is the id stored in the scene at
+    last save (empty when none), used to emit the reconcile log.
+    """
+    remote_root: str = ""
+    session_id: str = ""
+    saved_session_id: str = ""
+
+
+@dataclass(frozen=True)
+class ConnectionFailed(Event):
+    """Background connect attempt failed."""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class DisconnectRequested(Event):
+    """User explicitly requested disconnection."""
+
+
+@dataclass(frozen=True)
+class Disconnected(Event):
+    """Connection was closed (either by request or loss)."""
+
+
+@dataclass(frozen=True)
+class ConnectionLost(Event):
+    """Connection dropped unexpectedly (e.g. SSH transport dead).
+
+    ``cause`` is the text of the exception that ended the operation, when
+    there was one. The panel shows it after the headline, because the
+    headline alone cannot distinguish the cases the user has to tell apart:
+    a container whose server port was never published with ``-p`` reads
+    exactly like a dead SSH transport once the cause is dropped, and only
+    one of the two has an action attached to it.
+    """
+
+    cause: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Server lifecycle events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StartServerRequested(Event):
+    """User requested remote server start.
+
+    ``cuda_device`` is the display index and ``cuda_device_uuid`` the stable
+    launch identity, or ``gpu_devices.AUTOMATIC`` plus an empty UUID to set
+    nothing. They ride the event rather than being stored at connect because
+    the panel lets the selection change between Stop and the next Start.
+
+    ``device`` and ``gpu_backend`` ride it for the SAME reason, and only a
+    REMOTE connection reads them. They name which BUILD on the solver host the
+    server comes out of, the panel draws those rows once a connection is up,
+    and a value stored at connect would leave a row the artist can move and
+    that changes nothing. A native connection is different: its device is
+    settled when the connection is made, because the connect itself refuses a
+    root that holds no build for it, and the backend keeps that answer for its
+    own restart path. Empty means "whatever the backend already holds", which
+    is what every caller that names no device gets.
+    """
+
+    cuda_device: int = -1
+    cuda_device_uuid: str = ""
+    device: str = ""
+    gpu_backend: str = ""
+    # Seconds with no request and nothing running after which the server stops
+    # itself (`--idle-timeout`), 0 for never, None for the server's default.
+    idle_timeout: int | None = None
+
+
+@dataclass(frozen=True)
+class ServerLaunched(Event):
+    """Server process is up and responding to queries."""
+
+
+@dataclass(frozen=True)
+class StopServerRequested(Event):
+    """User requested remote server stop."""
+
+
+@dataclass(frozen=True)
+class KillServerRequested(Event):
+    """User pressed Force Terminate Process while connected.
+
+    Differs from ``StopServerRequested`` in its guard only: Stop is accepted
+    while the server is RUNNING or LAUNCHING, Kill whenever the connection is
+    up and idle, because the case it exists for is a server the engine does
+    not know about (Start Server refused because a stale one holds the port,
+    or a server left by an earlier session that the attach path did not
+    take). Both run ``DoStopServer``.
+    """
+
+
+@dataclass(frozen=True)
+class ServerStopped(Event):
+    """Server process has been killed."""
+
+
+@dataclass(frozen=True)
+class ServerLost(Event):
+    """Server stopped responding (empty response to query)."""
+
+
+# ---------------------------------------------------------------------------
+# Server response
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ServerPolled(Event):
+    """A server query returned a response dict.
+
+    This is the central event that replaces the old ``_update_status()``
+    conditional.  The pure ``transition()`` function interprets the response
+    and derives the new solver state.
+    """
+    response: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Solver operation events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BuildRequested(Event):
+    """User requested a scene build."""
+
+
+@dataclass(frozen=True)
+class RunRequested(Event):
+    """User requested simulation start."""
+
+
+@dataclass(frozen=True)
+class ResumeRequested(Event):
+    """User requested simulation resume.
+
+    ``from_frame`` is ``None`` to resume from the latest checkpoint
+    (the historical behavior), or an explicit frame index to resume
+    from that saved checkpoint.
+    """
+
+    from_frame: int | None = None
+
+
+@dataclass(frozen=True)
+class AbortRequested(Event):
+    """User requested abort of current operation."""
+
+
+@dataclass(frozen=True)
+class TerminateRequested(Event):
+    """User requested solver termination (kill simulation)."""
+
+
+@dataclass(frozen=True)
+class SaveAndQuitRequested(Event):
+    """User requested save-and-quit."""
+
+
+# ---------------------------------------------------------------------------
+# Data transfer events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SendDataRequested(Event):
+    """User requested sending data to the remote."""
+    remote_path: str = ""
+    data: bytes = b""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class SendDataComplete(Event):
+    """Data send finished successfully."""
+
+
+@dataclass(frozen=True)
+class BuildPipelineRequested(Event):
+    """Atomic (upload data+param) → build pipeline.
+
+    Replaces the old SOLVER_OT_Transfer modal orchestration: a single
+    event carries the two pickle payloads, the engine drives upload and
+    build as sequenced effects, and the UI just watches ``activity``.
+
+    Either payload may be empty to skip that file (params-only update),
+    but at least one must be non-empty. ``param_hash`` is the
+    quick-fingerprint of the param payload computed via
+    ``encoder.params.compute_param_hash``; the server stores it and
+    echoes it on every status response so the UI can detect drift.
+    """
+    data: bytes = b""
+    param: bytes = b""
+    data_hash: str = ""
+    param_hash: str = ""
+    message: str = ""
+    # When True the chained build keeps the session/output/ checkpoints
+    # in place (a resume-rebuild that re-decodes edited scene input);
+    # False is a fresh build that wipes the output directory.
+    preserve_output: bool = False
+
+
+@dataclass(frozen=True)
+class UploadOnlyRequested(Event):
+    """Atomic upload of data.pickle / param.pickle without chaining a build.
+
+    Used by debug-only transfer tests that want to isolate the upload
+    path from the build path.
+    """
+    data: bytes = b""
+    param: bytes = b""
+    data_hash: str = ""
+    param_hash: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class UploadPipelineComplete(Event):
+    """Atomic upload finished. Whether a build follows is driven by
+    ``state.pending_build`` which the transition sets from whichever
+    upstream event (BuildPipelineRequested vs UploadOnlyRequested)
+    initiated the upload."""
+
+
+@dataclass(frozen=True)
+class ReceiveDataRequested(Event):
+    """User requested receiving data from the remote."""
+    remote_path: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class ReceiveDataComplete(Event):
+    """Data receive finished successfully."""
+    data: bytes = b""
+
+
+# ---------------------------------------------------------------------------
+# Fetch / animation events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FetchRequested(Event):
+    """User requested fetching animation frames."""
+
+
+@dataclass(frozen=True)
+class FetchMapComplete(Event):
+    """Animation map and surface_map downloads finished."""
+    map_data: Any = None      # dict[str, numpy.ndarray]
+    surface_map: Any = None   # dict
+
+
+@dataclass(frozen=True)
+class FrameFetched(Event):
+    """One animation frame was downloaded from the remote."""
+    frame_number: int = 0
+    vertices: Any = None   # numpy.ndarray
+
+
+@dataclass(frozen=True)
+class FetchComplete(Event):
+    """All requested frames have been downloaded."""
+    total_frames: int = 0
+
+
+@dataclass(frozen=True)
+class FetchFailed(Event):
+    """A fetch or apply step failed; state must leave FETCHING/APPLYING.
+
+    Dispatched by worker-thread fetch paths (on precondition miss or
+    exception), by the apply side (on exception), and by the liveness
+    watchdog (on stuck progress).
+    """
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class AllFramesApplied(Event):
+    """Main-thread animation application is done (buffer drained)."""
+
+
+# ---------------------------------------------------------------------------
+# Exec events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExecRequested(Event):
+    """User requested command execution on the remote."""
+    command: str = ""
+    shell: bool = False
+
+
+@dataclass(frozen=True)
+class ExecComplete(Event):
+    """Remote command execution finished."""
+    output: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Query events (explicit user-initiated queries)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class QueryRequested(Event):
+    """User-initiated server query with optional payload."""
+    request: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Progress / status events (from background threads)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ProgressUpdated(Event):
+    """Progress callback from a background I/O operation."""
+    progress: float = 0.0
+    traffic: str = ""
+
+
+@dataclass(frozen=True)
+class ErrorOccurred(Event):
+    """An error happened in a background operation."""
+    error: str = ""
+    source: str = ""   # which subsystem raised it
+
+
+@dataclass(frozen=True)
+class ViolationsDismissed(Event):
+    """An edit moved the geometry the violation overlay points at.
+
+    The violations a refused build reports are positions in the scene AS IT
+    WAS UPLOADED. Once the artist moves those objects, by Resolve
+    Intersections, the highlights mark places the surfaces have left, so they
+    are taken down until the next upload reports its own.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Internal scheduling events
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PollTick(Event):
+    """Scheduled re-query of the server (replaces the sleep-poll loop)."""

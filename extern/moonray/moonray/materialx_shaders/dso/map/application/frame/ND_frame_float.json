@@ -1,0 +1,13 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		}
+	},
+	"name" : "ND_frame_float",
+	"type" : "Map"
+}

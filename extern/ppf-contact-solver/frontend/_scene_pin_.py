@@ -1,0 +1,985 @@
+# File: _scene_pin_.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+
+"""Pin operations, PinHolder, PinData, and pin TOML helpers.
+
+Split out of ``_scene_.py``: these classes describe pin animation
+(MoveBy, MoveTo, Spin, Scale, Torque, TransformKeyframes) and the
+``PinHolder`` user-facing builder that mirrors a Rust validator.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
+from . import _rust  # type: ignore[attr-defined]
+
+
+class Operation:
+    """Base class for pin operations that can be applied in sequence."""
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Apply the operation to vertices at a given time.
+
+        Args:
+            vertex: Current vertex positions (may be transformed by previous operations).
+            time: Current simulation time.
+
+        Returns:
+            Transformed vertex positions.
+        """
+        raise NotImplementedError("Subclasses must implement apply()")
+
+    def get_time_range(self) -> tuple[float, float]:
+        """Get the time range this operation is active.
+
+        Returns:
+            (t_start, t_end) tuple.
+        """
+        raise NotImplementedError("Subclasses must implement get_time_range()")
+
+
+@dataclass
+class MoveByOperation(Operation):
+    """Move operation with position delta and time range."""
+
+    delta: np.ndarray
+    t_start: float
+    t_end: float
+    transition: str = "linear"
+    bezier_handles: Optional[tuple] = None
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Apply position delta to current vertex position over time range."""
+        handles = _nested_bezier_handles(self)
+        return _rust.scene_move_by_apply(
+            np.ascontiguousarray(vertex, dtype=np.float64),
+            np.ascontiguousarray(self.delta, dtype=np.float64),
+            float(time), float(self.t_start), float(self.t_end),
+            self.transition, handles,
+        )
+
+    def get_time_range(self) -> tuple[float, float]:
+        return (self.t_start, self.t_end)
+
+
+@dataclass
+class MoveToOperation(Operation):
+    """Move operation with absolute target positions and time range."""
+
+    target: np.ndarray
+    t_start: float
+    t_end: float
+    transition: str = "linear"
+    bezier_handles: Optional[tuple] = None
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Overwrite vertex positions with target over time range."""
+        handles = _nested_bezier_handles(self)
+        return _rust.scene_move_to_apply(
+            np.ascontiguousarray(vertex, dtype=np.float64),
+            np.ascontiguousarray(self.target, dtype=np.float64),
+            float(time), float(self.t_start), float(self.t_end),
+            self.transition, handles,
+        )
+
+    def get_time_range(self) -> tuple[float, float]:
+        return (self.t_start, self.t_end)
+
+
+@dataclass
+class TransformKeyframeOperation(Operation):
+    """Evaluate sparse TRS keyframes with slerp on rotation.
+
+    Each call recomputes positions as ``R(t)*S(t)*local + T(t) - rest_T``.
+    The ``-rest_T`` cancels the per-object displacement that
+    ``Scene.time()`` re-adds after all ops, so the final vertex lands at
+    the interpolated world pose with a rotation-aware slerp instead of a
+    linear chord through the mesh.
+    """
+
+    local_vert: np.ndarray
+    times: list
+    translations: list
+    quaternions: list
+    scales: list
+    segments: list
+    rest_translation: np.ndarray
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        translations = [
+            [float(t[0]), float(t[1]), float(t[2])] for t in self.translations
+        ]
+        quaternions = [
+            [float(q[0]), float(q[1]), float(q[2]), float(q[3])] for q in self.quaternions
+        ]
+        scales = [
+            [float(s[0]), float(s[1]), float(s[2])] for s in self.scales
+        ]
+        rest = [
+            float(self.rest_translation[0]),
+            float(self.rest_translation[1]),
+            float(self.rest_translation[2]),
+        ]
+        return _rust.scene_transform_keyframe_apply(
+            np.ascontiguousarray(vertex, dtype=np.float64),
+            np.ascontiguousarray(self.local_vert, dtype=np.float64),
+            [float(t) for t in self.times],
+            translations, quaternions, scales,
+            list(self.segments), rest, float(time),
+        )
+
+    def get_time_range(self) -> tuple[float, float]:
+        if not self.times:
+            return (0.0, 0.0)
+        return (self.times[0], self.times[-1])
+
+
+@dataclass
+class SpinOperation(Operation):
+    """Spin operation with rotation parameters."""
+
+    center: np.ndarray
+    axis: np.ndarray
+    angular_velocity: float
+    t_start: float
+    t_end: float
+    center_mode: str = "absolute"
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Apply Rodrigues rotation if within time range."""
+        return _rust.scene_spin_apply(
+            np.ascontiguousarray(vertex, dtype=np.float64),
+            [float(self.center[0]), float(self.center[1]), float(self.center[2])],
+            [float(self.axis[0]), float(self.axis[1]), float(self.axis[2])],
+            float(self.angular_velocity),
+            float(self.t_start), float(self.t_end), float(time),
+        )
+
+    def get_time_range(self) -> tuple[float, float]:
+        return (self.t_start, self.t_end)
+
+
+@dataclass
+class ScaleOperation(Operation):
+    """Scale operation around a center point."""
+
+    center: np.ndarray
+    factor: float
+    t_start: float
+    t_end: float
+    transition: str = "linear"
+    center_mode: str = "absolute"
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Apply scaling interpolating from 1.0 to target factor over time range."""
+        return _rust.scene_scale_apply(
+            np.ascontiguousarray(vertex, dtype=np.float64),
+            [float(self.center[0]), float(self.center[1]), float(self.center[2])],
+            float(self.factor), float(self.t_start), float(self.t_end),
+            self.transition, float(time),
+        )
+
+    def get_time_range(self) -> tuple[float, float]:
+        return (self.t_start, self.t_end)
+
+
+@dataclass
+class TorqueOperation(Operation):
+    """Torque operation: applies rotational force around a PCA axis."""
+
+    axis_component: int  # 0=PC1, 1=PC2, 2=PC3
+    magnitude: float
+    # The vertex the axis is oriented toward, in its object's own numbering;
+    # the scene builder maps it to the solver's global index.
+    hint_vertex: int
+    t_start: float = 0.0
+    t_end: float = float("inf")
+
+    def apply(self, vertex: np.ndarray, time: float) -> np.ndarray:
+        """Torque is a force, not a kinematic operation. Returns vertex unchanged."""
+        return vertex
+
+    def get_time_range(self) -> tuple[float, float]:
+        return (self.t_start, self.t_end)
+
+
+@dataclass
+class PinData:
+    """Represents pinning data for a set of vertices."""
+
+    index: list[int]
+    operations: list[Operation]
+    unpin_time: Optional[float] = None
+    transition: str = "linear"
+    pull_strength: float = 0.0
+    # Optional per-vertex pull weight (np.ndarray, length == len(index),
+    # aligned to index). When set, the solver uses it per vertex instead
+    # of the scalar pull_strength, so one holder can pull different
+    # vertices with different (graceful, diffused) strengths. Exported as
+    # pin-pullw-{i}.bin alongside pin-ind-{i}.bin.
+    pull_weights: Optional[np.ndarray] = None
+    pin_group_id: str = ""
+    # Static moving objects use the pin-shell as an implementation detail
+    # (every vertex is pinned to drive a rigid-body motion). The user
+    # never asked for these pins, so the preview should not render them
+    # as pin markers.
+    hide_in_preview: bool = False
+    # Set by PinHolder.track_rest_shape. When true, the scene builder also
+    # emits a time-varying rest shape: this holder's operations are applied to
+    # the rest pose at each of their start and end times, so the body's
+    # stress-free shape follows the prescribed motion instead of fighting it.
+    # Either pin mode can track; Scene.build refuses tracking pins that do not
+    # together hold their whole object, and tracking beside plasticity.
+    rest_shape_track: bool = False
+    # This pin asks for the intersections of the elements it FULLY covers to
+    # be tolerated rather than reported (issue #138). An element qualifies
+    # only when every one of its vertices is pinned and every pin covering
+    # those vertices set this, so a partially pinned band is unaffected. Both
+    # pin modes carry it: a FIX pin's placement is prescribed and not the
+    # solver's to resolve, and a PULL pin holds only to the extent of its own
+    # force, which is the case the issue singles out.
+    allow_intersection: bool = False
+
+
+def _nested_bezier_handles(op_or_handles):
+    """Repackage `bezier_handles = ((hr_x, hr_y), (hl_x, hl_y))` into the
+    nested float tuple the Rust `*_apply` kernels expect
+    (`Option<((f64, f64), (f64, f64))>`), or None for linear fallback.
+    Accepts either an op carrying the attribute or the handles directly,
+    mirroring `_flatten_bezier_handles`.
+    """
+    h = getattr(op_or_handles, "bezier_handles", op_or_handles)
+    if h is None:
+        return None
+    hr, hl = h
+    return ((float(hr[0]), float(hr[1])), (float(hl[0]), float(hl[1])))
+
+
+def _flatten_bezier_handles(op: "Operation"):
+    """Flatten an op's `bezier_handles = ((hr_x, hr_y), (hl_x, hl_y))`
+    pair into the `[hr_x, hr_y, hl_x, hl_y]` list the Rust TOML
+    formatter writes (and that the solver-side reader picks up). None
+    when the op carries no handles, signaling linear fallback at apply
+    time.
+    """
+    h = getattr(op, "bezier_handles", None)
+    if h is None:
+        return None
+    hr, hl = h
+    return [float(hr[0]), float(hr[1]), float(hl[0]), float(hl[1])]
+
+
+def _pin_op_to_toml_dict(op: "Operation") -> dict:
+    """Repackage a pin Operation into the descriptor dict consumed by
+    `_rust.scene_format_pin_toml`. The Rust kernel walks a flat list of
+    these and emits the entire pin/op TOML block in one allocation.
+    """
+    if isinstance(op, MoveByOperation):
+        return {
+            "type": "move_by",
+            "t_start": float(op.t_start),
+            "t_end": float(op.t_end),
+            "transition": op.transition,
+            "bezier_handles": _flatten_bezier_handles(op),
+        }
+    if isinstance(op, MoveToOperation):
+        return {
+            "type": "move_to",
+            "t_start": float(op.t_start),
+            "t_end": float(op.t_end),
+            "transition": op.transition,
+            "bezier_handles": _flatten_bezier_handles(op),
+        }
+    if isinstance(op, SpinOperation):
+        return {
+            "type": "spin",
+            "center_mode": op.center_mode,
+            "center": [float(op.center[0]), float(op.center[1]), float(op.center[2])],
+            "axis": [float(op.axis[0]), float(op.axis[1]), float(op.axis[2])],
+            "angular_velocity": float(op.angular_velocity),
+            "t_start": float(op.t_start),
+            "t_end": float(op.t_end),
+        }
+    if isinstance(op, ScaleOperation):
+        return {
+            "type": "scale",
+            "center_mode": op.center_mode,
+            "center": [float(op.center[0]), float(op.center[1]), float(op.center[2])],
+            "factor": float(op.factor),
+            "t_start": float(op.t_start),
+            "t_end": float(op.t_end),
+            "transition": op.transition,
+            "bezier_handles": _flatten_bezier_handles(op),
+        }
+    if isinstance(op, TorqueOperation):
+        return {
+            "type": "torque",
+            "axis_component": int(op.axis_component),
+            "magnitude": float(op.magnitude),
+            "hint_vertex": int(op.hint_vertex),
+            "t_start": float(op.t_start),
+            "t_end": float(op.t_end),
+        }
+    if isinstance(op, TransformKeyframeOperation):
+        rt = op.rest_translation
+        return {
+            "type": "transform_keyframes",
+            "keyframe_count": len(op.times),
+            "t_start": float(op.times[0]) if op.times else 0.0,
+            "t_end": float(op.times[-1]) if op.times else 0.0,
+            "rest_translation": [float(rt[0]), float(rt[1]), float(rt[2])],
+        }
+    raise TypeError(f"unsupported pin operation type: {type(op).__name__}")
+
+
+def _pin_to_toml_dict(pin: "PinData") -> dict:
+    """Repackage a PinData into the dict consumed by Rust's pin TOML
+    formatter."""
+    return {
+        "operation_count": len(pin.operations),
+        "pin_count": len(pin.index),
+        "pull_strength": float(pin.pull_strength),
+        "unpin_time": float(pin.unpin_time) if pin.unpin_time is not None else None,
+        "pin_group_id": pin.pin_group_id if pin.pin_group_id else None,
+        "allow_intersection": bool(pin.allow_intersection),
+        "ops": [_pin_op_to_toml_dict(op) for op in pin.operations],
+    }
+
+
+class PinHolder:
+    """Class to manage pinning behavior of objects.
+
+    ``self._data`` (a Python :class:`PinData`) is canonical: every export
+    path (``_pin_to_toml_dict``, the scene builder, the decoder) reads and
+    mutates it directly, and it is the sole source for the FixedScene
+    export. ``self._rust`` is a discardable parallel validator that runs the
+    same argument checks on the subset of fields it carries: ``index``,
+    ``transition``, ``unpin_time``, ``pull_strength``, ``pin_group_id``, and
+    ``operations``. It does NOT track the Python-only fields
+    ``pull_weights`` and ``rest_shape_track`` (the Rust ``PinData`` struct has
+    no such fields), so those are validated and stored on ``_data`` alone.
+    """
+
+    _pin_counter = 0
+
+    def __init__(self, obj: "Object", indices: list[int]):  # noqa: F821
+        """Initialize pin object.
+
+        Args:
+            obj (Object): The object to pin.
+            indices (list[int]): The indices of the vertices to pin.
+        """
+        self._obj = obj
+        PinHolder._pin_counter += 1
+        pin_group_id = f"{obj.name}:pin_{PinHolder._pin_counter}"
+        self._data = PinData(
+            index=indices,
+            operations=[],
+            pin_group_id=pin_group_id,
+        )
+        # Parallel Rust validator for the fields it carries (index,
+        # transition, unpin_time, pull_strength, pin_group_id, operations).
+        # It is NOT a full lockstep mirror: the Python-only fields
+        # (pull_weights, rest_shape_track) have no
+        # counterpart in the Rust PinData and are validated on
+        # `self._data` alone. Builder methods route the mirrored fields
+        # through the validator first; downstream callers (decoder, scene
+        # builder) read the canonical Python `PinData` dataclass, never the
+        # mirror, so the mirror is discardable after validation.
+        self._rust = _rust.PinHolder(list(indices), pin_group_id)
+
+    def __getstate__(self) -> dict:
+        # The Rust mirror is not picklable. _data is canonical; the
+        # mirror is a parallel validator for builder calls. After
+        # unpickle the holder is read-only (loaded as part of a frozen
+        # FixedSession), so __setstate__ rebuilds an empty mirror.
+        return {"obj": self._obj, "data": self._data}
+
+    def __setstate__(self, state: dict) -> None:
+        self._obj = state["obj"]
+        self._data = state["data"]
+        self._rust = _rust.PinHolder(self._data.index, self._data.pin_group_id)
+
+    def interp(self, transition: str) -> "PinHolder":
+        """Set the transition type for the pinning.
+
+        Args:
+            transition (str): The transition type. Supported values are ``"linear"``, ``"smooth"``, and ``"bezier"``. Default is ``"linear"``.
+
+        Returns:
+            PinHolder: The pinholder with the updated transition type.
+        """
+        self._rust.interp(transition)
+        self._data.transition = transition
+        return self
+
+    def unpin(self, time: float) -> "PinHolder":
+        """Unpin the object at a specified time.
+
+        Args:
+            time (float): The time at which to unpin the vertices.
+
+        Returns:
+            PinHolder: The pinholder with the unpin time set.
+        """
+        self._rust.unpin(time)
+        self._data.unpin_time = time
+        return self
+
+    def move_by(
+        self, delta_pos, t_start: float = 0.0, t_end: float = 1.0,
+        transition: Optional[str] = None, bezier_handles=None,
+    ) -> "PinHolder":
+        """Move the object by a positional delta over a specified time range.
+
+        Args:
+            delta_pos (list[float]): The positional delta to apply.
+            t_start (float): The start time. Defaults to 0.0.
+            t_end (float): The end time. Defaults to 1.0.
+            transition (str, optional): Override interpolation type.
+            bezier_handles: Bezier control points for easing.
+
+        Returns:
+            PinHolder: The pinholder with the updated position.
+
+        Example:
+            Slide a pinned sphere 8 units along +x between t=0 and t=5::
+
+                scene.add("sphere").pin().move_by(
+                    [8, 0, 0], t_start=0.0, t_end=5.0,
+                )
+        """
+        delta_pos = np.asarray(delta_pos, dtype=np.float64).reshape((-1, 3))
+
+        if len(delta_pos) == 1 and len(self.index) > 1:
+            delta_pos = np.tile(delta_pos, (len(self.index), 1))
+        elif len(delta_pos) != len(self.index):
+            raise Exception("delta_pos must have the same length as pin")
+
+        if t_end <= t_start:
+            raise Exception("t_end must be greater than t_start")
+
+        # Rust validates length + t_end ordering; we already
+        # reshaped above so the call is idempotent.
+        self._rust.move_by(
+            delta_pos, t_start, t_end, transition, bezier_handles,
+        )
+        self._data.operations.append(
+            MoveByOperation(
+                delta=delta_pos,
+                t_start=t_start,
+                t_end=t_end,
+                transition=transition if transition else self._data.transition,
+                bezier_handles=bezier_handles,
+            )
+        )
+        return self
+
+    def transform_keyframes(
+        self,
+        local_vert: np.ndarray,
+        times: list,
+        translations: list,
+        quaternions: list,
+        scales: list,
+        segments: list,
+        rest_translation: np.ndarray,
+    ) -> "PinHolder":
+        """Pin vertices to sparse TRS keyframes evaluated with slerp.
+
+        Produces ``R(t)*S(t)*local + T(t) - rest_T`` per vertex, so a
+        rotating object follows an arc instead of a linear chord.
+
+        Per-segment ``interpolation`` is one of ``"LINEAR"``,
+        ``"BEZIER"``, or ``"CONSTANT"``.
+
+        Example:
+            Animate a static (pinned) object with three TRS keyframes,
+            a Bezier segment then a linear one::
+
+                import numpy as np
+
+                times        = [0.0, 1.0, 2.0]
+                translations = [[0, 0, 0], [1, 0, 0], [1, 1, 0]]
+                quaternions  = [[1, 0, 0, 0], [1, 0, 0, 0], [0.707, 0, 0.707, 0]]
+                scales       = [[1, 1, 1], [1, 1, 1], [1, 1, 1]]
+                segments     = [
+                    {"interpolation": "BEZIER"},
+                    {"interpolation": "LINEAR"},
+                ]
+
+                obj = scene.add("sphere").pin()
+                obj.transform_keyframes(
+                    local_vert=obj.object.vertex(False),
+                    times=times,
+                    translations=translations,
+                    quaternions=quaternions,
+                    scales=scales,
+                    segments=segments,
+                    rest_translation=np.zeros(3),
+                )
+        """
+        n = len(times)
+        if len(translations) != n or len(quaternions) != n or len(scales) != n:
+            raise ValueError(
+                "transform_keyframes: T/Q/S arrays must match times length"
+            )
+        if n > 0 and len(segments) != n - 1:
+            raise ValueError(
+                f"transform_keyframes: expected {n - 1} segments, got {len(segments)}"
+            )
+        # Supported per-segment interpolation types.  The runtime (preview
+        # and Rust simulator) respects exactly these; anything else would
+        # silently degrade to LINEAR, which is surprising, so we reject up
+        # front.
+        allowed = {"LINEAR", "BEZIER", "CONSTANT"}
+        for i, s in enumerate(segments):
+            interp = s.get("interpolation", "LINEAR")
+            if interp not in allowed:
+                raise ValueError(
+                    f"transform_keyframes segment {i}: unsupported "
+                    f"interpolation '{interp}'. Supported: {sorted(allowed)}"
+                )
+            # A BEZIER segment needs both control handles.  The Rust mirror
+            # rejects a handle-less BEZIER rather than fabricating handles
+            # (which would silently change the interpolated motion), so we
+            # reject up front here too to keep the contract consistent.
+            if interp == "BEZIER":
+                for key in ("handle_right", "handle_left"):
+                    handle = s.get(key)
+                    if handle is None:
+                        raise ValueError(
+                            f"transform_keyframes segment {i}: BEZIER "
+                            f"segment missing '{key}'"
+                        )
+                    if len(handle) != 2:
+                        raise ValueError(
+                            f"transform_keyframes segment {i}: '{key}' "
+                            f"must be a length-2 sequence"
+                        )
+        local_arr = np.asarray(local_vert, dtype=np.float64)
+        translations_arr = [np.asarray(t, dtype=np.float64) for t in translations]
+        quaternions_arr = [np.asarray(q, dtype=np.float64) for q in quaternions]
+        scales_arr = [np.asarray(s, dtype=np.float64) for s in scales]
+        rest_arr = np.asarray(rest_translation, dtype=np.float64)
+        self._rust.transform_keyframes(
+            local_arr,
+            list(times),
+            translations_arr,
+            quaternions_arr,
+            scales_arr,
+            list(segments),
+            rest_arr,
+        )
+        self._data.operations.append(
+            TransformKeyframeOperation(
+                local_vert=local_arr,
+                times=list(times),
+                translations=translations_arr,
+                quaternions=quaternions_arr,
+                scales=scales_arr,
+                segments=list(segments),
+                rest_translation=rest_arr,
+            )
+        )
+        return self
+
+    def move_to(
+        self, target_pos, t_start: float = 0.0, t_end: float = 1.0,
+        transition: Optional[str] = None, bezier_handles=None,
+    ) -> "PinHolder":
+        """Move the object to absolute target positions over a specified time range.
+
+        Args:
+            target_pos (list[float]): The target positions (absolute).
+            t_start (float): The start time. Defaults to 0.0.
+            t_end (float): The end time. Defaults to 1.0.
+            transition (str, optional): Override interpolation type.
+            bezier_handles: Bezier control points for easing ((hr_t, hr_v), (hl_t, hl_v)).
+
+        Returns:
+            PinHolder: The pinholder with the updated position.
+        """
+        target_pos = np.asarray(target_pos, dtype=np.float64).reshape((-1, 3))
+
+        if len(target_pos) == 1:
+            # Singleton-target: resolve against the object's current
+            # position. This depends on `self._obj`, which lives only
+            # on the Python side, so we expand here before forwarding
+            # the resolved (N, 3) array to the Rust mirror.
+            initial_vertices = self._obj.vertex(False)[self._data.index]
+            current_center = np.array(self._obj.position)
+            delta = target_pos[0] - current_center
+            target_pos = initial_vertices + delta
+        elif len(target_pos) != len(self.index):
+            raise Exception("target_pos must have the same length as pin")
+
+        if t_end <= t_start:
+            raise Exception("t_end must be greater than t_start")
+
+        self._rust.move_to(
+            target_pos, t_start, t_end, transition, bezier_handles,
+        )
+        self._data.operations.append(
+            MoveToOperation(
+                target=target_pos,
+                t_start=t_start,
+                t_end=t_end,
+                transition=transition if transition else self._data.transition,
+                bezier_handles=bezier_handles,
+            )
+        )
+        return self
+
+    def scale(
+        self,
+        scale: float,
+        t_start: float = 0.0,
+        t_end: float = 1.0,
+        center: Optional[list[float]] = None,
+        center_mode: str = "absolute",
+    ) -> "PinHolder":
+        """Scale the object by a specified factor over a time range.
+
+        Interpolates the scale factor from 1.0 to the target scale over [t_start, t_end].
+
+        Args:
+            scale (float): The target scaling factor.
+            t_start (float): The start time of the scaling. Defaults to 0.0.
+            t_end (float): The end time of the scaling. Defaults to 1.0.
+            center (Optional[list[float]]): The center point for scaling. If not provided, uses the origin (0, 0, 0).
+            center_mode (str): "centroid" to compute center from vertex positions at runtime, or "absolute" for fixed coordinate.
+
+        Returns:
+            PinHolder: The pinholder with the updated scaling.
+        """
+        center_point = np.array(center) if center is not None else np.zeros(3)
+
+        self._rust.scale(scale, t_start, t_end, center_point, center_mode)
+        self._data.operations.append(
+            ScaleOperation(
+                center=center_point,
+                factor=scale,
+                t_start=t_start,
+                t_end=t_end,
+                transition=self._data.transition,
+                center_mode=center_mode,
+            )
+        )
+        return self
+
+    def pull(self, strength: float = 1.0) -> "PinHolder":
+        """Set the pull strength applied to the pinned vertices.
+
+        Args:
+            strength (float, optional): The pull strength. Defaults to 1.0.
+
+        Returns:
+            PinHolder: The pinholder with the updated pull strength.
+        """
+        self._rust.pull(strength)
+        self._data.pull_strength = strength
+        return self
+
+    def pull_per_vertex(self, weights) -> "PinHolder":
+        """Set a per-vertex pull weight array (aligned to ``self.index``).
+
+        Overrides the scalar :meth:`pull` strength per vertex on the solver
+        side (exported as ``pin-pullw-{i}.bin``). Keep a positive scalar
+        ``pull()`` too: it stays the holder's classification marker (soft
+        pull vs hard fix) for the velocity set. ``pull_weights`` is a
+        Python-only field: the Rust validator does not carry it, so the
+        mirror is left on the scalar and only ``self._data`` is updated
+        here (and ``self._data`` is what feeds the FixedScene export).
+        """
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)
+        if len(w) != len(self._data.index):
+            raise ValueError(
+                "pull_per_vertex: weights length "
+                f"{len(w)} must match pin index count {len(self._data.index)}"
+            )
+        self._data.pull_weights = w
+        return self
+
+    def set_allow_intersection(self, allow: bool = True) -> "PinHolder":
+        """Let the elements this pin fully covers pass through what they meet.
+
+        The same setting as ``allow_intersection`` on :meth:`Object.pin`, for
+        a holder that already exists. Such an element gets no contact force,
+        is not held apart by the line search, and is not reported as an
+        intersection. An element qualifies only when every one of its
+        vertices is pinned and every pin covering those vertices set this, so
+        a partially pinned band still collides. Both a fixed pin and a
+        :meth:`pull` pin carry it.
+
+        Args:
+            allow (bool, optional): True to let the covered elements pass
+                through, False to make them collide again. Defaults to True.
+
+        Returns:
+            PinHolder: The pinholder, for chaining.
+
+        Example:
+            Pin a garment band captured from a rig-deformed pose, where the
+            prescribed placement overlaps the body::
+
+                band = shirt.pin(band_indices)
+                band.set_allow_intersection(True)
+        """
+        self._data.allow_intersection = bool(allow)
+        return self
+
+    def set_pin_group_id(self, pin_group_id: str) -> "PinHolder":
+        """Put this holder in a named pin group.
+
+        Every holder starts in a group of its own. Holders that share an id
+        and each carry a :meth:`torque` operation are one torque group: the
+        solver applies the torque about the centroid and principal axes of
+        all their vertices together, rather than of each holder's own, and
+        takes its magnitude, axis component and hint vertex from the first
+        holder of the group. A holder with no torque operation adds nothing
+        to its group, and nothing else reads the group.
+
+        Args:
+            pin_group_id (str): The group's name. Must not be empty: the
+                solver reads a missing id as the empty string, so an empty
+                one would join every holder that has none.
+
+        Returns:
+            PinHolder: The pinholder, for chaining.
+
+        Raises:
+            TypeError: If ``pin_group_id`` is not a string.
+            ValueError: If ``pin_group_id`` is empty.
+
+        Example:
+            Turn the two halves of a wheel's rim about one shared axis,
+            with ``top``, a vertex of the wheel, fixing the axis's sign::
+
+                for rim in (left_rim, right_rim):
+                    wheel.pin(rim).torque(
+                        magnitude=5.0, axis_component=2, hint_vertex=top,
+                    ).set_pin_group_id("rim")
+        """
+        if not isinstance(pin_group_id, str):
+            raise TypeError(
+                f"pin_group_id must be a str, got {type(pin_group_id).__name__}"
+            )
+        self._rust.set_pin_group_id(pin_group_id)
+        self._data.pin_group_id = pin_group_id
+        return self
+
+    def track_rest_shape(self, enabled: bool = True) -> "PinHolder":
+        """Make the object's rest shape follow this pin's prescribed motion.
+
+        At every start and end time of this holder's operations, the scene
+        builder applies those operations to the object's rest shape, and the
+        solver moves the rest shape through the resulting keyframes. The body
+        then settles into the prescribed deformation instead of resisting it
+        as elastic strain, while the pins keep guiding it and contact still
+        resolves. Both a fixed pin and a :meth:`pull` pin can track.
+
+        The tracking pins of one object must together hold EVERY vertex of
+        it, and each must carry at least one operation. A rest shape moved
+        over only part of an object would tear at the edge of the moved
+        region, so :meth:`Scene.build` refuses one that does not.
+
+        Args:
+            enabled (bool, optional): True to track, False to keep the rest
+                shape fixed. Defaults to True.
+
+        Returns:
+            PinHolder: The pinholder, for chaining.
+
+        Example:
+            Bend a bar along a captured deformation and let it rest there::
+
+                bar = scene.add("bar")
+                pin = bar.pin()
+                for k in range(len(frames) - 1):
+                    pin.move_by(frames[k + 1] - frames[k], times[k], times[k + 1])
+                pin.pull(1.0).track_rest_shape()
+        """
+        self._data.rest_shape_track = bool(enabled)
+        return self
+
+    def spin(
+        self,
+        center: Optional[list[float]] = None,
+        axis: Optional[list[float]] = None,
+        angular_velocity: float = 360.0,
+        t_start: float = 0.0,
+        t_end: float = float("inf"),
+        center_mode: str = "absolute",
+    ) -> "PinHolder":
+        """Add a spin operation to the pin.
+
+        Args:
+            center: Center of rotation. Defaults to [0, 0, 0].
+            axis: Rotation axis. Defaults to [0, 1, 0].
+            angular_velocity: Rotation speed in degrees/second.
+            t_start: Start time of spin.
+            t_end: End time of spin.
+            center_mode: "centroid" to compute center from vertex positions at runtime, or "absolute" for fixed coordinate.
+
+        Returns:
+            PinHolder: The pinholder with the spin operation added.
+
+        Raises:
+            ValueError: If ``axis`` has no length while ``angular_velocity``
+                is not zero. The rotation normalizes its axis, and a
+                zero-length one leaves it nothing to turn about: the pinned
+                vertices would contract toward ``center`` instead of turning.
+        """
+        if axis is None:
+            axis = [0.0, 1.0, 0.0]
+        if center is None:
+            center = [0.0, 0.0, 0.0]
+        axis_length = float(np.linalg.norm(np.asarray(axis, dtype=np.float64)))
+        if not axis_length > 0.0 and float(angular_velocity) != 0.0:
+            raise ValueError(
+                f"spin axis {[float(c) for c in axis]} has no length but the "
+                f"angular velocity is {float(angular_velocity)} deg/s; give "
+                "the spin an axis"
+            )
+
+        self._rust.spin(
+            np.array(center, dtype=np.float64),
+            np.array(axis, dtype=np.float64),
+            angular_velocity, t_start, t_end, center_mode,
+        )
+        self._data.operations.append(
+            SpinOperation(
+                center=np.array(center),
+                axis=np.array(axis),
+                angular_velocity=angular_velocity,
+                t_start=t_start,
+                t_end=t_end,
+                center_mode=center_mode,
+            )
+        )
+        return self
+
+    def torque(
+        self,
+        magnitude: float = 1.0,
+        axis_component: int = 2,
+        hint_vertex: Optional[int] = None,
+        t_start: float = 0.0,
+        t_end: float = float("inf"),
+    ) -> "PinHolder":
+        """Add a torque operation to the pin.
+
+        Applies a constant rotational force around a PCA-computed axis.
+        The center is always the centroid of the pin vertices.
+
+        A principal axis has no sign of its own, so the solver orients it to
+        point from the centroid toward ``hint_vertex`` at every step, and
+        that orientation is what decides which way ``magnitude`` turns the
+        object. The hint is therefore required.
+
+        Args:
+            magnitude: Torque in N·m.
+            axis_component: 0=PC1 (major), 1=PC2 (middle), 2=PC3 (minor).
+            hint_vertex: A vertex of this pin's object, in its own
+                numbering, on the side the axis should point toward.
+            t_start: Start time in seconds.
+            t_end: End time in seconds.
+
+        Returns:
+            PinHolder: The pinholder with the torque operation added.
+
+        Raises:
+            ValueError: If ``hint_vertex`` is missing or is not a vertex of
+                the object.
+
+        Example:
+            Twist a post about its long axis, which is its major principal
+            axis, oriented toward its topmost vertex::
+
+                post = scene.add("post")
+                top = int(post.vertex(False)[:, 1].argmax())
+                post.pin().torque(magnitude=0.5, axis_component=0,
+                                  hint_vertex=top)
+        """
+        n_vert = len(self._obj.get("V"))
+        if hint_vertex is None or not 0 <= int(hint_vertex) < n_vert:
+            raise ValueError(
+                f"torque needs a hint_vertex of '{self._obj.name}', one of its "
+                f"{n_vert} vertices, got {hint_vertex!r}: the torque axis is a "
+                "principal axis whose sign only the hint vertex fixes"
+            )
+        hint_vertex = int(hint_vertex)
+        self._rust.torque(
+            magnitude, axis_component, hint_vertex, t_start, t_end,
+        )
+        self._data.operations.append(
+            TorqueOperation(
+                axis_component=axis_component,
+                magnitude=magnitude,
+                hint_vertex=hint_vertex,
+                t_start=t_start,
+                t_end=t_end,
+            )
+        )
+        return self
+
+    @property
+    def data(self) -> Optional[PinData]:
+        """Get the pinning data.
+
+        Returns:
+            PinData: The pinning data.
+        """
+        return self._data
+
+    @property
+    def index(self) -> list[int]:
+        """Get pinned vertex indices."""
+        return self._data.index
+
+    @property
+    def operations(self) -> list[Operation]:
+        """Get list of operations."""
+        return self._data.operations
+
+    @property
+    def unpin_time(self) -> Optional[float]:
+        """Get the time at which vertices should unpin."""
+        return self._data.unpin_time
+
+    @property
+    def pull_strength(self) -> float:
+        """Get pull force strength."""
+        return self._data.pull_strength
+
+    @property
+    def pull_weights(self):
+        """Get the optional per-vertex pull weight array (or None)."""
+        return self._data.pull_weights
+
+    @property
+    def rest_shape_track(self) -> bool:
+        """Whether this pull holder drives a time-varying rest shape from a
+        captured deformation (see ``PinData.rest_shape_track``)."""
+        return self._data.rest_shape_track
+
+    @property
+    def allow_intersection(self) -> bool:
+        """Whether this pin asks for the intersections of the elements it
+        fully covers to be tolerated (see ``PinData.allow_intersection``)."""
+        return self._data.allow_intersection
+
+    @property
+    def transition(self) -> str:
+        """Get the transition type."""
+        return self._data.transition
+
+    @property
+    def pin_group_id(self) -> str:
+        """Get the pin group identifier."""
+        return self._data.pin_group_id

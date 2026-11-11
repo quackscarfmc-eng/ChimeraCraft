@@ -1,0 +1,41 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "in1Attr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in1",
+            "type" : "Vec3f"
+        },
+        "in2Attr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in2",
+            "type" : "Vec3f"
+        },
+        "value1Attr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "value1",
+            "type" : "Float"
+        },
+        "value2Attr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "value2",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_ifgreater_vector3",
+    "type" : "Map"
+}

@@ -1,0 +1,974 @@
+// File: main.rs
+// Code: Claude Code and Codex
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+
+mod args;
+mod backend;
+mod builder;
+mod cosserat;
+// The neutral driver: the Newton loop, the linear solve, the assembly order and
+// every dispatch decision, written once and driven through the `Device` seam.
+// It defines the `extern "C"` surface the unconditional declarations in
+// `backend.rs`, `main.rs` and `status_writer.rs` bind to, so not one call site
+// moves when it is the thing running.
+//
+// UNGATED: every backend `build.rs` can select links an implementation of the
+// seam for the driver to drive, since the C++ orchestrators are deleted.
+mod driver;
+mod cvec;
+mod cvecvec;
+mod data;
+mod embedded_api;
+mod force_field;
+mod mesh;
+mod plastic_state;
+mod raw_vec;
+mod scene;
+#[cfg(unix)]
+mod signal_sidecar;
+mod statistics;
+mod status_writer;
+mod triutils;
+
+use args::{ProgramArgs, SimArgs};
+use backend::MeshSet;
+use clap::Parser;
+use data::{DataSet, EdgeParam, EdgeProp, ParamSet};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use log::*;
+use log4rs::append::console::ConsoleAppender;
+use log4rs::config::{Appender, Config, Root};
+use log4rs::encode::pattern::PatternEncoder;
+use mesh::Mesh as SimMesh;
+use rayon::prelude::*;
+use scene::Scene;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::os::raw::c_char;
+use {builder::Props, cvec::CVec};
+
+extern crate nalgebra as na;
+
+extern "C" {
+    fn set_log_path(data_dir: *const c_char);
+}
+
+#[no_mangle]
+extern "C" fn print_rust(message: *const libc::c_char) {
+    let message = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_str()
+        .unwrap();
+    info!("{message}");
+}
+
+/// The exit status of `--probe` when this build has no usable device here. Not
+/// 1, which a panic or a refused argument also produces, so a crash is never
+/// read as the answer "unusable".
+const PROBE_UNUSABLE: i32 = 3;
+
+/// `--probe`: whether this binary can run on this machine, answered by the
+/// backend itself.
+///
+/// A distribution carries one directory per backend, and choosing among them
+/// needs "this backend has a usable device here", which only the backend can
+/// say. The answer is the preflight a session runs (`check_gpu`), which carries
+/// the precise refusals, followed by opening the device through the constructor
+/// a run uses, with its failure reported instead of panicked on.
+///
+/// The output is `key: value` lines on stdout, which the frontend's backend
+/// resolution reads: `backend`, `linked` where a library is linked, `stamp`
+/// (`ppf_cts_formats::SOURCE_STAMP`), then `device` with exit 0 or `unusable`
+/// with [`PROBE_UNUSABLE`].
+fn probe() -> i32 {
+    println!("backend: {}", env!("PPF_BACKEND"));
+    #[cfg(abi_backend_linked)]
+    {
+        println!("linked: {}", ppf_cts_compute::abi::linked_backend_name());
+    }
+    println!("stamp: {}", ppf_cts_formats::SOURCE_STAMP);
+    if let Err(error) = ppf_cts_core::utils::check_gpu() {
+        println!("unusable: {error}");
+        return PROBE_UNUSABLE;
+    }
+    match driver::probe_device() {
+        Ok(name) => {
+            println!("device: {name}");
+            0
+        }
+        Err(fault) => {
+            println!("unusable: {fault}");
+            PROBE_UNUSABLE
+        }
+    }
+}
+
+fn main() {
+    // WHETHER THIS BINARY CAN RUN HERE; see `probe`. Handled before the
+    // argument parser for the same reason `--backend` below is.
+    if std::env::args().any(|argument| argument == "--probe") {
+        std::process::exit(probe());
+    }
+    // WHICH BACKEND THIS BINARY IS, asked of the artifact itself.
+    //
+    // Every backend links this same executable name, because launch scripts,
+    // the Windows batch files and the CI runners invoke it by that name, so
+    // neither the path nor the file name says what is inside it. `build.rs`
+    // compiles the answer in and this prints it. Handled before the argument
+    // parser, which knows nothing of this flag and would reject it.
+    if std::env::args().any(|argument| argument == "--backend") {
+        // TWO ANSWERS, AND THE SECOND IS THE ONE THAT CAN DISAGREE.
+        //
+        // `PPF_BACKEND` is what `build.rs` SELECTED. It is not evidence about
+        // what the binary can CALL: a build whose `abi_backend_linked` cfg is
+        // missed on one platform still reports `cuda` from this string while
+        // running the whole solve on the host renderings. A build-time label
+        // cannot catch that, since it is produced by the very step that went
+        // wrong.
+        //
+        // `be_backend_name` is answered by the LOADED library, so it reports
+        // what is actually linked. When a library is linked, both are printed
+        // and a disagreement is named rather than hidden. One source can build
+        // for two platforms (a HIP backend compiles for AMD and, through nvcc,
+        // for NVIDIA), so "selected rocm" and "linked hip-nvidia" are both true
+        // and mean different things.
+        println!("{}", env!("PPF_BACKEND"));
+        #[cfg(abi_backend_linked)]
+        {
+            let linked = ppf_cts_compute::abi::linked_backend_name();
+            if linked != env!("PPF_BACKEND") {
+                println!("linked: {linked}");
+            }
+        }
+        return;
+    }
+    let mut program_args = ProgramArgs::parse();
+    // `--load -1` is the "resume from latest checkpoint" sentinel the
+    // server emits when the user clicks Resume (see
+    // ppf-cts-server::executor::solver::launch_solver). The rest of
+    // this binary keys off `program_args.load > 0` for the resume
+    // path, so resolve the sentinel to a real frame index before
+    // anything reads it. Without this, `--load -1` falls into the
+    // fresh-start branch, and the discard past the resume point would
+    // start at index 0, which destroys the very checkpoint and vert
+    // frames the user wanted to resume from.
+    if program_args.load < 0 {
+        let output_dir = std::path::Path::new(&program_args.output);
+        let saved = ppf_cts_core::datamodel::list_saved_states(output_dir);
+        match saved.into_iter().max() {
+            Some(n) => {
+                program_args.load = n as i32;
+            }
+            None => {
+                eprintln!(
+                    "--load {} (resume from latest) but no state_<N>.bin.gz found in {}",
+                    program_args.load, program_args.output
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    // THE RUN'S COMPLETION MARKERS GO FIRST, before anything can refuse this
+    // launch. A marker left by the previous run in this directory would
+    // otherwise survive a launch that panics before `Backend::run` reaches
+    // its own removal, and a caller polling for it would read the refused
+    // resume as finished.
+    for marker in [ppf_cts_formats::files::FINISHED, ppf_cts_formats::files::INITIALIZE_FINISH] {
+        let path = std::path::Path::new(&program_args.output).join(marker);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("cannot remove the stale {}: {err}", path.display()),
+        }
+    }
+    // Initialize the logger before emitting any diagnostics. The git
+    // and float info! lines below (and the print_rust FFI bridge)
+    // route to the global NOP logger until log4rs is installed inside
+    // setup(), so they are silently dropped if setup() runs later.
+    // setup() only reads program_args (load/output, both resolved by
+    // the --load block above) and operates on args.output, while
+    // Scene::new below reads args.path, so there is no read-after-delete
+    // hazard from running setup() first.
+    setup(&program_args);
+
+    // Acquire the liveness lock and begin the structured status record
+    // right after setup()'s output-dir wipe (load==0) and before any
+    // backend work, so the lock covers the whole compute lifetime and a
+    // fresh run never reads its own scrubbed record. launch_id only needs
+    // to be unique across launches in the same output dir, so a
+    // pid + wall-clock mix is sufficient (not a security token).
+    let launch_id = {
+        let pid = std::process::id() as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mixed = pid.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(nanos) & 0xFFFF_FFFF_FFFF;
+        format!("{mixed:012x}")
+    };
+    status_writer::init(&program_args.output, launch_id, program_args.load > 0);
+
+    let info = git_info::get();
+    info!(
+        "git branch: {}",
+        info.current_branch.unwrap_or("Unknown".to_string())
+    );
+    info!(
+        "git hash: {}",
+        info.head.last_commit_hash.unwrap_or("Unknown".to_string())
+    );
+    let mut scene = Scene::new(&program_args);
+    let sim_args = scene.args();
+
+    if program_args.load > 0 {
+        let mut param = builder::make_param(&sim_args);
+        info!("Loading dataset...");
+        let mut dataset: DataSet = read(&read_gz(&format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::DATASET
+        )));
+        // The dataset's rest shape (the `inv_rest*` matrices and rest angles)
+        // is the build-time one, because the dataset is written once. A scene
+        // whose rest shape creeps also writes it per frame, so overwrite those
+        // fields with the frame being resumed (see `plastic_state`).
+        let split_layout = std::path::Path::new(&format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::CHECKPOINT_LAYOUT
+        ))
+        .exists();
+        let path_plastic = format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::plastic_filename(program_args.load)
+        );
+        if std::path::Path::new(&path_plastic).exists() {
+            info!("Loading plastic rest shape from {path_plastic}...");
+            let plastic: plastic_state::PlasticState = read(&read_gz(&path_plastic));
+            plastic.apply(&mut dataset);
+        } else if split_layout && plastic_state::PlasticKinds::of(&dataset).any() {
+            // This directory carries the layout marker, so the dataset's rest
+            // shape is the build-time one, which belongs to no checkpoint, and
+            // every checkpoint of a creeping scene was written with its own
+            // per-frame copy. This frame's is not on disk, so its rest shape
+            // exists nowhere and resuming would silently run on a shape from
+            // the wrong time.
+            panic!(
+                "checkpoint {} has no matching {}: the rest shape for this \
+                 frame is not on disk, so it cannot be resumed",
+                ppf_cts_formats::files::state_filename(program_args.load),
+                ppf_cts_formats::files::plastic_filename(program_args.load)
+            );
+        }
+        // Reaching here means either the scene never creeps, so the build-time
+        // rest shape in the dataset is still correct, or the directory carries
+        // no layout marker, where the dataset holds the shape last written into
+        // it. Both want it left as loaded. The two are told apart by that
+        // marker rather than by looking for per-frame files, whose absence is
+        // ambiguous: they are pruned along with their checkpoints, so "none
+        // present" cannot distinguish "never written" from "deleted".
+        info!("Loading backend state...");
+        let mut backend = backend::Backend::load_state(program_args.load, &program_args.output);
+        // THE FRICTION'S MEMORY, written beside every checkpoint of a scene in
+        // which some pair can carry friction. A checkpoint of such a scene
+        // without one cannot be resumed as it ran: every contact that was
+        // sticking would restart from zero slip, so it is refused by name.
+        let path_friction = format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::friction_filename(program_args.load)
+        );
+        if std::path::Path::new(&path_friction).exists() {
+            info!("Loading friction memory from {path_friction}...");
+            let memory: driver::friction_memory::FrictionMemoryState =
+                read(&read_gz(&path_friction));
+            if let Err(fatal) = memory.check(dataset.vertex.curr.size as usize) {
+                panic!("{path_friction} cannot be resumed: {}", fatal.detail);
+            }
+            backend.friction_memory = Some(memory);
+        } else if driver::scene_has_friction(&dataset) {
+            panic!(
+                "checkpoint {} has no matching {}: the scene carries friction, and where its \
+                 contacts were sticking at this frame is not on disk (a checkpoint written \
+                 before the solver kept that memory has none), so it cannot be resumed; run \
+                 it from the start",
+                ppf_cts_formats::files::state_filename(program_args.load),
+                ppf_cts_formats::files::friction_filename(program_args.load)
+            );
+        }
+        // THE ROTATIONAL RUN STATE (Cosserat frames and their history, grain
+        // spin, PDRD running rotation), written beside every checkpoint of a
+        // scene that carries any. A checkpoint of such a scene without it, or
+        // with one sized for another scene, would restart each of them from its
+        // authored value under a pose that has moved on, so it is refused by
+        // name, here, before anything in the directory is discarded.
+        let path_run = format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::runstate_filename(program_args.load)
+        );
+        let run_kinds = driver::run_state::RunStateKinds::of_dataset(&dataset);
+        if std::path::Path::new(&path_run).exists() {
+            info!("Loading run state from {path_run}...");
+            let run: driver::run_state::RunState = read(&read_gz(&path_run));
+            if let Err(fatal) = run.check(run_kinds) {
+                panic!("{path_run} cannot be resumed: {}", fatal.detail);
+            }
+            backend.run_state = Some(run);
+        } else if run_kinds.any() {
+            panic!(
+                "checkpoint {} has no matching {}: the scene carries {}, which a step reads \
+                 from the step before it, and their state at this frame is not on disk (a \
+                 checkpoint written before the solver kept it has none), so it cannot be \
+                 resumed; run it from the start",
+                ppf_cts_formats::files::state_filename(program_args.load),
+                ppf_cts_formats::files::runstate_filename(program_args.load),
+                run_kinds.describe()
+            );
+        }
+        info!("Data loaded successfully");
+        param.time = backend.state.time;
+        param.time_f32 = param.time as f32;
+        param.prev_dt = backend.state.prev_dt;
+        builder::copy_to_dataset(
+            &backend.state.curr_vertex,
+            &backend.state.prev_vertex,
+            &mut dataset,
+        );
+        backend.run(&program_args, &sim_args, dataset, param, scene);
+    } else {
+        info!("Initializing mesh...");
+        let mut backend = backend::Backend::new(scene.make_mesh());
+        let mesh = &backend.mesh;
+        let face_area = triutils::face_areas(&mesh.vertex, &mesh.mesh.mesh.face);
+        let tet_volumes = triutils::tet_volumes(&mesh.vertex, &mesh.mesh.mesh.tet);
+
+        info!("Building material properties...");
+        let mut props = scene.make_props(mesh, &face_area, &tet_volumes);
+
+        info!("Computing constraints and parameters...");
+        let time = backend.state.time;
+        // Standalone snapshot for the param summary, not a step: prev == time,
+        // so every fix pin's step_delta is zero.
+        let temp_constraint = scene.make_constraint(time, time);
+        scene.export_param_summary(&program_args, &props, &face_area, &tet_volumes);
+
+        let mut total_rod_mass = 0.0;
+        let mut total_area_mass = 0.0;
+        let mut total_vol_mass = 0.0;
+
+        for prop in props.face.iter() {
+            total_area_mass += prop.mass;
+        }
+
+        info!("Building edge parameter map...");
+        // Build edge param map for deduplication
+        let mut edge_param_map: HashMap<EdgeParam, u32> = HashMap::new();
+        for (i, param) in props.edge_params.iter().enumerate() {
+            edge_param_map.insert(*param, i as u32);
+        }
+
+        info!("Processing edge properties...");
+        // Process rod edges (sequential, small count)
+        for i in 0..mesh.mesh.mesh.rod_count {
+            let prop = props.edge[i];
+            total_rod_mass += prop.mass;
+        }
+
+        // Process non-rod edges (parallelized)
+        // Step 1: Parallel computation
+        let rod_count = mesh.mesh.mesh.rod_count;
+        let edge_count = mesh.mesh.mesh.edge.ncols();
+        let non_rod_edge_data: Vec<(f32, EdgeParam)> = (rod_count..edge_count)
+            .into_par_iter()
+            .map(|i| {
+                let rod = mesh.mesh.mesh.edge.column(i);
+                let x0 = mesh.vertex.column(rod[0]);
+                let x1 = mesh.vertex.column(rod[1]);
+                let length = (x1 - x0).map(f32::from).norm();
+                let param = builder::averaged_edge_param(
+                    &mesh.mesh.neighbor.edge.face[i],
+                    &props.face,
+                    &props.face_params,
+                    |j, _| face_area[j],
+                );
+                (length, param)
+            })
+            .collect();
+
+        // Step 2: Sequential deduplication
+        let animated_materials = props.animated_materials;
+        for (length, param) in non_rod_edge_data {
+            // Identity indices for an animated scene, matching every other
+            // param table: the per-frame path rewrites these values, and a
+            // deduplicated table would renumber underneath the param_index
+            // stored on each EdgeProp below.
+            let param_idx = if animated_materials {
+                props.edge_params.push(param);
+                (props.edge_params.len() - 1) as u32
+            } else {
+                *edge_param_map.entry(param).or_insert_with(|| {
+                    let new_idx = props.edge_params.len() as u32;
+                    props.edge_params.push(param);
+                    new_idx
+                })
+            };
+            props.edge.push(EdgeProp {
+                length,
+                initial_length: length,
+                mass: 0.0,
+                fixed: false,
+                param_index: param_idx,
+                // Both `fixed` and this are derived in builder::build, which
+                // runs after these face edges have been appended, so it sees
+                // the full edge list.
+                pin_allow_intersection: false,
+            });
+        }
+
+        for prop in props.tet.iter() {
+            total_vol_mass += prop.mass;
+        }
+
+        let mut mass_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/data/total_mass.out", program_args.output).as_str())
+            .unwrap();
+        writeln!(
+            mass_file,
+            "{total_rod_mass} {total_area_mass} {total_vol_mass}"
+        )
+        .unwrap();
+        let velocity = scene.get_initial_velocity();
+
+        info!("Building dataset (this may take a while)...");
+        let pdrd_data = builder::PdrdSceneData {
+            body_rows: scene.pdrd_body_rows(),
+            vert_index: scene.pdrd_vert_index(),
+            vert_list: scene.pdrd_vert_list(),
+            rest_centered: scene.pdrd_rest_centered(),
+        };
+        let lock_data = builder::LockSceneData {
+            translation_axes: scene.translation_locks(),
+            translation_modes: scene.translation_lock_modes(),
+            rotation_axes: scene.rotation_locks(),
+            rotation_modes: scene.rotation_lock_modes(),
+            vert_dmap: scene.vert_dmap(),
+        };
+        let cosserat_data = builder::CosseratSceneData {
+            edge: scene.cosserat_edge(),
+            tilt: scene.cosserat_tilt(),
+        };
+        let mut dataset = builder::build(
+            &sim_args,
+            mesh,
+            &velocity,
+            &mut props,
+            temp_constraint,
+            pdrd_data,
+            lock_data,
+            cosserat_data,
+        );
+        {
+            let (vertex, ind, w) = scene.ties();
+            dataset.tie_vertex = cvec::CVec::from(vertex);
+            dataset.tie_ctrl = cvec::CVec::from(ind);
+            dataset.tie_weight = cvec::CVec::from(w);
+        }
+        info!("Dataset built successfully");
+
+        let param = builder::make_param(&sim_args);
+        backend.run(&program_args, &sim_args, dataset, param, scene);
+    }
+}
+
+fn remove_old_files(dirpath: &str, prefix: &str, suffix: &str, keep_number: i32, max_frame: i32) {
+    if keep_number <= 0 {
+        return;
+    }
+
+    let mut n = 0;
+    for i in 0..=max_frame {
+        let path = format!("{dirpath}/{prefix}{i}{suffix}");
+        if std::path::Path::new(&path).exists() {
+            n += 1;
+        }
+    }
+
+    let mut i = 0;
+    while n > keep_number {
+        let filename = format!("{prefix}{i}{suffix}");
+        let path = format!("{dirpath}/{filename}");
+        if std::path::Path::new(&path).exists() {
+            info!("Removing {filename}...");
+            std::fs::remove_file(path).unwrap_or(());
+            n -= 1;
+        }
+        i += 1;
+        if i > max_frame {
+            break;
+        }
+    }
+}
+
+fn remove_files(dirpath: &str, base: &str, ext: &str, load: i32) {
+    let mut count = load + 1;
+    loop {
+        let path = format!("{dirpath}/{base}_{count}.{ext}");
+        if std::path::Path::new(&path).exists() {
+            std::fs::remove_file(path).unwrap_or(());
+        } else {
+            break;
+        }
+        count += 1;
+    }
+}
+
+fn remove_files_in_dir(path: &str) -> std::io::Result<()> {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.into_iter().flatten() {
+            // ``save_and_quit`` is a control sentinel the server may
+            // write between launch and the solver's setup(). Wiping
+            // it here would lose the save request and the solver
+            // would run to completion. Preserve it. The server's
+            // launch_solver already cleared stale sentinels before
+            // spawning, so anything present now is fresh.
+            //
+            // ``hold_at_frame`` is preserved for the same reason: a
+            // frontend asking to hold at an early frame writes it before
+            // it launches, and a hold wiped here runs the whole scene.
+            if entry.file_name() == ppf_cts_formats::files::SAVE_AND_QUIT
+                || entry.file_name() == ppf_cts_formats::files::HOLD_AT_FRAME
+            {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_file() {
+                std::fs::remove_file(path)?;
+            } else if path.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the simulation time recorded for `load` from
+/// ``<output>/data/frame_to_time.out``. That stream is written as
+/// ``{frame} {time}`` once per output frame (see
+/// Backend::write_frame_outputs), so the row whose first column equals
+/// `load` gives the sim time at the resume checkpoint. Returns None when
+/// the file is missing or has no matching row; callers then skip
+/// time-keyed pruning rather than guess a threshold.
+fn loaded_time_for_frame(output: &str, load: i32) -> Option<f64> {
+    let contents = std::fs::read_to_string(format!("{output}/data/frame_to_time.out")).ok()?;
+    for line in contents.lines() {
+        let mut cols = line.split_whitespace();
+        let frame: i32 = cols.next()?.parse().ok()?;
+        if frame == load {
+            return cols.next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// On resume, drop rows that belong to frames the run is about to
+/// resimulate from the ``<output>/data/*.out`` streams. All of these are
+/// opened append-only (Rust-side time_per_frame/frame_to_time/clock and
+/// the C++ SimpleLog metrics), so without this the frames after the
+/// checkpoint would get duplicate keys, skewing the averaged-metric
+/// readers in ppf-cts-core's session::log.
+///
+/// time_per_frame.out and frame_to_time.out are keyed by integer frame
+/// index, so keep rows with ``frame <= load``. Every other stream is
+/// keyed by sim time (the C++ SimpleLog writes ``{time} {value}``, and
+/// clock.out matches), so keep rows with ``time <= loaded_time``. Lines
+/// whose first column is not the expected numeric key are left in place
+/// to avoid silently dropping data we don't understand.
+fn prune_out_streams(output: &str, load: i32) {
+    let data_dir = format!("{output}/data");
+    let loaded_time = loaded_time_for_frame(output, load);
+    let entries = match std::fs::read_dir(&data_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("out") {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+        let frame_keyed = name == "time_per_frame.out" || name == "frame_to_time.out";
+        // Without a sim-time threshold there is nothing to prune the
+        // time-keyed streams against, so leave them untouched.
+        if !frame_keyed && loaded_time.is_none() {
+            continue;
+        }
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+        let mut kept = String::with_capacity(contents.len());
+        for line in contents.lines() {
+            let keep = match line.split_whitespace().next() {
+                Some(first) if frame_keyed => match first.parse::<i32>() {
+                    Ok(frame) => frame <= load,
+                    Err(_) => true,
+                },
+                Some(first) => match first.parse::<f64>() {
+                    Ok(time) => time <= loaded_time.unwrap(),
+                    Err(_) => true,
+                },
+                None => true,
+            };
+            if keep {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+        std::fs::write(&path, kept).unwrap_or(());
+    }
+}
+
+/// Discard what a resumed run will write again: every frame, statistics record
+/// and checkpoint past the resume point, and the stream rows after it.
+///
+/// ONLY ONCE THE RESUME CAN NO LONGER BE REFUSED. `Backend::run` calls it after
+/// `initialize()` has accepted the resumed scene and the checkpoint's friction
+/// memory and run state are installed, before the first step writes anything;
+/// see `setup`.
+pub(crate) fn discard_after_resume_point(program_args: &ProgramArgs) {
+    remove_files(&program_args.output, "vert", "bin", program_args.load);
+    remove_files(&program_args.output, "display_pin", "bin", program_args.load);
+    remove_files(
+        &program_args.output,
+        "statistics",
+        "cbor",
+        program_args.load,
+    );
+    // State checkpoints are sparse on disk: save_state writes
+    // state_<N>.bin.gz only every auto_save frames, and
+    // remove_old_files keeps just keep_states of them at the
+    // highest indices. So the indices are scattered high values,
+    // not contiguous from load+1. A contiguous break-on-gap scan
+    // (like the vert one above) would stop at the first absent
+    // index after the resume point and leave newer checkpoints
+    // behind, which a later `--load -1` (resume from latest) would
+    // then resolve to and jump past the frame the user branched
+    // from. Enumerate the actual on-disk set and drop every index
+    // newer than the resume frame instead of assuming contiguity.
+    //
+    // The per-frame rest shape, friction memory and run state are dropped in lockstep
+    // with the checkpoint they belong to. Both sets are written at the same frames and pruned to
+    // the same `keep_states` count, so letting one outlive the other would
+    // desync the two budgets: an orphaned `plastic_<n>` above the resume
+    // point pushes the retention pass into deleting the OLDEST plastic
+    // file, whose `state_<n>` is still on disk, and resuming from that
+    // frame would then fail on a rest shape that no longer exists.
+    let output_dir = std::path::Path::new(&program_args.output);
+    for n in ppf_cts_core::datamodel::list_saved_states(output_dir) {
+        if (n as i32) > program_args.load {
+            for name in [
+                ppf_cts_formats::files::state_filename(n as i32),
+                ppf_cts_formats::files::plastic_filename(n as i32),
+                ppf_cts_formats::files::friction_filename(n as i32),
+                ppf_cts_formats::files::runstate_filename(n as i32),
+            ] {
+                let path = format!("{}/{name}", program_args.output);
+                std::fs::remove_file(path).unwrap_or(());
+            }
+        }
+    }
+    // The .out streams in output/data are append-only, so the resume
+    // run would re-append rows for frames load+1.. that the original
+    // run already recorded. Prune them to frames/time <= the
+    // checkpoint so resumed frames don't produce duplicate keys.
+    prune_out_streams(&program_args.output, program_args.load);
+}
+
+fn setup(program_args: &ProgramArgs) {
+    // A RESUME DISCARDS NOTHING HERE. What lies past the resume point (the
+    // frames, the newer checkpoints, the stream rows) is the previous run's
+    // only copy of its results, and a resume can still be refused after this:
+    // a checkpoint missing a file its scene needs, a scene `initialize()`
+    // declines. So the discard waits until every refusal has had its chance
+    // (`discard_after_resume_point`, called by `Backend::run` once the resumed
+    // scene is initialized and its checkpoint installed), and a refused resume
+    // leaves the directory as it found it.
+    if program_args.load == 0 {
+        remove_files_in_dir(&program_args.output).unwrap();
+    }
+
+    if !std::path::Path::new(&program_args.output).exists() {
+        std::fs::create_dir_all(&program_args.output).unwrap_or(());
+    }
+    // ``output/data/`` holds the per-frame .out streams (total_mass,
+    // time_per_frame, frame_to_time, ...). Nothing else creates it,
+    // so a fresh run on a clean output dir hits NotFound when the
+    // first writeln! fires. Make sure the dir exists up-front.
+    let data_dir = format!("{}/data", program_args.output);
+    if !std::path::Path::new(&data_dir).exists() {
+        std::fs::create_dir_all(&data_dir).unwrap_or(());
+    }
+    // The server's launch_solver removes any stale ``save_and_quit``
+    // sentinel before spawning this process, so anything present here
+    // was written between spawn and setup() and reflects the user's
+    // intent. Don't preemptively delete it: the run() loop will pick
+    // it up on the first iteration and call save_state.
+
+    // TWO WRITERS SHARE THIS STDOUT STREAM, AND ONLY ONE OF THEM IS TIMESTAMPED.
+    // This pattern prefixes every `::log::` record, which is the whole of the
+    // solver's Rust-side output. The other writer is `driver::log`, which
+    // reproduces `src/kernels/simplelog/SimpleLog.cpp` and prints with
+    // `println!` and no prefix at all: the mark lines (`* iter: 199`), the
+    // phase lines (`> linsolve...7 msec`) and the section brackets
+    // (`====== advance ======`). A solve's transcript therefore carries
+    // `===== advance: 28 msec =====` bare and
+    // `[2026-09-08 07:26:36] GPU SM Clock: 2520 MHz` prefixed one line later.
+    //
+    // So the missing prefix on those lines is the specification rather than an
+    // oversight, and routing them through `info!` to make the stream uniform
+    // would restore the prefix and change what every reader of this log sees:
+    // the frontend's `>>> Log:` tail, the addon's log panel and a person
+    // watching a solve. Those lines are a host contract, not free-form output.
+    //
+    // Interleaving is exact and needs no coordination. log4rs's
+    // `ConsoleAppender` writes through `io::stdout()` whenever stdout is not a
+    // tty, which is the shipped case (the solver's stdout is redirected into
+    // `session/stdout.log`), so it shares the handle and the lock `println!`
+    // uses. On a tty it writes to fd 1 directly, but it flushes per record and
+    // `println!` flushes per line, so neither writer leaves a partial line
+    // outstanding across the other.
+    // THE LEVEL IS READ FROM `RUST_LOG`, AND WITHOUT THAT A DEMOTION IS A
+    // DELETION. Diagnostics that carry more than a shipped transcript needs sit
+    // at `debug!`, so the default stream stays the one the addon's log panel
+    // and the frontend's tail were written against. That is only a demotion if
+    // something can still ask for them: with the level hardcoded at `Info` the
+    // `debug!` call is unreachable in the shipped binary, and the fixtures that
+    // assert on those lines fail with no way to switch them back on.
+    fn level_from_environment() -> LevelFilter {
+        // An unparseable value is reported rather than silently ignored: a
+        // typo in `RUST_LOG` that quietly gave the default would be read as
+        // the diagnostic having gone missing.
+        match std::env::var("RUST_LOG") {
+            Ok(text) => match text.trim().parse::<LevelFilter>() {
+                Ok(level) => level,
+                Err(_) => {
+                    eprintln!(
+                        "solver: RUST_LOG={text:?} is not a log level; \
+                         using info. Valid: error, warn, info, debug, trace."
+                    );
+                    LevelFilter::Info
+                }
+            },
+            Err(_) => LevelFilter::Info,
+        }
+    }
+
+    let pattern = "[{d(%Y-%m-%d %H:%M:%S)}] {m}{n}";
+    let stdout = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(pattern)))
+        .build();
+    let config = Config::builder()
+        .appender(Appender::builder().build("stdout", Box::new(stdout)))
+        .build(Root::builder().appender("stdout").build(level_from_environment()))
+        .unwrap();
+
+    log4rs::init_config(config).unwrap();
+
+    info!("{}", std::env::args().collect::<Vec<_>>().join(" "));
+    let data_dir = CString::new(format!("{}/data", program_args.output)).unwrap();
+    unsafe {
+        set_log_path(data_dir.as_ptr());
+    }
+}
+
+fn decompress_from_gz(compressed_data: Vec<u8>, path: &str) -> Vec<u8> {
+    let mut decoder = GzDecoder::new(compressed_data.as_slice());
+    let mut decompressed_data = Vec::new();
+    if let Err(e) = decoder.read_to_end(&mut decompressed_data) {
+        panic!(
+            "Failed to decompress '{path}': {e}. The file is likely truncated \
+             or corrupt, for example an auto-save that was interrupted or an \
+             incomplete file transfer. Resuming from this checkpoint is not \
+             possible; re-run the simulation or resume from a valid checkpoint."
+        );
+    }
+    decompressed_data
+}
+
+/// 64 KiB I/O write buffer.
+const IO_BUF_CAPACITY: usize = 64 * 1024;
+
+/// Streams serialization directly to a gzip-compressed file without buffering entire data in RAM.
+///
+/// The bytes are written to a temporary sibling file and then atomically
+/// renamed into `path`. A process killed mid-write (e.g. an interrupted
+/// auto-save) therefore leaves either the previous valid file or the fully
+/// written new one, never a truncated gzip that fails to decompress on resume
+/// with `UnexpectedEof`. The temp file is fsynced before the rename so a crash
+/// right after the rename cannot expose partially flushed contents.
+fn save<T: serde::Serialize>(obj: &T, path: &str) {
+    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    {
+        let file = std::fs::File::create(&tmp_path).unwrap();
+        let buf_writer = std::io::BufWriter::with_capacity(IO_BUF_CAPACITY, file);
+        let mut encoder = GzEncoder::new(buf_writer, Compression::default());
+        bincode::serialize_into(&mut encoder, obj).unwrap();
+        let buf_writer = encoder.finish().unwrap();
+        let file = buf_writer.into_inner().unwrap();
+        file.sync_all().unwrap();
+    }
+    std::fs::rename(&tmp_path, path).unwrap();
+}
+
+fn read_gz(path: &str) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("Failed to read '{path}': {e}"));
+    decompress_from_gz(bytes, path)
+}
+
+fn read<'de, T: serde::Deserialize<'de>>(data: &'de [u8]) -> T {
+    // bincode is POSITIONAL: it records no field names and honors no
+    // `serde(default)`, so a checkpoint written by a build whose structs have
+    // since gained a field cannot be read back, and the failure arrives here
+    // as an opaque complaint about trailing bytes or an implausible length.
+    // Name the likely cause instead. The dataset is write-once per session
+    // (see the checkpoint layout notes), so there is no self-healing path and
+    // the answer is always to rebuild the scene rather than to retry.
+    let type_name = std::any::type_name::<T>();
+    bincode::deserialize(data).unwrap_or_else(|e| {
+        panic!(
+            "Failed to deserialize a checkpoint of type {type_name}: {e}.\n\
+             This usually means it was written by a build with a different \
+             in-memory layout for {type_name}, which bincode cannot migrate. \
+             Rebuild the scene to produce a fresh session directory; an \
+             existing dataset.bin.gz cannot be upgraded in place."
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_out_streams;
+    use std::collections::HashSet;
+    use std::fs;
+
+    fn write_stream(data_dir: &std::path::Path, name: &str, body: &str) {
+        fs::write(data_dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn prune_out_streams_drops_resimulated_frames() {
+        let output = std::env::temp_dir().join(format!(
+            "ppf_cts_prune_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = output.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let load = 3;
+        // frame_to_time maps frame -> sim time; the row for `load` sets the
+        // sim-time threshold the time-keyed streams are pruned against.
+        write_stream(
+            &data_dir,
+            "frame_to_time.out",
+            "0 0\n1 0.04\n2 0.08\n3 0.12\n4 0.16\n5 0.2\n",
+        );
+        write_stream(
+            &data_dir,
+            "time_per_frame.out",
+            "0 10\n1 11\n2 12\n3 13\n4 14\n5 15\n",
+        );
+        // clock.out (and the C++ SimpleLog streams) are keyed by sim time.
+        write_stream(
+            &data_dir,
+            "clock.out",
+            "0.000000 1500\n0.040000 1500\n0.080000 1500\n0.120000 1500\n0.160000 1400\n",
+        );
+        write_stream(
+            &data_dir,
+            "advance.total_mass.out",
+            "0.000000 12.5\n0.080000 12.5\n0.120000 12.5\n0.200000 12.5\n",
+        );
+
+        prune_out_streams(output.to_str().unwrap(), load);
+
+        // Frame-keyed streams keep only frame <= load with no duplicate keys.
+        for name in ["frame_to_time.out", "time_per_frame.out"] {
+            let contents = fs::read_to_string(data_dir.join(name)).unwrap();
+            let mut seen = HashSet::new();
+            for line in contents.lines() {
+                let frame: i32 = line.split_whitespace().next().unwrap().parse().unwrap();
+                assert!(
+                    frame <= load,
+                    "{name}: frame {frame} > load {load} survived"
+                );
+                assert!(seen.insert(frame), "{name}: duplicate frame {frame}");
+            }
+            assert_eq!(seen.len(), (load + 1) as usize, "{name}: wrong row count");
+        }
+
+        // Time-keyed streams keep only rows up to the checkpoint sim time.
+        for name in ["clock.out", "advance.total_mass.out"] {
+            let contents = fs::read_to_string(data_dir.join(name)).unwrap();
+            let mut seen: HashSet<u64> = HashSet::new();
+            for line in contents.lines() {
+                let time: f64 = line.split_whitespace().next().unwrap().parse().unwrap();
+                assert!(
+                    time <= 0.12 + 1e-9,
+                    "{name}: time {time} > loaded time survived"
+                );
+                assert!(seen.insert(time.to_bits()), "{name}: duplicate time {time}");
+            }
+        }
+
+        fs::remove_dir_all(&output).unwrap_or(());
+    }
+
+    #[test]
+    fn save_round_trips_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ppf_cts_save_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dataset.bin.gz");
+        let path_str = path.to_str().unwrap();
+
+        let original: Vec<u64> = (0..10_000u64).collect();
+        super::save(&original, path_str);
+
+        // The atomically renamed file decompresses and deserializes cleanly,
+        // and no `.tmp.<pid>` sibling is left behind after a successful save.
+        let loaded: Vec<u64> = super::read(&super::read_gz(path_str));
+        assert_eq!(loaded, original);
+        let temp_left = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp."));
+        assert!(!temp_left, "temp file was not renamed away");
+
+        // A pre-existing truncated file must not block a fresh valid save.
+        fs::write(&path, b"\x1f\x8b\x08not a complete gzip stream").unwrap();
+        super::save(&original, path_str);
+        let reloaded: Vec<u64> = super::read(&super::read_gz(path_str));
+        assert_eq!(reloaded, original);
+
+        fs::remove_dir_all(&dir).unwrap_or(());
+    }
+}

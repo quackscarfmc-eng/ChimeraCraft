@@ -1,0 +1,569 @@
+// File: crates/ppf-cts-core/src/transitions/mod.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// Pure (state, event) -> (new_state, [effects]). Single source of
+// truth for every server state change. ZERO side-effects: no I/O, no
+// spawn, no log (the `DoLog` effect is *recorded*, not executed).
+//
+// This is the SERVER-side state machine, operating on `ServerState`
+// (Build / Data / Solver as tracked by the solver host). It is
+// intentionally distinct from the ADDON-side state machine in
+// `blender_addon/core/transitions.py`, which operates on `AppState`
+// (Phase / Activity / Server / Solver as observed from the Blender
+// side). The two run on different processes, observe different
+// events, and emit different effect sets; they are NOT duplicates
+// and must not be merged. They share zero types. Any cross-side
+// invariant (e.g. handshake order) has to be reviewed in BOTH files
+// when changed.
+
+use crate::effects::Effect;
+use crate::events::Event;
+use crate::state::{Build, Data, ServerState, Solver};
+
+/// Single entry point (formerly the Python
+/// `server.transitions.server_transition`, now removed).
+///
+/// Returns `(new_state, effects)`. The caller (engine) is responsible
+/// for replacing its held state and dispatching the effects.
+pub fn transition(state: ServerState, event: Event) -> (ServerState, Vec<Effect>) {
+    match event {
+        // ── Project context ─────────────────────────────────────────
+        Event::ProjectSelected {
+            name,
+            root,
+            has_data,
+            has_param,
+            has_app,
+            is_resumable,
+            crash,
+            upload_id,
+            data_hash,
+            param_hash,
+            total_frames,
+            exemptions,
+        } => {
+            let data = if has_data && has_param {
+                Data::Uploaded
+            } else {
+                Data::Empty
+            };
+
+            // Same project: refresh data availability and upload_id;
+            // preserve solver/build/frame state. Rehydrate
+            // total_frames from disk only when we currently lack it
+            // (e.g. the connect probe just blew it away by routing
+            // through __probe__ then back). Don't clobber a fresh
+            // value from an in-flight BuildMetadata with a stale
+            // scene_info.json read.
+            if name == state.name {
+                let preserved_total = if state.total_frames > 0 {
+                    state.total_frames
+                } else {
+                    total_frames
+                };
+                let mut new = ServerState {
+                    root,
+                    data,
+                    upload_id,
+                    data_hash,
+                    param_hash,
+                    total_frames: preserved_total,
+                    ..state
+                };
+                if new.build == Build::Built {
+                    new.resumable = is_resumable;
+                }
+                return (new, vec![]);
+            }
+
+            // Different project: reset state, optionally load app.
+            // Carry the disk-derived total_frames straight through so
+            // a re-select of a previously-built project (e.g. probe
+            // -> real reconnect) immediately knows how many frames
+            // the build set up, without waiting for another build.
+            let build = if has_app {
+                Build::Built
+            } else {
+                Build::None
+            };
+            // Reconstruct a crash from disk: a restarted server has no
+            // in-memory Solver::Failed, but the solver-authored status.cbor
+            // survives, so a reconnect after a crash still reports the
+            // failure (and, with checkpoints present, "Failed (Resumable)").
+            // Only when the app actually built -- status_string masks solver
+            // state behind NO_BUILD otherwise, and a crash without a build
+            // can't resume.
+            //
+            // The reason is carried through with the fact. Reporting only
+            // that a run failed leaves a reconnected user with strictly less
+            // than they had before they restarted Blender, which is exactly
+            // when they most need the cause.
+            let reconciled = has_app.then_some(crash).flatten();
+            let solver = if reconciled.is_some() {
+                Solver::Failed
+            } else {
+                Solver::Idle
+            };
+            let (error, crash_kind) = match reconciled {
+                Some(c) => (c.rendered, c.kind_tag),
+                None => (String::new(), String::new()),
+            };
+            let mut effects: Vec<Effect> = Vec::new();
+            if !has_app {
+                effects.push(Effect::DoLoadApp {
+                    name: name.clone(),
+                    root: root.clone(),
+                });
+            }
+            (
+                ServerState {
+                    name,
+                    root,
+                    data,
+                    build,
+                    solver,
+                    resumable: is_resumable,
+                    frame: 0,
+                    initialized: false,
+                    error,
+                    crash_kind,
+                    build_progress: 0.0,
+                    build_info: String::new(),
+                    total_frames,
+                    upload_id,
+                    data_hash,
+                    param_hash,
+                    violations: state.violations,
+                    exemptions: if build == Build::Built {
+                        exemptions
+                    } else {
+                        vec![]
+                    },
+                },
+                effects,
+            )
+        }
+
+        // ── Upload landing ──────────────────────────────────────────
+        Event::UploadLanded {
+            upload_id,
+            data_hash,
+            param_hash,
+            has_data,
+            has_param,
+        } => {
+            let data = if has_data && has_param {
+                Data::Uploaded
+            } else {
+                Data::Empty
+            };
+            // Replace each hash only when *this upload* carried it;
+            // a param-only update sends ``data_hash=""`` while the
+            // pre-existing data file (and its hash on disk) still
+            // exist, so we can't key off ``has_data`` (which is just
+            // a file-exists probe). The empty-hash sniff matches
+            // what the addon actually emits and preserves the prior
+            // hash so the next Run-button click correctly detects
+            // data drift instead of seeing server_data="".
+            let new_data_hash = if !data_hash.is_empty() {
+                data_hash
+            } else {
+                state.data_hash.clone()
+            };
+            let new_param_hash = if !param_hash.is_empty() {
+                param_hash
+            } else {
+                state.param_hash.clone()
+            };
+            // A fresh upload invalidates any prior build: the app
+            // artifact was for an earlier (data, param) tuple. Reset
+            // to NONE so the next BuildRequested is accepted; an
+            // in-flight build (BUILDING) is preserved; the client
+            // detects upload_id mismatch and aborts on its side.
+            //
+            // THE VERDICT GOES WITH THE BUILD IT WAS ABOUT. `error`,
+            // `crash_kind` and `violations` describe the payload this upload
+            // just replaced. The violations are positions in THAT payload's
+            // geometry, and a client draws whatever a response carries, so
+            // kept past this point they are drawn over a scene they do not
+            // describe until the next build ends.
+            // Left in place they travel in the same response as the NEW
+            // payload's hashes, and `status_string` reports a build that
+            // was never requested as "NO_BUILD", which is also how it
+            // reports one that failed: the client tells the two apart by
+            // the error alone, so a stale one reads as this payload's
+            // build having failed, before that build has started.
+            let invalidated = state.build != Build::Building;
+            let new_build = if invalidated { Build::None } else { state.build };
+            let (new_error, new_crash_kind, new_violations) = if invalidated {
+                (String::new(), String::new(), vec![])
+            } else {
+                (
+                    state.error.clone(),
+                    state.crash_kind.clone(),
+                    state.violations.clone(),
+                )
+            };
+            let log = format!(
+                "Upload landed (id={upload_id}, data={has_data}, param={has_param})."
+            );
+            (
+                ServerState {
+                    data,
+                    upload_id,
+                    data_hash: new_data_hash,
+                    param_hash: new_param_hash,
+                    build: new_build,
+                    error: new_error,
+                    crash_kind: new_crash_kind,
+                    violations: new_violations,
+                    resumable: false,
+                    ..state
+                },
+                vec![Effect::DoLog { message: log }],
+            )
+        }
+
+        // ── Build ───────────────────────────────────────────────────
+        Event::BuildRequested { preserve_output }
+            if state.data == Data::Uploaded && state.build != Build::Building =>
+        {
+            (
+                ServerState {
+                    build: Build::Building,
+                    build_progress: 0.0,
+                    build_info: "Preparing build...".to_string(),
+                    total_frames: 0,
+                    error: String::new(),
+                    crash_kind: String::new(),
+                    // What the previous build or run reported is that
+                    // verdict's, like the error beside it.
+                    violations: vec![],
+                    exemptions: vec![],
+                    ..state
+                },
+                vec![Effect::DoSpawnBuild { preserve_output }],
+            )
+        }
+
+        Event::CancelBuildRequested if state.build == Build::Building => (
+            state,
+            vec![
+                Effect::DoCancelBuild,
+                Effect::DoLog {
+                    message: "Build cancel requested.".to_string(),
+                },
+            ],
+        ),
+
+        Event::BuildProgress { progress, info } => (
+            ServerState {
+                build_progress: progress,
+                build_info: info,
+                ..state
+            },
+            vec![],
+        ),
+
+        Event::BuildMetadata { total_frames } => (
+            ServerState {
+                total_frames,
+                ..state
+            },
+            vec![],
+        ),
+
+        Event::BuildCompleted { exemptions } => (
+            ServerState {
+                build: Build::Built,
+                build_progress: 1.0,
+                build_info: "Build complete.".to_string(),
+                resumable: false,
+                // A successful build supersedes any prior run, so clear a
+                // lingering Solver::Failed; otherwise status_string would
+                // keep reporting FAILED after a clean rebuild-after-crash
+                // (the on-disk crash marker is already cleared at build
+                // start, so this keeps the in-memory state consistent).
+                solver: Solver::Idle,
+                violations: vec![],
+                exemptions,
+                ..state
+            },
+            vec![Effect::DoLog {
+                message: "Build complete.".to_string(),
+            }],
+        ),
+
+        Event::BuildFailed { error, violations } => {
+            let log = format!("Build failed: {error}");
+            (
+                ServerState {
+                    build: Build::Failed,
+                    error,
+                    violations,
+                    exemptions: vec![],
+                    build_info: "Build failed.".to_string(),
+                    ..state
+                },
+                vec![Effect::DoLog { message: log }],
+            )
+        }
+
+        Event::BuildCancelledEvent => (
+            ServerState {
+                build: Build::None,
+                build_progress: 0.0,
+                build_info: String::new(),
+                error: String::new(),
+                crash_kind: String::new(),
+                ..state
+            },
+            vec![Effect::DoLog {
+                message: "Build cancelled by user.".to_string(),
+            }],
+        ),
+
+        Event::GpuCheckFailed { error } => {
+            let log = format!("GPU check failed: {error}");
+            (
+                ServerState {
+                    build: Build::Failed,
+                    error,
+                    // Not a solver crash, so no cause tag: the addon draws
+                    // the raw message for these.
+                    crash_kind: String::new(),
+                    ..state
+                },
+                vec![Effect::DoLog { message: log }],
+            )
+        }
+
+        // ── Solver operations ──────────────────────────────────────
+        Event::StartRequested
+            if state.build == Build::Built
+                && matches!(state.solver, Solver::Idle | Solver::Failed) =>
+        {
+            (
+                ServerState {
+                    solver: Solver::Running,
+                    frame: 0,
+                    initialized: false,
+                    error: String::new(),
+                    crash_kind: String::new(),
+                    ..state
+                },
+                vec![
+                    Effect::DoLaunchSolver { resume_from: None },
+                    Effect::DoLog {
+                        message: "Solver starting.".to_string(),
+                    },
+                ],
+            )
+        }
+
+        // Accept Solver::Failed as well as Idle: after a crash the
+        // monitor sets solver=Failed but leaves the on-disk checkpoints
+        // intact (a poll refreshes `resumable` from them), so resuming
+        // from a saved state is valid. Mirrors StartRequested, which also
+        // accepts Failed. The `resumable` guard still gates on a real
+        // checkpoint existing.
+        Event::ResumeRequested { from_frame }
+            if state.build == Build::Built
+                && matches!(state.solver, Solver::Idle | Solver::Failed)
+                && state.resumable =>
+        {
+            let message = match from_frame {
+                Some(n) => format!("Solver resuming from frame {n}."),
+                None => "Solver resuming from latest checkpoint.".to_string(),
+            };
+            (
+                ServerState {
+                    solver: Solver::Running,
+                    initialized: false,
+                    error: String::new(),
+                    crash_kind: String::new(),
+                    ..state
+                },
+                vec![
+                    Effect::DoLaunchSolver {
+                        resume_from: Some(from_frame.unwrap_or(-1)),
+                    },
+                    Effect::DoLog { message },
+                ],
+            )
+        }
+
+        // Always emits DoKillSolver: handles externally-started
+        // solvers (e.g. from JupyterLab) where state.solver was never
+        // promoted to Running. The executor's Utils.busy() check makes
+        // it a no-op when nothing is running.
+        Event::TerminateRequested => (
+            ServerState {
+                solver: Solver::Idle,
+                initialized: false,
+                ..state
+            },
+            vec![
+                Effect::DoKillSolver,
+                Effect::DoLog {
+                    message: "Solver terminated.".to_string(),
+                },
+            ],
+        ),
+
+        // Same rationale as TerminateRequested: must work against
+        // externally-started solvers.
+        Event::SaveAndQuitRequested => (
+            ServerState {
+                solver: Solver::Saving,
+                ..state
+            },
+            vec![
+                Effect::DoRequestSaveAndQuit,
+                Effect::DoLog {
+                    message: "Save and quit requested.".to_string(),
+                },
+            ],
+        ),
+
+        // ── Solver monitor events ──────────────────────────────────
+        Event::SolverFrameUpdated { frame } => (
+            ServerState { frame, ..state },
+            vec![],
+        ),
+
+        Event::SolverInitialized => (
+            ServerState {
+                initialized: true,
+                ..state
+            },
+            vec![],
+        ),
+
+        Event::SolverFinished { resumable } => {
+            let log = format!("Solver finished. Resumable={}", title_bool(resumable));
+            (
+                ServerState {
+                    solver: Solver::Idle,
+                    initialized: false,
+                    resumable,
+                    ..state
+                },
+                vec![Effect::DoLog { message: log }],
+            )
+        }
+
+        Event::SolverCrashed {
+            error,
+            kind_tag,
+            violations,
+        } => {
+            let log = format!("Solver crashed: {error}");
+            (
+                ServerState {
+                    solver: Solver::Failed,
+                    initialized: false,
+                    error,
+                    crash_kind: kind_tag,
+                    violations,
+                    ..state
+                },
+                vec![Effect::DoLog { message: log }],
+            )
+        }
+
+        Event::SolverSaving => (
+            ServerState {
+                solver: Solver::Saving,
+                ..state
+            },
+            vec![],
+        ),
+
+        // Engine thinks the solver is idle but the monitor saw a live
+        // ppf-contact-solver process under our project root: Jupyter
+        // started a run that didn't go through our effect pipeline.
+        // Promote `solver` to Running and, when the data files are
+        // present, advance `data` / `build` accordingly so the addon's
+        // status string reads BUSY instead of NO_DATA / NO_BUILD.
+        // Anything other than `Solver::Idle` means the engine is
+        // already tracking a launch (or a crash, or saving), and we
+        // leave it alone.
+        Event::ExternalSolverAdopted { has_data_on_disk }
+            if state.solver == Solver::Idle && state.build != Build::Building =>
+        {
+            let data = if has_data_on_disk {
+                Data::Uploaded
+            } else {
+                state.data
+            };
+            let build = if has_data_on_disk && state.build == Build::None {
+                Build::Built
+            } else {
+                state.build
+            };
+            (
+                ServerState {
+                    solver: Solver::Running,
+                    data,
+                    build,
+                    ..state
+                },
+                vec![Effect::DoLog {
+                    message: "Adopting externally-launched solver".to_string(),
+                }],
+            )
+        }
+
+        // ── Delete ─────────────────────────────────────────────────
+        Event::DeleteRequested if !state.root.is_empty() => (
+            // Fresh state with only the project name preserved. Wipes
+            // upload_id so no in-flight build from any client matches
+            // after this.
+            ServerState {
+                name: state.name.clone(),
+                ..ServerState::default()
+            },
+            vec![
+                Effect::DoKillSolver,
+                Effect::DoDeleteProjectData {
+                    root: state.root,
+                },
+                Effect::DoLog {
+                    message: "Project data deleted.".to_string(),
+                },
+            ],
+        ),
+
+        // ── Generic error ─────────────────────────────────────────
+        Event::ErrorOccurred { error } => (
+            ServerState {
+                error: error.clone(),
+                // Not a solver crash, so no cause tag.
+                crash_kind: String::new(),
+                ..state
+            },
+            vec![Effect::DoLog { message: error }],
+        ),
+
+        // ── Guard-rejected or unknown ─────────────────────────────
+        _ => (state, vec![]),
+    }
+}
+
+/// Python's `bool.__str__` is "True"/"False" (capitalized). The
+/// `SolverFinished` log message format is locked in by the Python
+/// reference (`f"Solver finished. Resumable={r}"`). Reproduce that
+/// titlecase exactly so log parsers don't drift.
+fn title_bool(b: bool) -> &'static str {
+    if b {
+        "True"
+    } else {
+        "False"
+    }
+}
+
+#[cfg(test)]
+mod tests;

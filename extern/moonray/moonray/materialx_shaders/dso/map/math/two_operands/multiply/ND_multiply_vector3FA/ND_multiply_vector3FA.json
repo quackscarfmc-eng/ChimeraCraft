@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"in1Attr" : 
+		{
+			"default" : "Vec3f(0.0,0.0,0.0)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in1",
+			"type" : "Vec3f"
+		},
+		"in2Attr" : 
+		{
+			"default" : "0.0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in2",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_multiply_vector3FA",
+	"type" : "Map"
+}

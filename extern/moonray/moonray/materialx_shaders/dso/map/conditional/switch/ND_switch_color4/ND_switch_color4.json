@@ -1,0 +1,63 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "in1Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in1",
+            "type" : "Rgba"
+        },
+        "in2Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in2",
+            "type" : "Rgba"
+        },
+        "in3Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in3",
+            "type" : "Rgba"
+        },
+        "in4Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in4",
+            "type" : "Rgba"
+        },
+        "in5Attr" : 
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in5",
+            "type" : "Rgba"
+        },
+        "whichAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "which",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_switch_color4",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

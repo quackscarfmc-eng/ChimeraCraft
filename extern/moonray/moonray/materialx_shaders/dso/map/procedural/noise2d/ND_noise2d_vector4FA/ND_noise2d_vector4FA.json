@@ -1,0 +1,40 @@
+{
+    "attributes" : 
+    {
+        "amplitudeAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amplitude",
+            "type" : "Float",
+            "comment" : "the center-to-peak amplitude of the noise"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "pivot",
+            "type" : "Float",
+            "comment" : "the center value of the output noise"
+        },
+        "texcoordAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "texcoord", 
+            "type" : "Vec2f",
+            "comment" : "the 2D texture coordinate at which the noise is evaluated"
+        }
+    },
+    "outputAttributes" :
+    {
+        "outAttr" :
+        {
+            "name" : "out",
+            "type" : "Vec4f",
+            "comment" : "The output 4-component vector value of the 2D noise function"
+        }
+    },
+    "name" : "ND_noise2d_vector4FA",
+    "type" : "Map"
+}

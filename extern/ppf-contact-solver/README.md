@@ -1,0 +1,1070 @@
+# ZOZO's Contact Solver 🫶
+
+A contact solver for physics-based simulations
+involving 👚 shells, 🪵 solids, 🪢 rods, 🧱 rigid bodies and ⏳ sand. Started as an in-house physics engine at [ZOZO, Inc.](https://corp.zozo.com/en/), the largest fashion e-commerce company in Japan, and now evolving with the community. All open-source.
+
+[![Getting Started](https://github.com/st-tech/ppf-contact-solver/actions/workflows/getting-started.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/getting-started.yml)
+[![All Examples](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once.yml)
+[![All Examples (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once-win.yml)
+[![Python API Docs](https://github.com/st-tech/ppf-contact-solver/actions/workflows/make-docs.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/make-docs.yml)
+[![Docker Build](https://github.com/st-tech/ppf-contact-solver/actions/workflows/build-docker.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/build-docker.yml)
+[![Build Release](https://github.com/st-tech/ppf-contact-solver/actions/workflows/release.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/release.yml)
+[![Blender CI](https://github.com/st-tech/ppf-contact-solver/actions/workflows/blender.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/blender.yml)
+![solver_logo](./asset/image/teaser-image.jpg)
+
+> 🤖 **LLM Transparency:** We **highly** respect that readers expect to hear the author's original voice and tone, which we work to retain throughout. Our use of LLMs is clarified in [(Markdown)](./articles/llm_transparency.md).
+
+## 📌 TL;DR
+
+To use this through Blender, watch the [CGMatter walkthrough](https://www.youtube.com/watch?v=D0k6evTvJDg). Release download is [here](https://github.com/st-tech/ppf-contact-solver/releases) and the video tutorials are [here](https://st-tech.github.io/ppf-contact-solver/blender_addon/tutorial.html).
+
+## 👀 Quick Look
+
+🎨 Simulate remotely from our [Blender add-on](https://st-tech.github.io/ppf-contact-solver) (screenshots taken on macOS; you can also run locally on a modern NVIDIA GPU on Windows or Linux, or on an Apple silicon Mac)
+
+<https://github.com/user-attachments/assets/f266111e-7380-428b-8a3c-25eac4f039e5>
+
+🚀 Or run it locally: `./ppf-contact-solver` (macOS/Linux), double click `start.bat` (Windows), or a Docker command (Linux/Windows)
+
+![glance-terminal](./asset/image/glance-terminal.webp)
+
+🌐 Click the URL and explore our examples
+
+![glance-jupyter](./asset/image/glance-jupyter.webp)
+
+## ✨ Highlights
+
+- **💪 100% Penetration-Free Upon Success**: No snagging intersections [(Details)](#-our-penetration-free-guarantee).
+- **🦀 Rust-First**: We minimize the use of C++ to maximize safety. No performance compromised.
+- **⏲ Scalable**: An extreme case includes beyond 180M contacts. Not just one million.
+- **🚲 Cache Efficient**: All on the GPU runs in single precision. No double precision.
+- **🥼 Not Rubbery**: Any single triangle never extends beyond strict upper bounds (e.g., 1%).
+- **📐 Finite Element Method**: We use FEM for deformables and symbolic force jacobians.
+- **📊 Parameters Calibrated**: Fabric presets match real measurements [(Report)](https://st-tech.github.io/ppf-contact-solver/fabric-report/index.html).
+- **⚔️ Highly Stressed**: We run GitHub Actions to run stress tests [10 times in a row](#️-ten-consecutive-runs).
+- **🐛 Community Tested**: Users report bugs and we fix them [(Issues)](https://github.com/st-tech/ppf-contact-solver/issues).
+- **🚀 Massively Parallel**: Both contact and elasticity solvers are run on the GPU.
+- **🖥️ Cross Platform**: Both the add-on and the solver engine run natively on macOS, Windows, and Linux.
+- **🎛️ Cross Architecture**: We natively support Apple silicon (Metal), NVIDIA (CUDA), and AMD (ROCm) GPUs.
+- **🧮 SIMD-Optimized CPU Backend**: Our CPU code runs natively on both x86_64 and ARM64.
+- **🐳 Docker Sealed**: All can be deployed fast. The image is ~1GB.
+- **🌐 JupyterLab Included**: Open your browser and run examples right away [(Video)](https://zozo.box.com/s/jgd6ijfmwee04vvnnfzapq7m2eq7cxy8).
+- **🐍 Documented Python APIs**: Our Python code is fully [docstringed](https://st-tech.github.io/ppf-contact-solver/jupyterlab_api/module_reference.html) and lintable [(Video)](https://zozo.box.com/s/52atrfn70vn8u07iwzbyrrz5ameczo03).
+- **☁️ Cloud-Ready**: Our solver can be seamlessly deployed on major cloud platforms.
+- **🎨 Blender Add-on**: Simulate remotely and fetch results locally, even on macOS.
+- **🤖 MCP Support**: Let a LLM run simulations for you using natural language.
+- **✨ Stay Clean**: You can remove all traces after use.
+- **📜 Permissive License**: Apache 2.0 allows commercial and proprietary use.
+
+### 🚧 Gentle Disclaimer and Limitations
+
+- **⏳ Offline use:** Not real time, though some examples reach interactive rates.
+- **🐢 Not the fastest:** Other recent work reports faster results.
+- **📉 Not differentiable:** No gradients, so inverse design and learning are out of scope.
+- **🧪 Not production ready (yet):** Many bugs remain, including undiscovered ones. We are actively working to make it production-proof. Known bugs are tracked in [Issues](https://github.com/st-tech/ppf-contact-solver/issues).
+- **🐌 CPU and Metal backends are slow:** Meant for evaluation, learning, and small examples. Larger scenes need a powerful GPU.
+- **🟥 ~~AMD GPUs untested:~~** ~~The ROCm backend has never run on real AMD hardware. We rely on community bug reports.~~ No longer true; AMD (ROCm) has been tested. See [the discussion](https://github.com/st-tech/ppf-contact-solver/discussions/131#discussioncomment-18525860).
+- **🛠️ Add-on setup takes effort:** Not one click. The solver backend is deployed separately, locally or remotely.
+- **👤 Development pace:** Maintained by Ryoichi Ando alone, with limited time.
+
+## 🔖 Table of Contents
+
+- [📝 Change History](#-change-history)
+- [🎓 Technical Materials](#-technical-materials)
+- [⚡️ Requirements](#️-requirements)
+- [💨 Getting Started](#-getting-started)
+  - [🍎 macOS Native](#-macos-native)
+  - [🪟 Windows Native Executable](#-windows-native-executable)
+  - [🐧 Linux Native](#-linux-native)
+  - [🐳 Docker (Linux and Windows)](#-docker-linux-and-windows)
+- [🐍 How To Use](#-how-to-use)
+  - [🎨 Blender Add-on](#-blender-add-on)
+    - [🌏 Community Translations](#-community-translations)
+  - [🌐 JupyterLab](#-jupyterlab)
+    - [📚 Python APIs and Parameters](#-python-apis-and-parameters)
+- [🔍 Obtaining Logs](#-obtaining-logs)
+- [🖼️ Catalogue](#️-catalogue)
+  - [🎨 Blender Add-on Examples](#-blender-add-on-examples)
+  - [🌐 JupyterLab Examples](#-jupyterlab-examples)
+  - [💰 Budget Table on AWS](#-budget-table-on-aws)
+  - [🏗️ Large Scale Examples](#️-large-scale-examples)
+- [🚀 GitHub Actions](#-github-actions)
+  - [⚔️ Ten Consecutive Runs](#️-ten-consecutive-runs)
+  - [📦 Action Artifacts](#-action-artifacts)
+- [📡 Deploying on Cloud Services](#-deploying-on-cloud-services)
+  - [📦 Deploying on vast.ai](#-deploying-on-vastai)
+  - [📦 Deploying on Scaleway](#-deploying-on-scaleway)
+  - [📦 Deploying on Amazon Web Services](#-deploying-on-amazon-web-services)
+  - [📦 Deploying on Google Compute Engine](#-deploying-on-google-compute-engine)
+- [🤝 Community Response](#-community-response)
+  - [📺 YouTube](#-youtube)
+  - [🎬 Shorts and Reels](#-shorts-and-reels)
+  - [📰 Articles](#-articles)
+  - [🧩 Blender Add-ons](#-blender-add-ons)
+  - [📣 Sharing Your Work](#-sharing-your-work)
+- [💼 Commercial Use and Beyond](#-commercial-use-and-beyond)
+  - [🔧 Building Your Own Solver](#-building-your-own-solver)
+- [📬 Contributing](#-contributing)
+- [💬 Participating Discussions](#-participating-discussions)
+- [📨 Reaching the Author](#-reaching-the-author)
+- [🔒 Our Penetration-free Guarantee](#-our-penetration-free-guarantee)
+  - [✅ How Do We Promise No Intersections?](#-how-do-we-promise-no-intersections)
+  - [🚨 Intersection Errors Can Also Indicate an Impossible Setup](#-intersection-errors-can-also-indicate-an-impossible-setup)
+- [❓ Frequently Asked Questions](#-frequently-asked-questions)
+- [🙏 Acknowledgements](#-acknowledgements)
+
+### 📚 Advanced Contents
+
+- 🧑 Setting Up Your Development Environment [(Markdown)](./articles/develop.md#-setting-up-your-development-environment)
+- 🐞 Bug Fixes and Updates [(Markdown)](./articles/bug.md)
+
+## 📝 Change History
+
+- (2026.09.19) Added support for Apple (Metal) and AMD (ROCm) GPUs, and CPU support for x86_64 and aarch64 with SIMD optimization (AVX2 and NEON).
+- (2026.07.09) Added a [performance article](./articles/performance.md) benchmarking the speedup across all examples.
+- (2026.06.30) Added rigidbody support based on [Painless Differentiable Rotation Dynamics](https://dl.acm.org/doi/10.1145/3730944).
+- (2026.06.30) Added sand support.
+- (2026.06.30) Achieved 2x performance improvement [with help of feedback from @Hurleyworks](https://github.com/st-tech/ppf-contact-solver/discussions/86).
+- (2026.04.30) Added a Blender Add-on support. See the [documentation](https://st-tech.github.io/ppf-contact-solver).
+
+📚 For the complete change history, see [articles/changes.md](./articles/changes.md).
+
+## 🎓 Technical Materials
+
+#### 📘 **A Cubic Barrier with Elasticity-Inclusive Dynamic Stiffness**
+
+<https://github.com/user-attachments/assets/ac104255-604e-4890-9fb1-59732f004f0a>
+
+- 📚 Published in [ACM Transactions on Graphics (TOG) Vol.43, No.6](https://dl.acm.org/doi/abs/10.1145/3687908)
+- 🎥 Main video [(Video)](https://zozo.box.com/s/ylyv8798ue38ra5vqo2dgjhx48edy6j9)
+- 🎥 Additional video examples [(Directory)](https://zozo.box.com/s/inyyosspazk7z79zf9yeikt4xxy641g3)
+- 🎥 Presentation videos [(Short)](https://zozo.box.com/s/fv07obu61ajn8s8s6ub9i7j9id5h4l2v) [(Long)](<https://zozo.box.com/s/3ewlqk47bss9v39g26nlsb99qhxsc50v>)
+- 📃 Main paper [(PDF)](https://zozo.box.com/s/ckss1ejz0lbw848pg1qo7eqtvujsogy5) ([Hindsight)](./articles/hindsight.md)
+- 📊 Supplementary PDF [(PDF)](https://zozo.box.com/s/ylqjobig0bq55eox5evjt49u2tcyqljm)
+- 🤖 Supplementary scripts [(Directory)](https://zozo.box.com/s/m6h1t5eykdsuynx7kqr3wqi9789pfl9n)
+- 🔍 Singular-value eigenanalysis [(Markdown)](./articles/eigensys.md)
+
+##### 📌 Reference Implementation
+
+The main branch is undergoing frequent updates and will deviate from the paper.
+To retain consistency with the paper, we have created a new branch ```sigasia-2024```.
+
+- 🛠️ Only maintenance updates are planned for this branch.
+- 🚫 General users *should not* use this branch as it is not optimized for best performance.
+- 🚫 All algorithmic changes listed in this [(Markdown)](./articles/bug.md) are excluded from this branch.
+- 📦 We also provide a pre-compiled Docker image: ```ghcr.io/st-tech/ppf-contact-solver-compiled-sigasia-2024:latest``` of this branch.
+- 🌐 [Template Link for vast.ai](https://cloud.vast.ai?ref_id=85288&template_id=0c7544fb5eda5ac95bf945c6b1249175)
+
+## ⚡️ Requirements
+
+A GPU is recommended, but not required. The right backend is picked for you when a run starts.
+
+| Hardware | Backend | Runs on | Good to know |
+| --- | --- | --- | --- |
+| 🟩 NVIDIA GPU | CUDA 13.2+ | Linux (x86_64, arm64), Windows (x86_64) | Turing (RTX 20 / GTX 16 / T4) or newer with driver 580+; RTX 4090 / 5090 for large scenes; 3090 / 4070 / 5070 for small to medium ones |
+| 🟥 AMD GPU | ROCm | Linux (x86_64), Windows (x86_64) | gfx9 through gfx12 |
+| 🍎 Apple silicon | Metal | macOS | M1 / A14 generation or newer |
+| 💻 Any CPU | CPU (x86_64, arm64) | macOS, Windows, Linux | SIMD-optimized using AVX2 and NEON instructions |
+
+You will also need:
+
+- 🐳 A Docker environment (see [below](#-docker-linux-and-windows)), supported only on x86_64 with an NVIDIA GPU (CUDA)
+- 🎨 Blender 5+ (only if you intend to use the Blender add-on)
+
+## 💨 Getting Started
+
+Whether you plan to use the Blender add-on or the JupyterLab interface, the solver engine itself must first be deployed. The steps below apply to both.
+
+> ⚠️ Do not run `warmup.py` locally. If you do, you are very likely to hit failures and find it difficult to cleanup.
+
+> 🤔 If you are cautious, you can review the [build workflow](https://github.com/st-tech/ppf-contact-solver/actions/workflows/release.yml) to verify safety yourself.
+We try to maximize transparency; **we never build locally and upload.**
+
+#### 🍎 macOS Native
+
+For Apple silicon Macs, a self-contained folder carrying the Metal and CPU backends.
+No Python, Homebrew, or Xcode installation is needed, and nothing is installed outside the folder.
+
+1. Download the latest release from [GitHub Releases](https://github.com/st-tech/ppf-contact-solver/releases) and unzip
+2. Open Terminal and change into the unzipped folder
+3. Run `./ppf-contact-solver`
+
+JupyterLab frontend will auto-start. You should be able to access it at <http://localhost:8080>.
+Keep the terminal window open; `Ctrl+C` shuts it down.
+
+#### 🪟 Windows Native Executable
+
+For Windows 10/11 users, a self-contained executable (several hundred MB) is available.
+No Python, Docker, or CUDA Toolkit installation is needed.
+All should simply work out of the box [(Video)](https://zozo.box.com/s/9rthkw122fyss5qxuf5mie9xywg7jzdz).
+The x86_64 archive carries the CUDA, ROCm, and CPU backends, so one download serves an NVIDIA machine and an AMD one, while a Windows on ARM machine runs the CPU backend.
+
+1. Install the latest driver for your GPU: NVIDIA [(Link)](https://www.nvidia.com/en-us/drivers/) or AMD [(Link)](https://www.amd.com/en/support), skipped for a CPU-only run
+2. Download the latest release from [GitHub Releases](https://github.com/st-tech/ppf-contact-solver/releases) and unzip
+3. Double click `start.bat`
+
+JupyterLab frontend will auto-start. You should be able to access it at <http://localhost:8080>.
+
+#### 🐧 Linux Native
+
+A self-contained directory for x86_64 and aarch64 machines running glibc 2.28 or newer.
+The x86_64 archive carries the CUDA, ROCm, and CPU backends, and the aarch64 one carries CUDA and the CPU backend.
+No Python, CUDA Toolkit, or ROCm installation is needed.
+
+1. Install the latest driver for your GPU: NVIDIA [(Link)](https://www.nvidia.com/en-us/drivers/) or AMD [(Link)](https://www.amd.com/en/support), skipped for a CPU-only run
+2. Download the latest release from [GitHub Releases](https://github.com/st-tech/ppf-contact-solver/releases) and unzip
+3. Run `./ppf-contact-solver`
+
+JupyterLab frontend will auto-start. You should be able to access it at <http://localhost:8080>.
+Keep the terminal window open; `Ctrl+C` shuts it down.
+
+#### 🐳 Docker (Linux and Windows)
+
+Install a NVIDIA driver [(Link)](https://www.nvidia.com/en-us/drivers/) on your host system and follow the instructions below specific to the operating system to get a Docker running:
+
+🐧 Linux | 🪟 Windows
+----|----
+Install the Docker engine from here [(Link)](https://docs.docker.com/engine/install/). Also, install the NVIDIA Container Toolkit [(Link)](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Just to make sure that the Container Toolkit is loaded, run `sudo service docker restart`. | Install the Docker Desktop [(Link)](https://docs.docker.com/desktop/setup/install/windows-install/). You may need to log out or reboot after the installation. After logging back in, launch Docker Desktop to ensure that Docker is running.
+
+Next, run the following command to start the container. If no edits are needed, just copy and paste:
+
+##### 🪟 Windows (PowerShell)
+
+```bash
+$MY_WEB_PORT = 8080      # JupyterLab port on your side
+$MY_BLENDER_PORT = 9090  # Solver port for the Blender add-on
+$IMAGE_NAME = "ghcr.io/st-tech/ppf-contact-solver-compiled:latest"
+docker run --rm -it `
+  --name ppf-contact-solver `
+  --gpus all `
+  -p ${MY_WEB_PORT}:${MY_WEB_PORT} `
+  -p ${MY_BLENDER_PORT}:${MY_BLENDER_PORT} `
+  -e WEB_PORT=${MY_WEB_PORT} `
+  $IMAGE_NAME # Image size ~1GB
+```
+
+##### 🐧 Linux (Bash/Zsh)
+
+```bash
+MY_WEB_PORT=8080      # JupyterLab port on your side
+MY_BLENDER_PORT=9090  # Solver port for the Blender add-on
+IMAGE_NAME=ghcr.io/st-tech/ppf-contact-solver-compiled:latest
+docker run --rm -it \
+  --name ppf-contact-solver \
+  --gpus all \
+  -p ${MY_WEB_PORT}:${MY_WEB_PORT} \
+  -p ${MY_BLENDER_PORT}:${MY_BLENDER_PORT} \
+  -e WEB_PORT=${MY_WEB_PORT} \
+  $IMAGE_NAME # Image size ~1GB
+```
+
+The image download shall be started.
+Our image is hosted on [GitHub Container Registry](https://github.com/st-tech/ppf-contact-solver/pkgs/container/ppf-contact-solver-compiled) (~1GB).
+JupyterLab will then auto-start.
+Eventually you should be seeing:
+
+```
+==== JupyterLab Launched! 🚀 ====
+     http://localhost:8080
+    Press Ctrl+C to shutdown
+================================
+```
+
+Next, open your browser and navigate to <http://localhost:8080>. The port `8080` can change if you change the `MY_WEB_PORT` variable.
+Keep your terminal window open.
+Now you are ready to go! 🎉
+
+#### 🛑 Shutting Down
+
+To shut down the container, just press `Ctrl+C` in the terminal.
+The container will be removed and all traces will be cleaned up. 🧹
+
+> If you wish to keep the container running in the background, replace `--rm` with `-d`. To shutdown the container and remove it, run `docker stop ppf-contact-solver && docker rm ppf-contact-solver`.
+
+#### 🔧 Advanced Installation
+
+If you wish to build the docker image from scratch, please refer to the cleaner installation guide [(Markdown)](./articles/install.md).
+
+## 🐍 How To Use
+
+We provide two frontends: a Blender add-on and a JupyterLab interface. The Blender add-on lets you build scenes and run simulations entirely within Blender's UI, while JupyterLab lets you script everything in Python from your browser. Both communicate with the same solver engine, so pick whichever you like.
+
+In both cases, you can interact with the simulator on your laptop while the actual simulation runs on a remote headless server over the internet.
+This means that **you don't have to own NVIDIA hardware**, but can rent it at [vast.ai](https://vast.ai) for less than $0.5 per hour.
+That said, if you do have a modern NVIDIA GPU on a local Windows or Linux machine, or an Apple silicon Mac, you can also run the solver directly on it.
+Actually, this [(Video)](https://zozo.box.com/s/jgd6ijfmwee04vvnnfzapq7m2eq7cxy8) was recorded on a [vast.ai](https://vast.ai) instance.
+The experience is good! 👍
+
+### 🎨 Blender Add-on
+
+Our Blender add-on aims to offer a familiar UI that best feels like everything works locally, but under the hood, it communicates with a remote server where **all** simulations run, and then the results are fetched back.
+
+This provides a unique experience where users can leverage powerful **remote** GPUs while working seamlessly in their local Blender environment. Remarkably, our Blender add-on works even on **macOS** systems 😊, unlike other CUDA-based physics simulator add-ons that require local NVIDIA GPUs.
+More importantly, **you can work on a laptop without worrying about draining the battery fast**. 🔋
+
+Follow this page [How to Install](https://st-tech.github.io/ppf-contact-solver/blender_addon/getting_started/install.html) to learn how to install the add-on. For a thorough walk through workflow, we refer to our documentation below:
+
+<p align="center">
+  <a href="https://st-tech.github.io/ppf-contact-solver"><img src="./asset/image/read-blender-addon-docs.svg" alt="Read Blender Add-on Documentation" height="35"></a>
+</p>
+
+🎬 Prefer video? [CGMatter](https://www.youtube.com/@CGMatter) walks through the full setup in this video tutorial:
+
+<p align="center"><a href="https://www.youtube.com/watch?v=D0k6evTvJDg"><img src="https://img.youtube.com/vi/D0k6evTvJDg/maxresdefault.jpg" alt="ZoZos Contact Solver - The ultimate Blender cloth simulator"></a></p>
+
+Here are some highlights:
+
+#### 📖 Docs Look
+
+We maintain a [full docs site](https://st-tech.github.io/ppf-contact-solver) with workflow guides and recorded walkthroughs for the add-on:
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/screenshots/documentation-dark-small.png" alt="Workflow documentation page on the docs site, showing the Blender / solver coordinate system explanation."></td>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/screenshots/video-tutorials-dark-small.jpg" alt="Video Tutorials page on the docs site, showing a grid of recorded walkthroughs."></td>
+</tr>
+<tr>
+<td valign="top">Workflow documentation page. <a href="https://st-tech.github.io/ppf-contact-solver/blender_addon/workflow/index.html">(Link)</a></td>
+<td valign="top">Video tutorials page. <a href="https://st-tech.github.io/ppf-contact-solver/blender_addon/tutorial.html">(Link)</a></td>
+</tr>
+</table>
+
+#### 🖼️ UI Look
+
+Here are a couple of screenshots of the add-on running inside Blender:
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/gallery/kite-ui-small.jpg" alt="The kite scene set up inside Blender using the add-on."></td>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/gallery/zebra-ui-small.jpg" alt="The zebra scene set up inside Blender using the add-on."></td>
+</tr>
+<tr>
+<td valign="top">Kite scene set up in Blender. <a href="https://zozo.box.com/s/dbtktx71fd0gb4z2trnvew7l3t8fuwxu">(full-size)</a></td>
+<td valign="top">Zebra scene set up in Blender. <a href="https://zozo.box.com/s/bkt5uviyqx825os7r854xslurqpxcj2k">(full-size)</a></td>
+</tr>
+</table>
+
+![Blender add-on overview](./docs/blender_addon/images/blender.webp)
+
+#### 🤖 From Natural Language to Simulation (via MCP)
+
+We expose all of the add-on's tools through an MCP server, so any LLM (Claude, Codex, etc.) can drive the whole pipeline from a natural language prompt. Scene building, parameter tweaks, and running the simulation all happen without UI clicks. Here are two examples:
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/gallery/mcp.webp" alt="Codex terminal on the left driving Blender on the right through the MCP server, building a bowl-and-spheres scene from a natural language prompt."></td>
+<td width="50%" valign="top"><img src="./docs/blender_addon/images/gallery/drape-over-sphere.webp" alt="A cloth sheet draped over a sphere, produced from a single natural language prompt through the MCP server."></td>
+</tr>
+<tr>
+<td valign="top">Codex (left) driving Blender (right) through the add-on's MCP server.</td>
+<td valign="top">A prompt: drape a sheet over a sphere and make an animation video mp4 render 300 frames.</td>
+</tr>
+</table>
+
+#### 🐍 From a Python Script to Simulation
+
+You can also drive the entire pipeline from a Python script inside Blender's scripting editor. This is handy for procedural scene setup and batch variant generation. Below is a full example that drapes a sheet over a sphere:
+
+```python
+import addon_utils
+import importlib
+import bpy
+
+# Look up the add-on module under whichever extension repository Blender
+# installed it into and grab the public solver API.
+addon = next(m for m in addon_utils.modules() if m.__name__.endswith(".ppf_contact_solver"))
+solver = importlib.import_module(f"{addon.__name__}.ops.api").solver
+
+# Reset any prior state.
+solver.clear()
+
+# Create a sphere (the static collider) at the origin.
+bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=4, radius=0.5, location=(0, 0, 0))
+bpy.context.object.name = "Sphere"
+
+# Create a 2x2 sheet just above the sphere as a 64x64 grid.
+bpy.ops.mesh.primitive_grid_add(x_subdivisions=64, y_subdivisions=64, size=2, location=(0, 0, 0.6))
+sheet = bpy.context.object
+sheet.name = "Sheet"
+
+# Pin the two corners on the -x edge via a vertex group.
+vg = sheet.vertex_groups.new(name="Corners")
+corner_indices = [
+    i for i, v in enumerate(sheet.data.vertices)
+    if v.co.x < -0.99 and abs(abs(v.co.y) - 1.0) < 0.01
+]
+vg.add(corner_indices, 1.0, "REPLACE")
+
+# Build solver groups.
+cloth = solver.create_group("Cloth", type="SHELL")
+cloth.add("Sheet")
+cloth.param.enable_strain_limit = True
+cloth.param.strain_limit_percent = 5.0
+cloth.param.bend = 1
+
+ball = solver.create_group("Ball", type="STATIC")
+ball.add("Sphere")
+
+# Pin the two sheet corners.
+cloth.create_pin("Sheet", "Corners")
+
+# Scene parameters.
+solver.param.frame_count = 100
+solver.param.step_size = 0.01
+```
+
+Here's how the script runs inside Blender [(full-size)](https://zozo.box.com/s/m86w3jyprvz5dug2pr7k73bozdbgldfl):
+
+![python-scripting](./docs/blender_addon/images/screenshots/python-scripting.jpg)
+
+For the full `solver.*` surface, see the [Blender Python API guide](https://st-tech.github.io/ppf-contact-solver/blender_addon/integrations/python_api.html).
+
+#### 🌏 Community Translations
+
+Our add-on ships UI catalogs for 日本語, 简体中文, and 한국어, selectable from **Edit → Preferences → Interface → Translation**.
+[narznarznarz](https://github.com/narznarznarz) polished our Korean catalog to match Blender's own Korean terminology [(Discussion)](https://github.com/st-tech/ppf-contact-solver/discussions/94):
+
+- 🇰🇷 [`ko_KR.json`](https://github.com/narznarznarz/ppf-contact-solver/blob/narznarznarz-patch-1/blender_addon/i18n/ko_KR.json) by [narznarznarz](https://github.com/narznarznarz)
+
+To install, [download it](https://raw.githubusercontent.com/narznarznarz/ppf-contact-solver/narznarznarz-patch-1/blender_addon/i18n/ko_KR.json) (keep the name `ko_KR.json`) and overwrite the `ko_KR.json` in the installed add-on's `i18n` directory, which this prints in Blender's **Python Console**:
+
+```python
+import addon_utils, os
+addon = next(m for m in addon_utils.modules() if m.__name__.endswith(".ppf_contact_solver"))
+print(os.path.join(os.path.dirname(addon.__file__), "i18n"))
+```
+
+Then restart Blender. Updating the add-on restores our catalog, so re-apply it after an update.
+
+### 🌐 JupyterLab
+
+Our frontend is accessible through a browser using our built-in JupyterLab interface.
+All is set up when you open it for the first time.
+Results can be interactively viewed through the browser and exported as needed.
+Our Python interface is designed with the following principles in mind:
+
+- **🛠️ In-Pipeline Tri/Tet Creation**: Depending on external 3D/CAD softwares for triangulation or tetrahedralization makes dynamic resolution changes cumbersome. We provide handy `.triangulate()` and `.tetrahedralize()` calls to keep everything in-pipeline, allowing users to skip explicit mesh exports to 3D/CAD software.
+- **🚫 No Mesh Data Included**: Preparing mesh data using external tools can be cumbersome. Our frontend minimizes this effort by allowing meshes to be created on the fly or downloaded when needed.
+- **🔗 Method Chaining**: We adopt the method chaining style from JavaScript, making the API intuitive to understand and read smoothly.
+- **📦 Single Import for Everything**: All frontend features are accessible by simply importing with `from frontend import App`.
+
+Here's an example of draping five sheets over a sphere with two corners pinned.
+We have more examples in the [examples](./examples/) directory. Please take a look! 👀
+
+```python
+# import our frontend
+from frontend import App
+
+# make an app
+app = App.create("drape")
+
+# create a square mesh resolution 128 spanning the xz plane
+V, F = app.mesh.square(res=128, ex=[1, 0, 0], ey=[0, 0, 1])
+
+# add to the asset and name it "sheet"
+app.asset.add.tri("sheet", V, F)
+
+# create an icosphere mesh radius 0.5
+V, F = app.mesh.icosphere(r=0.5, subdiv_count=4)
+
+# add to the asset and name it "sphere"
+app.asset.add.tri("sphere", V, F)
+
+# create a scene
+scene = app.scene.create()
+
+# define gap between sheets
+gap = 0.01
+
+for i in range(5):
+
+    # add the sheet asset to the scene with an vertical offset
+    obj = scene.add("sheet").at(0, gap * i, 0)
+
+    # pick two corners
+    corner = obj.grab([1, 0, -1]) + obj.grab([-1, 0, -1])
+
+    # pin the corners
+    obj.pin(corner)
+
+    # set the strict limit on maximum strain to 5% per triangle
+    obj.param.set("strain-limit", 0.05)
+
+# add a sphere mesh at a lower position with jitter and set it static collider
+scene.add("sphere").at(0, -0.5 - gap, 0).jitter().pin()
+
+# compile the scene and report stats
+scene = scene.build().report()
+
+# preview the initial scene, shows image left
+scene.preview()
+
+# create a new session with the compiled scene
+session = app.session.create(scene)
+
+# set session params
+session.param.set("frames", 100).set("dt", 0.01)
+
+# build this session
+session = session.build()
+
+# start the simulation and live-preview the results, shows image right
+session.start().preview()
+
+# also show streaming logs
+session.stream()
+
+# or interactively view the animation sequences
+session.animate()
+
+# export all simulated frames in (sequences of ply meshes + a video)
+session.export.animation()
+```
+
+<img src="./asset/image/drape-preview.webp" alt="drape">
+
+#### 📚 Python APIs and Parameters
+
+- Full API documentation is available on our [GitHub Pages](https://st-tech.github.io/ppf-contact-solver/jupyterlab_api/module_reference.html). The major APIs are documented using docstrings and compiled with [Sphinx](https://www.sphinx-doc.org/en/master/)
+We have also included [`jupyter-lsp`](https://github.com/jupyter-lsp/jupyterlab-lsp) to provide interactive linting assistance and display docstrings as you type. See this video [(Video)](https://zozo.box.com/s/52atrfn70vn8u07iwzbyrrz5ameczo03) for an example.
+The behaviors can be changed through the settings.
+
+- A list of parameters used in `param.set(key,value)` is documented here: [(Simulation Parameters)](https://st-tech.github.io/ppf-contact-solver/jupyterlab_api/simulation_parameters.html) [(Material Parameters)](https://st-tech.github.io/ppf-contact-solver/jupyterlab_api/material_parameters.html).
+
+> ⚠️ Please note that our Python APIs are subject to breaking changes as this repository undergoes frequent iterations. If you need APIs to be fixed, please fork.
+
+## 🔍 Obtaining Logs
+
+Logs for the simulation can also be queried through our Python APIs. Here's an example of how to get a list of recorded logs, fetch them, and compute the average.
+
+```python
+# get a list of log names
+logs = session.get.log.names()
+print(logs)
+assert "time-per-frame" in logs
+assert "newton-steps" in logs
+
+# get a list of time per video frame
+msec_per_video = session.get.log.numbers("time-per-frame")
+
+# compute the average time per video frame
+print("avg per frame:", sum([n for _, n in msec_per_video]) / len(msec_per_video))
+
+# get a list of newton steps
+newton_steps = session.get.log.numbers("newton-steps")
+
+# compute the average of consumed newton steps
+print("avg newton steps:", sum([n for _, n in newton_steps]) / len(newton_steps))
+
+# Last 8 lines. Omit for everything.
+print("==== log stream ====")
+for line in session.get.log.stdout(n_lines=8):
+    print(line)
+```
+
+Below are some representatives.
+`vid_time` refers to the video time in seconds and is recorded as `float`.
+`ms` refers to the consumed simulation time in milliseconds recorded as `int`.
+`vid_frame` is the video frame count recorded as `int`.
+
+| **Name** | **Description** | **Format**
+|---------------|----------------|------------
+| time-per-frame | Time per video frame | `list[(vid_frame,ms)]` |
+| matrix-assembly | Matrix assembly time | `list[(vid_time,ms)]` |
+| pcg-linsolve | Linear system solve time | `list[(vid_time,ms)]` |
+| line-search | Line search time | `list[(vid_time,ms)]` |
+| time-per-step | Time per step | `list[(vid_time,ms)]` |
+| newton-steps | Newton iterations per step | `list[(vid_time,count)]` |
+| num-contact | Contact count | `list[(vid_time,count)]` |
+| max-sigma | Max stretch | `list(vid_time,float)` |
+
+The full list of log names and their descriptions is documented here: [(GitHub Pages)](https://st-tech.github.io/ppf-contact-solver/jupyterlab_api/log_channels.html).
+
+Note that some entries have multiple records at the same video time. This occurs because the same operation is executed multiple times within a single step during the inner Newton's iterations. For example, the linear system solve is performed at each Newton's step, so if multiple Newton's steps are executed, multiple linear system solve times appear in the record at the same video time.
+
+If you would like to retrieve the raw log stream, you can do so by
+
+```python
+# Last 8 lines. Omit for everything.
+for line in session.get.log.stdout(n_lines=8):
+    print(line)
+```
+
+This will output something like:
+
+```text
+* dt: 1.000e-03
+* max_sigma: 1.045e+00
+* avg_sigma: 1.030e+00
+------ newton step 1 ------
+   ====== contact_matrix_assembly ======
+   > dry_pass...0 msec
+   > rebuild...7 msec
+   > fillin_pass...0 msec
+```
+
+If you would like to read `stderr`, you can do so using `session.get.log.stderr()` (if it exists).
+This returns `list[str]`.
+All the log files are updated in real-time and can be fetched right after the simulation starts; you don't have to wait until it finishes.
+
+## 🖼️ Catalogue
+
+### 🎨 Blender Add-on Examples
+
+These scenes are all built with our [add-on](#-blender-add-on). The simulation itself runs on a remote solver, or directly on your local machine if you have a modern NVIDIA GPU on Windows or Linux, or an Apple silicon Mac.
+
+You set the geometry, constraints, and parameters from Blender's UI, and the saved `.blend` carries everything the add-on needs.
+
+||||
+|---|---|---|
+|[kite.blend](https://zozo.box.com/s/j5tg9hy7nf1fdea1yg0s6holzwwus77t) [(Video)](https://zozo.box.com/s/7siwyp04s1vs48znwnt5vx1vhgodyr4h)|[crumple.blend](https://zozo.box.com/s/69ysygaqfud3bba8v3w33eqcbfn6l76u) [(Video)](https://zozo.box.com/s/ddrqqq87gpn0mekqx0yaukez87casten)|[puff.blend](https://zozo.box.com/s/mfc64djyjyunuhnmn51rm4jexxenx0si) [(Video)](https://zozo.box.com/s/8dpuoqbg80vxvxwsga36nz1633vx4k6u)|
+|![](./docs/blender_addon/images/gallery/kite.webp)|![](./docs/blender_addon/images/gallery/crumple.webp)|![](./docs/blender_addon/images/gallery/puff.webp)|
+|[press.blend](https://zozo.box.com/s/n1upezi7j0eufmrsief4qh252of7g1nq) [(Video)](https://zozo.box.com/s/nt8s46e6kke9poruvxmtxv5v56p2ysit)|[zebra.blend](https://zozo.box.com/s/qcos081dolarpczz8mheegvwqalxcnu2) [(Video)](https://zozo.box.com/s/rvcqynftqk27fczplafm0wgt95xmhb1k)|[curtain.blend](https://zozo.box.com/s/f8775589v2jd3nnmm7dzjrfy44xmbuhl) [(Video)](https://zozo.box.com/s/e558genjdno7jz9m0svojte5eco6q7tm)|
+|![](./docs/blender_addon/images/gallery/press.webp)|![](./docs/blender_addon/images/gallery/zebra.webp)|![](./docs/blender_addon/images/gallery/curtain.webp)|
+
+The simulated portion (objects, groups, pins, and solver parameters) is generated by a script you drop into Blender's Scripting editor. Cameras, lighting, and any non-simulated props are still set up in Blender's UI. Each script is linked above its thumbnail.
+
+|||||
+|---|---|---|---|
+|[cards.py](./examples/blender/cards.py) [(Video)](https://zozo.box.com/s/3xihxxigc6atsoss4vrh72qppgdvihy5)|[five-twist.py](./examples/blender/five-twist.py) [(Video)](https://zozo.box.com/s/71a22jxs5r68wk08j283p4fwj1q4543u)|[noodle.py](./examples/blender/noodle.py) [(Video)](https://zozo.box.com/s/orx2xs715i15l4urmnxns8qs9djhntvs)|[woven.py](./examples/blender/woven.py) [(Video)](https://zozo.box.com/s/16pmmgkpk6r18ae90cwjaknod6cd7y2w)|
+|![](./docs/blender_addon/images/gallery/cards.webp)|![](./docs/blender_addon/images/gallery/five-twist.webp)|![](./docs/blender_addon/images/gallery/noodle.webp)|![](./docs/blender_addon/images/gallery/woven.webp)|
+
+### 🌐 JupyterLab Examples
+
+All these examples run on our Python frontend through JupyterLab. Click any notebook to see how the scene is built, or click the video link to watch the result.
+
+|||||
+|---|---|---|---|
+|[woven.ipynb](./examples/woven.ipynb) [(Video)](https://zozo.box.com/s/0kgqmurmahwpvufuplbse9f83lsd7cjs)|[stack.ipynb](./examples/stack.ipynb) [(Video)](https://zozo.box.com/s/cy0pmlu5wwzmhri2qhrereqgobbv4eh6)|[trampoline.ipynb](./examples/trampoline.ipynb) [(Video)](https://zozo.box.com/s/syi5q1ywgtwrqx1f9xcjgz5m4jzagdra)|[needle.ipynb](./examples/needle.ipynb) [(Video)](https://zozo.box.com/s/zlrb6xk4gg4yjm2tspyv6u2n8vlo3dyb)|
+|![](./asset/image/catalogue/woven.mp4.webp)|![](./asset/image/catalogue/stack.mp4.webp)|![](./asset/image/catalogue/trampoline.mp4.webp)|![](./asset/image/catalogue/needle.mp4.webp)|
+|[cards.ipynb](./examples/cards.ipynb) [(Video)](https://zozo.box.com/s/7c114pua0107xkz4nc3bwfdzpkhgn1o9)|[codim.ipynb](./examples/codim.ipynb) [(Video)](https://zozo.box.com/s/o3en7lkzz2xhi0i9hzfdidau7pp7nco2)|[hang.ipynb](./examples/hang.ipynb) [(Video)](https://zozo.box.com/s/lcgnivq93ahvp1uccw91t13ht6qggopx)|[trapped.ipynb](./examples/trapped.ipynb) [(Video)](https://zozo.box.com/s/lnnyeqrvm86rxnwyjxhojfj0jgm5nphn)|
+|![](./asset/image/catalogue/cards.mp4.webp)|![](./asset/image/catalogue/codim.mp4.webp)|![](./asset/image/catalogue/hang.mp4.webp)|![](./asset/image/catalogue/trapped.mp4.webp)|
+|[domino.ipynb](./examples/domino.ipynb) [(Video)](https://zozo.box.com/s/p5ksfqja1ew3c6vntco5zq6g0kgf7xoo)|[noodle.ipynb](./examples/noodle.ipynb) [(Video)](https://zozo.box.com/s/wvsn7byr4yv80wixi5cs8mgoubco6kp4)|[drape.ipynb](./examples/drape.ipynb) [(Video)](https://zozo.box.com/s/fuisqc3wpnynd46mvdc7z2gat7mkjw07)|[five-twist.ipynb](./examples/five-twist.ipynb) [(Video)](https://zozo.box.com/s/36h8jpu5vcgc5t4xln2l68afj7izsx4h)|
+|![](./asset/image/catalogue/domino.mp4.webp)|![](./asset/image/catalogue/noodle.mp4.webp)|![](./asset/image/catalogue/drape.mp4.webp)|![](./asset/image/catalogue/quintupletwist.mp4.webp)|
+|[ribbon.ipynb](./examples/ribbon.ipynb) [(Video)](https://zozo.box.com/s/qxsx2it6kvd6p5ufqtmge6pd63lmhcny)|[curtain.ipynb](./examples/curtain.ipynb) [(Video)](https://zozo.box.com/s/ii938zyr4ytks5bnpbch3ystztuqq8mu)|[fishingknot.ipynb](./examples/fishingknot.ipynb) [(Video)](https://zozo.box.com/s/56dqf3fmnd0qr9pptqe8u8mw8vooh01p)|[friction.ipynb](./examples/friction.ipynb) [(Video)](https://zozo.box.com/s/15r5o7rrowwtbrsrjjpj35v8xt92ufhr)|
+|![](./asset/image/catalogue/ribbon.mp4.webp)|![](./asset/image/catalogue/curtain.mp4.webp)|![](./asset/image/catalogue/fishingknot.mp4.webp)|![](./asset/image/catalogue/friction.mp4.webp)|
+|[belt.ipynb](./examples/belt.ipynb) [(Video)](https://zozo.box.com/s/7ovalnjrptprcib7z0hj85lvr3yuhroz)|[fitting.ipynb](./examples/fitting.ipynb) [(Video)](https://zozo.box.com/s/pdcswk4ytzqgo98cjo91ensprgxz2umm)|[roller.ipynb](./examples/roller.ipynb) [(Video)](https://zozo.box.com/s/5156ez3b7rsvldqbgxsd7irhwp7mo2nc)|[yarn.ipynb](./examples/yarn.ipynb) [(Video)](https://zozo.box.com/s/3ly6riq5id8y9ukvbpnfnlro3qttylxw)|
+|![](./asset/image/catalogue/belt.mp4.webp)|![](./asset/image/catalogue/fitting.mp4.webp)|![](./asset/image/catalogue/roller.mp4.webp)|![](./asset/image/catalogue/yarn.mp4.webp)|
+
+### 💰 Budget Table on AWS
+
+Below is a table summarizing the estimated costs for running our examples on a NVIDIA L4 instance `g6.2xlarge` at Amazon Web Services US regions (`us-east-1` and `us-east-2`).
+
+- 💰 Uptime cost is approximately $1 per hour.
+- ⏳ Deployment time is approximately 8 minutes ($0.13). Instance loading takes 3 minutes, and Docker pull & load takes 5 minutes.
+- 🎮 The NVIDIA L4 delivers [30.3 TFLOPS for FP32](https://www.nvidia.com/en-us/data-center/l4/), offering approximately 36% of the [performance of an RTX 4090](https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/).
+- 🎥 Video frame rate is 60fps.
+
+| **Example** | **Cost** | **Time** | **#Frame** | **#Vert** | **#Face** | **#Tet** | **#Rod** | **Max Strain** |
+|--------------|-------|-------|-----|--------|--------|--------|---------|-----|
+| trapped      | $0.08 | 4.66m | 300 | 135.4K | 216.5K | 416.5K | ```N/A```     | ```N/A``` |
+| twist        | $0.37 | 22.4m | 430 | 204.0K | 406.8K | ```N/A```    | ```N/A```     | ```N/A``` |
+| stack        | $0.28 | 16.5m | 120 | 167.4K | 327.7K | 12.7K  | ```N/A```     | 5%  |
+| trampoline   | $0.13 | 8.03m | 60  | 36.4K  | 56.8K  | 78.2K  | ```N/A```     | 1%  |
+| needle       | $0.20 | 11.7m | 120 | 86.8K  | 169.0K | 12.7K  | ```N/A```     | 5%  |
+| cards        | $0.08 | 4.54m | 180 | 9.4K   | 13.9K  | 6.0K   | ```N/A```     | ```N/A``` |
+| domino       | $0.06 | 3.38m | 250 | 0.5K   | 0.8K   | 0.3K   | ```N/A```     | ```N/A``` |
+| drape        | $0.04 | 2.67m | 100 | 81.9K  | 161.3K | ```N/A```    | ```N/A```     | 5% |
+| curtain      | $0.18 | 10.6m | 300 | 64.0K  | 124.2K | ```N/A```    | ```N/A```     | 5% |
+| friction     | $0.16 | 9.63m | 850 | 3.3K   | 4.3K   | 12.0K  | ```N/A```     | ```N/A``` |
+| hang         | $0.14 | 8.54m | 200 | 16.4K  | 32.3K  | ```N/A```    | ```N/A```     | 1%  |
+| belt         | $0.08 | 5.09m | 200 | 12.3K  | 23.3K  | ```N/A```    | ```N/A```     | 5%  |
+| codim        | $0.11 | 6.80m | 240 | 61.6K  | 73.6K  | 234.5K | 1.3K    | ```N/A``` |
+| fishingknot  | $0.08 | 4.89m | 350 | 19.6K  | 36.9K  | ```N/A```    | ```N/A```     | 5%  |
+| fitting      | $0.02 | 1.26m | 240 | 28.5K  | 54.9K  | ```N/A```    | ```N/A```     | 10% |
+| noodle       | $0.09 | 5.25m | 240 | 116.3K | ```N/A```    | ```N/A```    | 116.2K  | ```N/A``` |
+| ribbon       | $0.25 | 14.8m | 480 | 35.6K  | 53.0K  | 12.6K  | ```N/A```     | ```N/A``` |
+| woven        | $0.39 | 23.2m | 450 | 115.6K | ```N/A```    | ```N/A```    | 115.4K  | ```N/A``` |
+| yarn         | $0.01 | 0.25m | 120 | 28.6K  | ```N/A```    | ```N/A```    | 28.5K   | ```N/A``` |
+| roller       | $0.04 | 2.64m | 180 | 6.2K   | 11.0K  | 7.1K   | ```N/A```     | ```N/A``` |
+
+#### 🏗️ Large Scale Examples
+
+Large scale examples are run on a [vast.ai](https://vast.ai) instance with an RTX 4090.
+These examples are not included in GitHub Action tests since they can take days to finish.
+
+| | | |
+|---|---|---|
+| [large-twist.ipynb](./examples/large-twist.ipynb) [(Video)](https://zozo.box.com/s/awtqwo572t7ixuy04va478zn6f69djlr) | [large-five-twist.ipynb](./examples/large-five-twist.ipynb) [(Video)](https://zozo.box.com/s/v62q7cbfnpl3hufwwy2nmewyes2w1iw6) | [large-woven.ipynb](./examples/large-woven.ipynb) [(Video)](https://zozo.box.com/s/kc81msjfo4yw9eozn8i8bean0gbph0pj) |
+| ![twist](./asset/image/large-scale/twist.jpg) | ![five-twist](./asset/image/large-scale/five-twist.jpg) | ![woven](./asset/image/large-scale/woven.jpg) |
+
+| Example | Commit | #Vert | #Face | #Rod | #Contact | #Frame | Time/Frame |
+|---|---|---|---|---|---|---|---|
+| large-twist | [a93dab5](https://github.com/st-tech/ppf-contact-solver/commit/a93dab59641eab47d6e3b0f8faaa9afd7df3948f) | 3.2M | 6.4M | ```N/A``` | 56.7M | 2,000 | 46.4s |
+| large-five-twist | [6ab6984](https://github.com/st-tech/ppf-contact-solver/commit/6ab6984d95f67673f1ebfdc996b0320123d88bed) | 8.2M | 16.4M | ```N/A``` | 184.1M | 2,413 | 144.5s |
+| large-woven | [4c07b83](https://github.com/st-tech/ppf-contact-solver/commit/4c07b834b299e49bb08797940e9f0869789301b8) | 2.7M | ```N/A``` | 2.7M | 8.9M | 946 | 436.8s |
+
+📝 Large scale examples take a very long time, and it's easy to lose connection or close the browser.
+Our frontend lets you close and reopen it at your convenience. Just recover your session after you reconnect.
+Here's an example cell how to recover:
+
+```python
+# In case you shutdown the server (or kernel) and still want
+# to restart, do this.
+# Do not run other cells used to create this scene.
+# You can also recover this way if you closed the browser.
+# Just directly run this in a new cell or in a new notebook.
+
+from frontend import App
+
+# recover the session
+session = App.recover("app-name")
+
+# resume if not currently running
+if not App.busy():
+    session.resume()
+
+# preview the current state
+session.preview()
+
+# stream the logs
+session.stream()
+```
+
+## 🚀 GitHub Actions
+
+We implemented GitHub Actions that test all of our examples except for large scale ones, which take from days to weeks to finish.
+We perform explicit intersection checks at the end of each step, which raises an error if an intersection is detected.
+**This ensures that all steps are confirmed to be penetration-free if tests pass.**
+The runner types are described as follows:
+
+### [![Getting Started](https://github.com/st-tech/ppf-contact-solver/actions/workflows/getting-started.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/getting-started.yml)
+
+This action builds the solver and runs a single headless example from start to finish on a freshly launched `g6e.2xlarge` AWS instance, so every run starts from a clean environment. 🌱
+
+### [![All Examples](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once.yml) [![All Examples (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/run-all-once-win.yml)
+
+Like the Getting Started action, these build the solver and run the examples from start to finish on freshly launched `g6e.2xlarge` AWS instances, so every run starts from a clean environment.
+Each example runs in parallel on its own instance, which reduces the total action time. 🌱
+
+### [![Blender CI](https://github.com/st-tech/ppf-contact-solver/actions/workflows/blender.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/blender.yml)
+
+This action exercises our [Blender add-on](#-blender-add-on) on Linux, Windows, and macOS in parallel. The Linux and Windows jobs run against the real CUDA solver on freshly launched `g6e.2xlarge` AWS instances, and the macOS job runs on a free GitHub-hosted runner that drives another such instance over the add-on's SSH connection. Blender 5.2.0 is installed from the official Blender Foundation mirror, and the add-on is installed as a Blender 5 extension. A headless test rig then runs the scenario registry covering add-on UI flows, sharded across the instances.
+
+### 📦 Action Artifacts
+
+We generate zipped action artifacts for each run. These artifacts include:
+
+- **📝 Logs**: Detailed logs of the simulation runs.
+- **📊 Metrics**: Performance metrics and statistics.
+- **📹 Videos**: Simulated animations.
+
+Please note that these artifacts will be deleted after a month.
+
+### ⚔️ Ten Consecutive Runs
+
+We know that you can't judge the reliability of contact resolution by simply watching a single success video example.
+To ensure greater transparency, we implemented GitHub Actions to run many of our examples via automated GitHub Actions, not just once, but **10 times in a row** for both Linux and Windows.
+This means that **a single failure out of 10 tests is considered a failure of the entire test suite!**
+Also, we apply small jitters to the position of objects in the scene, so **at each run, the scene is slightly different.**
+
+##### 🪟 Windows Native
+
+[![drape.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/drape-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/drape-win.yml)
+[![cards.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/cards-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/cards-win.yml)
+[![curtain.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/curtain-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/curtain-win.yml)
+[![friction.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/friction-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/friction-win.yml)
+[![hang.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/hang-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/hang-win.yml)
+[![needle.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/needle-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/needle-win.yml)
+[![stack.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/stack-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/stack-win.yml)
+[![trampoline.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trampoline-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trampoline-win.yml)
+[![trapped.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trapped-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trapped-win.yml)
+[![twist.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/twist-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/twist-win.yml)
+[![five-twist.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/five-twist-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/five-twist-win.yml)
+[![domino.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/domino-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/domino-win.yml)
+[![belt.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/belt-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/belt-win.yml)
+[![codim.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/codim-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/codim-win.yml)
+[![fishingknot.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fishingknot-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fishingknot-win.yml)
+[![fitting.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fitting-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fitting-win.yml)
+[![noodle.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/noodle-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/noodle-win.yml)
+[![ribbon.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/ribbon-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/ribbon-win.yml)
+[![woven.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/woven-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/woven-win.yml)
+[![yarn.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/yarn-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/yarn-win.yml)
+[![roller.ipynb (Windows Native)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/roller-win.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/roller-win.yml)
+
+##### 🐧 Linux
+
+[![drape.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/drape.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/drape.yml)
+[![cards.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/cards.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/cards.yml)
+[![curtain.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/curtain.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/curtain.yml)
+[![friction.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/friction.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/friction.yml)
+[![hang.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/hang.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/hang.yml)
+[![needle.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/needle.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/needle.yml)
+[![stack.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/stack.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/stack.yml)
+[![trampoline.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trampoline.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trampoline.yml)
+[![trapped.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trapped.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/trapped.yml)
+[![twist.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/twist.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/twist.yml)
+[![five-twist.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/five-twist.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/five-twist.yml)
+[![domino.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/domino.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/domino.yml)
+[![belt.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/belt.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/belt.yml)
+[![codim.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/codim.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/codim.yml)
+[![fishingknot.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fishingknot.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fishingknot.yml)
+[![fitting.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fitting.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/fitting.yml)
+[![noodle.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/noodle.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/noodle.yml)
+[![ribbon.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/ribbon.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/ribbon.yml)
+[![woven.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/woven.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/woven.yml)
+[![yarn.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/yarn.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/yarn.yml)
+[![roller.ipynb](https://github.com/st-tech/ppf-contact-solver/actions/workflows/roller.yml/badge.svg)](https://github.com/st-tech/ppf-contact-solver/actions/workflows/roller.yml)
+
+## 📡 Deploying on Cloud Services
+
+Running our solver on the cloud has a few practical advantages:
+
+- **💰 Pay only when you use it**: Spin up an instance, run your experiment, and delete it when you're done. You pay for hours, not for a GPU sitting on your desk.
+- **📈 Scale on demand**: If you have a deadline, just launch multiple instances and run experiments in parallel. No waiting in a queue.
+- **🤝 Share with collaborators**: Send the JupyterLab link to a remote teammate and they can watch the simulation right alongside you.
+- **🔒 Cloud-grade security**: You inherit whatever security the provider gives you, which is usually a lot more than you'd set up yourself.
+- **🐛 Reproducible environments**: Users and developers share the same kernel and driver, making bug reproduction more reliable than across heterogeneous local setups.
+- **🛠️ No hardware maintenance**: No driver updates, no thermal management, and no replacement costs when hardware fails.
+
+Below, we describe how to deploy our solver on major cloud services. These instructions are up to date as of late 2024 and are subject to change.
+
+> ⚠️ For all the services below, don't forget to delete the instance after use, or you'll be charged for nothing. 💸
+
+### 📦 Deploying on [vast.ai](https://vast.ai)
+
+- Select our template [(Link)](https://cloud.vast.ai?ref_id=85288&template_id=29158e5c91e1b4b9543b6a027a837979).
+- For a step-by-step video tutorial, see ["Setting Up vast.ai"](https://st-tech.github.io/ppf-contact-solver/blender_addon/tutorial.html).
+- Create an instance and connect via SSH with port forwarding, e.g. `ssh -L 8080:localhost:8080 root@<host> -p <port>`, then open `http://localhost:8080` in your browser.
+
+### 📦 Deploying on [Scaleway](https://www.scaleway.com/en/)
+
+- Set zone to `fr-par-2`
+- Select type `L4-1-24G` or `GPU-3070-S`
+- Choose `Ubuntu Jammy GPU OS 12`
+- *Do not skip* the Docker container creation in the installation process; it is required.
+- This setup costs approximately €0.76 per hour.
+- CLI instructions are described in [(Markdown)](./articles/cloud.md#-scaleway).
+
+### 📦 Deploying on [Amazon Web Services](https://aws.amazon.com/en/)
+
+- Amazon Machine Image (AMI): `Deep Learning Base AMI with Single CUDA (Ubuntu 24.04)`
+- Instance Type: `g6.2xlarge` (Recommended)
+- This setup costs around $1 per hour.
+- *Do not skip* the Docker container creation in the installation process; it is required.
+
+### 📦 Deploying on [Google Compute Engine](https://cloud.google.com/products/compute)
+
+- Select `GPUs`. We recommend the GPU type `NVIDIA L4` because it's affordable and accessible, as it does not require a high quota. You may select `T4` instead for testing purposes.
+- Do **not** check `Enable Virtual Workstation (NVIDIA GRID)`.
+- We recommend the machine type `g2-standard-8`.
+- Choose a Deep Learning VM OS image from the family `common-cu129-ubuntu-2404-nvidia-580` (NVIDIA driver 580) and set the disk size to `50GB`.
+- As of late 2024, this configuration costs approximately $0.86 per hour in `us-central1 (Iowa)` and $1.00 per hour in `asia-east1 (Taiwan)`.
+- Port number `8080` is reserved by the OS image. Set `$MY_WEB_PORT` to `8888`. When connecting via `gcloud`, use the following format:  `gcloud compute ssh --zone "xxxx" "instance-name" -- -L 8080:localhost:8888`.
+- *Do not skip* the Docker container creation in the installation process; it is required.
+- CLI instructions are described in [(Markdown)](./articles/cloud.md#-google-compute-engine).
+
+## 🤝 Community Response
+
+### 📺 YouTube
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=D0k6evTvJDg"><img src="https://img.youtube.com/vi/D0k6evTvJDg/maxresdefault.jpg" alt="ZoZos Contact Solver - The ultimate Blender cloth simulator"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=dXfTz01Z-GM&t=616s"><img src="https://img.youtube.com/vi/dXfTz01Z-GM/maxresdefault.jpg" alt="Blender Gets Serious About Physics + Motion Designer Builds a Mograph App | Motion Mondays"></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://www.youtube.com/watch?v=D0k6evTvJDg"><em>ZoZos Contact Solver - The ultimate Blender cloth simulator</em></a> by <a href="https://www.youtube.com/@CGMatter">CGMatter</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=dXfTz01Z-GM&t=616s"><em>Blender Gets Serious About Physics + Motion Designer Builds a Mograph App | Motion Mondays</em></a> by <a href="https://www.youtube.com/@SchoolofMotion">School of Motion</a>.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=VOORiyip4_c"><img src="https://img.youtube.com/vi/VOORiyip4_c/maxresdefault.jpg" alt="The Worst Bug In Games Is Now Gone Forever"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=hM9vI36qXW0"><img src="https://img.youtube.com/vi/hM9vI36qXW0/maxresdefault.jpg" alt="NUEVA Simulacion de Telas PERFECTAS en Blender"></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://www.youtube.com/watch?v=VOORiyip4_c"><em>The Worst Bug In Games Is Now Gone Forever</em></a> by <a href="https://www.youtube.com/@TwoMinutePapers">Two Minute Papers</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=hM9vI36qXW0"><em>NUEVA Simulacion de Telas PERFECTAS en Blender</em></a> by <a href="https://www.youtube.com/@MinerDesign">MinerDesign</a>.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=wPjqsq0N0ns"><img src="https://img.youtube.com/vi/wPjqsq0N0ns/maxresdefault.jpg" alt="Blender Now Has Mind-blowing Physics!"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=0huIwBTcKHU&t=108s"><img src="https://img.youtube.com/vi/0huIwBTcKHU/maxresdefault.jpg" alt="Blender Physics Just Got Insane"></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://www.youtube.com/watch?v=wPjqsq0N0ns"><em>Blender Now Has Mind-blowing Physics!</em></a> by <a href="https://www.youtube.com/@DECODEDVFX">DECODED</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=0huIwBTcKHU&t=108s"><em>Blender Physics Just Got Insane</em></a> by <a href="https://www.youtube.com/@CGDive">CGDive</a>.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=ivDtWRFewVM"><img src="https://img.youtube.com/vi/ivDtWRFewVM/maxresdefault.jpg" alt="Houdini Level Cloth Simulation in Blender?"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=R-5sL80WKoc"><img src="https://img.youtube.com/vi/R-5sL80WKoc/hqdefault.jpg" alt="This Blender Addon Makes Cloth Simulation SO Much Better"></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://www.youtube.com/watch?v=ivDtWRFewVM"><em>Houdini Level Cloth Simulation in Blender?</em></a> by <a href="https://www.youtube.com/@InspirationTuts">InspirationTuts</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=R-5sL80WKoc"><em>This Blender Addon Makes Cloth Simulation SO Much Better</em></a> by <a href="https://www.youtube.com/@Megani21">Megani</a>.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://youtu.be/ZagGwtRO3Ss?si=vbAPHeBAPhbqdemM&t=684"><img src="https://img.youtube.com/vi/ZagGwtRO3Ss/maxresdefault.jpg" alt="Blender 5.2 Cloth Simulation + The Secret to Better Collisions"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=z5D5iCBqMKI"><img src="https://img.youtube.com/vi/z5D5iCBqMKI/maxresdefault.jpg" alt="This FREE Blender Add-on Could Solve Your Cloth Problems"></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://youtu.be/ZagGwtRO3Ss?si=vbAPHeBAPhbqdemM&t=684"><em>Blender 5.2 Cloth Simulation + The Secret to Better Collisions</em></a> by <a href="https://www.youtube.com/@styliz3d">Styliz 3D</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=z5D5iCBqMKI"><em>This FREE Blender Add-on Could Solve Your Cloth Problems</em></a> by <a href="https://www.youtube.com/@blenderhub7">BlenderHub</a>.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=7BzCCpbpgKY&t=282s"><img src="https://img.youtube.com/vi/7BzCCpbpgKY/hqdefault.jpg" alt="These Blender Simulation Solvers Are Changing Everything"></a></td>
+<td width="50%" valign="top"><a href="https://www.youtube.com/watch?v=eeYQ2qM3KPw"><img src="https://img.youtube.com/vi/eeYQ2qM3KPw/hqdefault.jpg" alt="I Tested &quot;Next-Gen&quot; Cloth Physics in Blender... Then It Stopped."></a></td>
+</tr>
+<tr>
+<td valign="top"><a href="https://www.youtube.com/watch?v=7BzCCpbpgKY&t=282s"><em>These Blender Simulation Solvers Are Changing Everything</em></a> by <a href="https://www.youtube.com/@InspirationTuts">InspirationTuts</a>.</td>
+<td valign="top"><a href="https://www.youtube.com/watch?v=eeYQ2qM3KPw"><em>I Tested "Next-Gen" Cloth Physics in Blender... Then It Stopped.</em></a> by <a href="https://www.youtube.com/@BracerJack">Bracer Jack</a>.</td>
+</tr>
+</table>
+
+- [*Visual Components - ZOZO's Contact Solver Handshanking*](https://www.youtube.com/watch?v=k000SaPXK4Q) by [idkfa](https://www.youtube.com/@idkfa3).
+- [*Blender 3D - ZOZO's Contact Solver Capability Test - Squished Cloths under Rubber Ball*](https://www.youtube.com/watch?v=emA3xxJjtOM) by [\[BH\]Lithium](https://www.youtube.com/@lithium820).
+- [*Testing ZoZo's contact solver in blender*](https://www.youtube.com/watch?v=DkIWXsxFJLs) by [Colin T](https://www.youtube.com/@ManiacalV).
+- [*Zozo's Contact Solver | Blender Test*](https://www.youtube.com/watch?v=EcTBUaeOu2U) by [YEETboys_666](https://www.youtube.com/@YEETboys_555).
+- [*Zozo's Multi-Cloth Simulation | Blender Test*](https://www.youtube.com/watch?v=VVphAZokcjs) by [YEETboys_666](https://www.youtube.com/@YEETboys_555).
+
+### 🎬 Shorts and Reels
+
+- [*Testing the new ZOZO Physics Contact Solver Addon for Blender*](https://www.youtube.com/shorts/50dQrbSYoWk) by [Max Grob](https://www.youtube.com/@maxgrob1412).
+- [*Will the Steel Ball Pass Through?*](https://www.youtube.com/shorts/-s57o9FHM9c) by [ゴリランド](https://www.youtube.com/@%E3%82%B4%E3%83%AA%E3%83%A9%E3%83%B3%E3%83%89).
+- [*Will the Minecraft Slime Block Drop?*](https://www.youtube.com/shorts/H2ncgaLnU6s) by [ゴリランド](https://www.youtube.com/@%E3%82%B4%E3%83%AA%E3%83%A9%E3%83%B3%E3%83%89).
+- [*Will the Slime Block Make It Down?*](https://www.youtube.com/shorts/yPJKib9Smzc) by [ゴリランド](https://www.youtube.com/@%E3%82%B4%E3%83%AA%E3%83%A9%E3%83%B3%E3%83%89).
+- [*Will the Squishy Balls Fit Through?*](https://www.youtube.com/shorts/qvGMO8czEAA) by [ゴリランド](https://www.youtube.com/@%E3%82%B4%E3%83%AA%E3%83%A9%E3%83%B3%E3%83%89).
+- https://www.youtube.com/shorts/l84D9OJNJ8U by [Arslan Ashraf](https://www.youtube.com/@ArslanCreates3D).
+- https://www.youtube.com/shorts/Pr5J5vSydvg by [Arthendo](https://www.youtube.com/@arthendo4175).
+- https://www.instagram.com/reel/DdpRXR5SfSR/ by [avril.studios](https://www.instagram.com/avril.studios/).
+- https://www.instagram.com/reel/DeRXEnVNqL2/ by [ohonkanen](https://www.instagram.com/ohonkanen/).
+- https://www.instagram.com/reel/Debyir-oTZH/ by [fatdog3d](https://www.instagram.com/fatdog3d/).
+- https://www.instagram.com/reel/DeWQeBZCf1y/ by [blenderhub7](https://www.instagram.com/blenderhub7/).
+- https://www.instagram.com/reel/DY1RyzftwCC/ by [imhere_imj](https://www.instagram.com/imhere_imj/).
+- https://www.instagram.com/reel/DYzoS9mRbHc/ by [alanmsyarif](https://www.instagram.com/alanmsyarif/).
+- https://www.instagram.com/reel/DY9kzq6g7qk/ by [motionfig.studio](https://www.instagram.com/motionfig.studio/).
+- https://www.instagram.com/reel/DZLNAgyP0GV/ by [4ntho3d](https://www.instagram.com/4ntho3d/).
+- https://www.instagram.com/reel/DboXtShx8f1/ by [femto_gd](https://www.instagram.com/femto_gd/).
+- https://www.instagram.com/reel/DbnwIr1KHBG/ by [mathisrigolle](https://www.instagram.com/mathisrigolle/).
+- https://www.instagram.com/reel/DeIUtg1FcdB/ by [billy.coder](https://www.instagram.com/billy.coder/).
+
+### 📰 Articles
+
+- [*A New Open-Source Physics Engine for Blender - ZOZO's Contact Solver*](https://www.reddit.com/r/blender/comments/1ti5bbh/a_new_opensource_physics_engine_for_blender_zozos/) on [r/blender](https://www.reddit.com/r/blender/).
+- [*New Simulation Method To Achieve Accuracy In Collision Physics*](https://80.lv/articles/new-simulation-method-to-achieve-accuracy-in-collision-physics) by Amber Rutherford on [80 Level](https://80.lv/).
+- [*New Research Might Have Finally Solved the Clipping Bug*](https://www.live-laugh-love.world/blog/game-collision-bugs-solution/) by LLL Inc.
+- [*New Open-Source Physics Engine For Blender Released*](https://80.lv/articles/new-open-source-physics-engine-for-blender-released) on [80 Level](https://80.lv/).
+- [*Dancing Skeleton with Realistic Fabric Simulation in Blender*](https://80.lv/articles/dancing-skeleton-with-realistic-fabric-simulation-in-blender) on [80 Level](https://80.lv/).
+- [*The Official Blender Add-on for ZOZO's Contact Solver - An Open-Source Physics Solver*](https://www.pixelsham.com/2026/05/20/the-official-blender-add-on-for-zozos-contact-solver-an-open-source-physics-solver/) on [PixelSham](https://www.pixelsham.com/).
+- [*ZOZO's Contact Solver Blender Add-on 2026*](https://3dnchu.com/archives/zozos-contact-solver-b3d/) (Japanese article) on [3D人-3dnchu-](https://3dnchu.com/).
+- [*ZOZO Releases Open-Source High-Precision Physics Simulation "ppf-contact-solver", Enabling Large-Scale Cloth Simulation from Blender*](https://modelinghappy.com/archives/68744) (Japanese article) on [MODELING HAPPY](https://modelinghappy.com/).
+- [*ZOZO's Contact Solver: open-source physics simulation lands in Blender 5*](https://www.kabum.it/blog/zozo-ppfcontact-solver-for-blender/) on [Kabum](https://www.kabum.it/).
+- [*The Polynomial That Fixed 30 Years of Cloth Simulation*](https://towardsdatascience.com/the-polynomial-that-fixed-30-years-of-cloth-simulation/) by Ferran Alia on [Towards Data Science](https://towardsdatascience.com/).
+- [*GALAXY S26 ULTRA new colors*](https://blenderartists.org/t/galaxy-s26-ultra-new-colors/1643756) by NARZ.CG on [Blender Artists](https://blenderartists.org/).
+- [*ZOZO's Contact Solver (ppf-contact-solver) Blender Add-on Installation Procedure*](https://note.com/mon38/n/n34b4687db39d?hl=en) (Japanese article) by [mon38](https://note.com/mon38) on [note](https://note.com/).
+
+### 🧩 Blender Add-ons
+
+Alongside our [official Blender add-on](#-blender-add-on), the following community add-ons are also available:
+
+- [AndoSim](https://github.com/Slaymish/AndoSim)
+- [ArzteZ-PPF-solver](https://github.com/tavcitavci-sys-tavci-ui/ArzteZ-PPF-solver)
+
+### 📣 Sharing Your Work
+
+Our work still needs many improvements, and our documentation and tutorial videos are not very sophisticated.
+The author would greatly appreciate it if you made your own tutorial videos, write-ups, or blog posts about the solver, and posted them online on YouTube, your blog, social media, or anywhere else.
+
+If you post about it on [X.com](https://x.com), please consider using the [**#ZOZOContactSolver**](https://x.com/hashtag/ZOZOContactSolver) tag so the author and community users can find your work.
+
+## 💼 Commercial Use and Beyond
+
+This project is released under the [Apache License 2.0](./LICENSE). In plain terms, you may use, modify, and redistribute the code in commercial products, including proprietary software, without paying royalties or open-sourcing your own code. You only need to preserve the license notice and the attribution required by the license.
+
+The one exception is the code that calls Blender's Python API (`bpy`). Blender requires an add-on to preserve the same freedoms Blender grants, so the Blender add-on (`blender_addon/`), its example scripts (`examples/blender/`) and the tests that load it (`addon_host_tests/`) are licensed under the [GNU General Public License, version 3 or later](./blender_addon/LICENSE) (`GPL-3.0-or-later`). Everything else, including the solver and the Python frontend, remains Apache 2.0. [LICENSING.md](./LICENSING.md) maps each path to its license.
+
+If you build something on top of this solver, we would love to hear about it, but you are not obligated to disclose anything.
+
+### 🔧 Building Your Own Solver
+
+If you like, we suggest taking the whole source code apart and building your own solver tailored to your specific needs. With the recent advances in coding agents, this is very likely possible even without any expertise in physics or coding.
+
+Once you build your own, you are free to publish it as your own project or commercialize it, as long as you follow the license terms described above.
+
+You don't need to use this project as is. Customize it as you like!
+
+## 📬 Contributing
+
+We cannot accept pull requests directly, since that involves resolving copyright and licensing matters with [ZOZO, Inc.](https://corp.zozo.com/en/) Instead, please open an issue for bug reports and proposals, or fork the repository and share a reference implementation for us to review. Substantial contributions will be credited here.
+
+Issues are triaged in batches by a single part-time maintainer (Ryoichi Ando) and labeled `queued` (seen), `in-progress` (started), or `worked` (answered at least once), so please be patient if a response takes a while.
+
+When reporting an issue, please attach a `.blend` file that reproduces it if possible. Remove any copyrightable materials from the scene or replace them with openly licensed alternatives. Because GitHub does not support direct `.blend` uploads, compress the file into a ZIP archive (for example, `scene.blend.zip`) before attaching it.
+
+Please do not submit any other copyrightable materials through Issues or Discussions. Thank you!
+
+## 💬 Participating Discussions
+
+We have opened [GitHub Discussions](https://github.com/st-tech/ppf-contact-solver/discussions) as a place for questions, ideas, and conversations about the solver. Feel free to drop by to ask questions, share your work, or chat with the community.
+
+## 📨 Reaching the Author
+
+This project is owned by [ZOZO, Inc.](https://corp.zozo.com/en/) and maintained by Ryoichi Ando.
+
+For bug reports or feature requests, please open an issue on GitHub. For usage questions, [GitHub Discussions](https://github.com/st-tech/ppf-contact-solver/discussions) is the best place to ask. Either route is the fastest way to reach the author and keeps the conversation searchable for other users.
+
+If you would prefer to reach out privately, you can also email the author at <ryoichi.ando@zozo.com>. Please do not send any copyrightable materials; anything of that kind will never be read by the author and will be deleted upon receipt.
+
+If you used this project in a public piece of work, whether a paper, a production credit, or a personal project, the author would love to feature it here. A link to your article, project page, or website is all we need (rather than images or clips themselves, since hosting them here may run into licensing issues), and we will be happy to add it.
+
+## 🔒 Our Penetration-free Guarantee
+
+We employ Continuous Collision Detection (CCD), **not Discrete Collision Detection (DCD)**. Our [cubic barrier](#-technical-materials) theoretically guarantees penetration-free contact by construction, not heuristics, **only when a solution is found.** A solution may not be found in extreme cases. In such cases, as well as with bugs, the solver may crash, stall, or take nearly forever to find a solution. **What we guarantee is that every step that succeeds is free of intersections.**
+
+### ✅ How Do We Promise No Intersections?
+
+An intersection checker confirms **zero penetration** after every successful run and every step in [GitHub Actions](#-github-actions), so no hidden intersections are left behind.
+
+### 🚨 Intersection Errors Can Also Indicate an Impossible Setup
+
+Examples include pinned panels driven through each other ([#116](https://github.com/st-tech/ppf-contact-solver/issues/116)) and cloth trapped in a self-intersecting character animation ([#110](https://github.com/st-tech/ppf-contact-solver/issues/110)). Stopping preserves the guarantee, while completing would silently accept penetration. Check the scene before reporting a bug.
+
+If a cloth is pinched by an animated character or a shape-keyed collider (see [#160](https://github.com/st-tech/ppf-contact-solver/issues/160)), the solver may stop with "Newton solve made no progress (over-constrained configuration)". In that case, enable "Soft Constraint" on the group of the collider. The collider then gives way slightly where it presses on the cloth, and the scene can run to the end.
+
+<img src="https://github.com/user-attachments/assets/f9053c49-d2a1-4117-962c-35455882e011" alt="Apply Soft Constraints" width="500">
+
+If the cloth has pins, changing the pin type to "Pull" can also fix the failure. If you have any pins, please turn them all to "Pull" pins.
+
+<img src="https://github.com/user-attachments/assets/3b9a9dd3-d585-48ff-8aa1-cf7d3313a5c0" alt="Pull pin type" width="280">
+
+## ❓ Frequently Asked Questions
+
+| Question | Answer |
+| --- | --- |
+| Why did ZOZO, Inc. make this? | To accelerate our internal R&D. Please read this article from [ZOZO, Inc.](https://corp.zozo.com/en/) (Japanese): <https://corp.zozo.com/topics/20241125-siggraphasia/> |
+| A fashion company made this? | Yes. |
+| Why is this very slow? | We use a very different physics that guarantees strain limiting (e.g., no stretching over 2%) and penetration-free. That costs a lot. Other popularized solvers (e.g., XPBD) are much faster, but we don't know how to satisfy the two guarantees with them. |
+| This paper &lt;XXX&gt; is faster than yours! | We are aware of that, so we never claim the state-of-the-art performance. |
+| Then why not use &lt;XXX&gt;? | We need to check two things for &lt;XXX&gt;. First, whether it provides a strain limit guarantee, which is very important for us. Second, whether it runs entirely in single precision, since any use of double precision would prevent it from compiling on Apple Metal. |
+| Then, if &lt;XXX&gt; can do all of that, will you adopt it? | The adoption cost is not free. Also, incorporating third-party techniques requires our internal legal review. |
+| Should we use it? | Honestly, not yet for serious use. We still have many bugs, and performance is too slow. A lot needs to be fixed and improved. We are on it. |
+| I bumped into a bug. | We kindly ask you to report it via [GitHub Issues](https://github.com/st-tech/ppf-contact-solver/issues). See [Contributing](#-contributing) for what to attach. |
+| Does the author speak English? When I post an issue, I prefer the author read it directly, not an AI translating it into Japanese and passing it to the author. | Direct read. No translation. |
+| What are the third-party alternatives? | Ask ChatGPT. |
+| Is this better than &lt;Your Favorite Product&gt;? | Partly yes, partly no. ZOZO's Contact Solver is not a drop-in replacement for any commercial product. |
+| So what is it good for? | See the [Catalogue](#️-catalogue) and the community [YouTube](#-youtube) videos. They show what we can do. |
+| Why did you separate the backend communicator and the solver engine? I would prefer an all-in-one, single-click setup. | Our main target is cloud use, such as AWS, rather than running on a desktop computer. |
+| Why did you make the setup this complicated? | For internal use reasons. For now, see the [CGMatter YouTube video](https://www.youtube.com/watch?v=D0k6evTvJDg) and our [video tutorials](https://st-tech.github.io/ppf-contact-solver/blender_addon/tutorial.html). They are much cleaner. |
+| The UI is not very user friendly, either. | True. We designed it that way to make debugging easier for us. At least we are aware. |
+| I don't have GPUs. Can I use this? | Yes, all the features run on the CPU backend (or Metal on Apple silicon), but it does not scale to large-scale scenes. See [Requirements](#️-requirements). |
+| Does it run on AMD and Apple silicon (Metal) GPUs? | Yes. See [Requirements](#️-requirements). |
+| Is it really intersection-free? | If the simulation does not crash or stall, yes, it is exactly 100% intersection-free. We never promise that the simulation will not crash or stall. |
+| Why should I believe you? | We perform explicit intersection checks at the end of every step. See [How Do We Promise No Intersections?](#-how-do-we-promise-no-intersections). |
+| Overhyped? | Many people seem to think it runs in real time and are disappointed to learn that it does not. We have laid out clear limitations in [Gentle Disclaimer and Limitations](#-gentle-disclaimer-and-limitations). |
+| I got an intersection error. Where is your guarantee? | In some situations, penetration is structurally unavoidable. See [Intersection Errors Can Also Indicate an Impossible Setup](#-intersection-errors-can-also-indicate-an-impossible-setup). |
+| Doesn't LLM-assisted coding compromise reliability? | The author can neither write code faster than an LLM nor write smarter or more polished code than the latest LLM models. We run extensive tests through [GitHub Actions](#-github-actions) to assure reliability as best we can. |
+| But LLMs can make mistakes. | The author makes more mistakes. |
+| Did you write everything using AI? | We try to let AI handle what it is reliable at. However, Claude Code did not exist when our [TOG paper (2024)](#-technical-materials) was published, and until it did, we wrote everything ourselves, except for completions suggested by Copilot. We know what we are doing. |
+| Is this really free? | Yes. |
+| Free? AI coded? Sounds cheap. | This project is years of research. It started even before ChatGPT existed. |
+| AI slacking off? | No! Tremendous human effort is poured into it. |
+| How large is your team? | A single person (Ryoichi Ando). Security reviews and legal checks are done by responsible teams at ZOZO, Inc. |
+| Is this really made by a single person? | The author is a single person backed by the support of the company. |
+| You forked other repo and just made small changes? | No. Everything is written from scratch. |
+| This README is TL;DR. | Just watch the [CGMatter YouTube video](https://www.youtube.com/watch?v=D0k6evTvJDg). That's the best starting point. |
+| I can make this better! | Please do so. As long as you adhere to the [Apache License 2.0](./LICENSE) (and, for the Blender add-on, the [GPL-3.0-or-later](./blender_addon/LICENSE)), you are free to distribute and commercialize your own. |
+
+## 🙏 Acknowledgements
+
+The author thanks [ZOZO, Inc.](https://corp.zozo.com/en/) for permitting the release of the code and the team members for assisting with the internal paperwork for this project.
+The author expresses gratitude to GitHub community users for their feedback in [Issues](https://github.com/st-tech/ppf-contact-solver/issues) and [Discussions](https://github.com/st-tech/ppf-contact-solver/discussions), which has greatly helped track down and fix bugs, and for proposing feature requests that have strengthened this solver.
+The author also thanks everyone who has shared videos featuring this solver on YouTube, helping introduce it to a wider audience.
+This repository is owned by [ZOZO, Inc.](https://corp.zozo.com/en/)

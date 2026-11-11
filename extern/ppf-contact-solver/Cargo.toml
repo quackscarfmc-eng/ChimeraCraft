@@ -1,0 +1,84 @@
+# File: Cargo.toml
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+
+[workspace]
+# Edition 2021 implies resolver = 2 for workspaces with a [package],
+# but in a virtual workspace cargo defaults to resolver = 1 unless
+# stated explicitly. Pin it here so feature unification stays on the
+# modern (per-target) resolver every member already assumed.
+resolver = "2"
+members = [
+    "crates/ppf-cts-formats",
+    "crates/ppf-cts-compute",
+    "crates/ppf-cts-core",
+    "crates/ppf-cts-py",
+    "crates/ppf-cts-server",
+    "crates/ppf-cts-solver",
+]
+# `cargo build --release` at the workspace root builds four artifacts:
+# the CUDA solver driver (binary: `ppf-contact-solver`, package:
+# `ppf-cts-solver`) and its static library (`libppf_cts_solver.a`), the
+# tokio-based solver host (`ppf-cts-server`), and the PyO3 extension cdylib
+# `_ppf_cts_py` (package: `ppf-cts-py`). All four land in `target/release/`;
+# build-win-native/build.bat and the
+# Linux build paths rely on this. ppf-cts-core and ppf-cts-formats are
+# libraries (built transitively as deps). ppf-cts-py is built as a plain
+# cargo cdylib: there is no maturin wheel step. `frontend/__init__.py`
+# loads `target/<profile>/lib_ppf_cts_py.{so,dylib}` (or `_ppf_cts_py.dll`
+# on Windows) directly via importlib, so it is never installed into a venv
+# or site-packages. On macOS `cargo build --release` selects Metal, and on a
+# host with no GPU toolkit it hard-errors naming what it looked for: there is
+# no fallback build, so a tree either holds a real backend or holds nothing.
+default-members = [
+    "crates/ppf-cts-solver",
+    "crates/ppf-cts-server",
+    "crates/ppf-cts-py",
+]
+# eigsys/eig-rust stays on its own (separate Cargo.toml outside this
+# workspace) because its nalgebra major version diverges from ours and
+# pulling it in would force a coordinated bump. The explicit `exclude`
+# stops cargo's auto-discovery from ever folding it back in.
+exclude = ["eigsys/eig-rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Pinned here so every workspace crate uses identical versions.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.95"
+# CBOR codec. ciborium replaces the abandoned serde_cbor (last
+# release 2021); both produce CBOR-spec bytes so the Python cbor2
+# 6.x consumer accepts either. We use the unified Value type for
+# opaque pass-through fields and into_writer / from_reader for the
+# typed envelope round-trip.
+ciborium = "0.2"
+bincode = "1.3.3"
+nalgebra = { version = "0.33", features = ["serde-serialize"] }
+ndarray = "0.16"
+rayon = "1.10"
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+log = "0.4"
+log4rs = "1.2"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[workspace.lints.clippy]
+# Keep the clippy noise actionable. We don't enable
+# `unsafe_op_in_unsafe_fn` because PyO3 0.22's `#[pyfunction]` macro
+# expands to internal `unsafe` calls without `unsafe {}` blocks,
+# producing one warning per binding (~600+ false positives). Re-enable
+# after PyO3 catches up to the Rust 2024 idiom.
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+uninlined_format_args = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

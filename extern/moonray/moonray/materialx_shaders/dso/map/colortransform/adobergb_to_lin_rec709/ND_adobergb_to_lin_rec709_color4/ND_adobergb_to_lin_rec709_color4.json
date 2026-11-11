@@ -1,0 +1,20 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Rgba(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgba"
+        }
+    },
+    "name" : "ND_adobergb_to_lin_rec709_color4",
+    "type" : "Map"
+}

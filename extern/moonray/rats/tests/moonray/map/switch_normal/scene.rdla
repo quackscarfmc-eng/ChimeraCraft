@@ -1,0 +1,57 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+SceneVariables {
+    ["image_width"] = 250,
+    ["image_height"] = 250,
+    ["pixel_samples"] = 2,
+}
+
+Camera("/Scene/rendering/camera") {
+    ["near"] = 0.1,
+    ["node_xform"] = translate(0.0, 0.0, 1.0) * rotate(-45, 1, 0, 0) * translate(0.0, 0.0, 0.2),
+}
+
+rectLgt = RectLight("rectLgt") {
+    ["node_xform"] = translate(0.0, 0.0, 30.0) * rotate(-45.0, 1, 0, 0) * rotate(180.0, 0, 1, 0),
+}
+
+ltSet = LightSet("LightSet") {
+    rectLgt,
+}
+
+geom = UsdGeometry("geom") {
+    ["stage"] = rats_assets_dir .. "/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+GeometrySet("geomset") {
+    geom
+}
+
+skin = ImageNormalMap("skin") {
+    ["tangent_space_normal_texture"] = rats_assets_dir .. "/textures/skin_normal.tx",
+}
+
+wood = ImageNormalMap("wood") {
+    ["tangent_space_normal_texture"] = rats_assets_dir .. "/textures/wood_normal.tx",
+}
+
+checkMap = CheckerboardMap("checkMap") {
+}
+
+switchNormalMap = SwitchNormalMap("switchNormalMap") {
+    ["choice"] = bind(checkMap, 1.0),
+    ["input0"] = wood,
+    ["input1"] = skin,
+}
+
+mtl = DwaSolidDielectricMaterial("mtl1") {
+    ["show_diffuse"] = false,
+    ["show_specular"] = true,
+    ["roughness"] = 0.3,
+    ["input_normal"] = switchNormalMap,
+}
+
+Layer("/Scene/layer") {
+    {geom, {""}, mtl, ltSet},
+}

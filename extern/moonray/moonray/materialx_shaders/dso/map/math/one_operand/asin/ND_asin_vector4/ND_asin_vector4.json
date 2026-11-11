@@ -1,0 +1,28 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "Vec4f(0.0f,0.0f,0.0f,0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Vec4f"
+		}
+	},
+	"name" : "ND_asin_vector4",
+	"type" : "Map",
+        "outputAttributes" :
+        {
+                "outAttr" :
+                {
+                        "name" : "out",
+                        "type" : "Vec4f"
+                }
+        }
+}

@@ -1,0 +1,29 @@
+{
+	"attributes" : 
+	{
+		"anisotropyAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"min" : "0.0",
+			"name" : "anisotropy",
+			"type" : "Float"
+		},
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"glossinessAttr" : 
+		{
+			"default" : "0.0f",
+			"flags" : "FLAGS_BINDABLE",
+			"min" : "0.0",
+			"name" : "glossiness",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_glossiness_anisotropy",
+	"type" : "Map"
+}

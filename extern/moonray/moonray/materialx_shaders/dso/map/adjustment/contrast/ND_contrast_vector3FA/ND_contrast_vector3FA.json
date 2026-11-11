@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "amountAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec3f"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "pivot",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_contrast_vector3FA",
+    "type" : "Map"
+}

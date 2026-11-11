@@ -1,0 +1,1665 @@
+#!/bin/env python3
+# Copyright 2023-2026 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# @file rdla_filter
+# $Id$
+#
+
+from optparse import OptionParser
+import os
+import re
+import random
+import sys
+import scene_rdl2
+
+class SceneObject:
+    def __init__(self, object_name, object_type, variable_name, contents):
+        self.name = object_name
+        self._type = object_type
+        self.variable_name = variable_name
+        self.contents = contents
+
+        # Set of other scene objects that reference this one
+        self.dependents = set()
+
+class LayerAssignment:
+    def __init__(self,
+                 assignment_line,
+                 geo_type,
+                 geo_name,
+                 material_type,
+                 material_name,
+                 displacement_type,
+                 displacement_name,
+                 volume_type,
+                 volumeName,
+                 light_set_name,
+                 shadow_set_name,
+                 light_filter_set_name):
+        self.assignment_line = assignment_line
+        self.geo_type = geo_type
+        self.geo_name = geo_name
+        self.material_type = material_type
+        self.material_name = material_name
+        self.displacement_type = displacement_type
+        self.displacement_name = displacement_name
+        self.volume_type = volume_type
+        self.volume_name = volumeName
+        self.light_set_name = light_set_name
+        self.shadow_set_name = shadow_set_name
+        self.light_filter_set_name = light_filter_set_name
+
+class RdlParameterDef:
+    def __init__(self,
+                 name,
+                 type,
+                 default,
+                 enumerable,
+                 enumeration,
+                 comment):
+        self.name = name
+        self._type = type
+        self.default = default
+        self.enumerable = enumerable
+        self.enumeration = enumeration
+        self.comment = comment
+
+    def get_enumeration(self, keyValue):
+        try:
+            key = int(keyValue)
+            if not self.enumerable or not self.enumeration or not key in self.enumeration:
+                return int_value
+            else:
+                return self.enumeration[key]
+        except ValueError:
+            return keyValue
+
+def get_type_and_name(input_string, regex):
+    match = re.search(regex, input_string)
+    if match:
+        type_name = match.group(1)
+        object_name = match.group(2)
+        return (type_name, object_name)
+    else:
+        return (None, None)
+
+def check_identity(line_in):
+    ident = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    matches = re.findall(r"([0-9.]+?)[,)]", line_in)
+    num_matches = len(matches)
+    if num_matches == 16 or num_matches == 32:
+        for i, m in enumerate(matches):
+            if ident[i % 16] != float(matches[i]):
+                return False
+        return True
+    return False
+
+
+class RdlaFilter:
+    def __init__(self):
+
+        # TODO:
+        # - Create and use RdlObjectDef class to hold list of RdlParameterDef objects
+        # - Fix broken default value cases
+        #       Non-default emission when show_emission is false
+        #            ["emission"] = Rgb(0.0, 0.0, 0.0),
+        #       Normal dial value when there's no input_normal map
+        #            ["input_normal_dial"] = 0.0,
+
+        if not self.parse_command_line():
+            return
+
+        # Set to prevent object duplication
+        self.unique_object_set = set()
+
+        # Set to prevent object variable duplication
+        self.unique_variable_names = set()
+
+        # Regex used to capture typical rdla object reference in the form:
+        # ObjectType("ObjectName")
+        self.component_regex = re.compile('(\w*)\(\"(.*?)\"\)')
+
+        self.param_regex = re.compile('\[\"(.*?)\"\]\s*=\s*(.*?),$')
+
+        self.blur_regex = re.compile(r'Mat4\([^)]*\)')
+        self.vector_type_regex = re.compile(r'(Vec3\([^)]*\))|(Rgb\([^)]*\))|(Vec2\([^)]*\))')
+        self.array_type_regex = re.compile(r'=\s*\{([^}]*)\}')
+        self.vector_regex = re.compile(r'(\w+)\(([^,]+),\s*([^,]+)(?:,\s*([^,]+))?\)')
+
+        # Load the scene using scene_rdl2 API
+        self.scene_context = None
+        self.api_objects = dict()  # Map of (class_name, obj_name) -> api SceneObject
+        self.rdl2_print_dict = dict()
+        self.scene_objects = dict()
+        self.load_scene_with_api()
+        self.build_rdl2_print_from_api()
+
+        # Open the output rdla file
+        self.output_handle = open(self.output_rdla_file, 'w')
+
+        scene_variables = self.get_scene_variables()
+        if scene_variables:
+            self.write_object(scene_variables)
+
+        if not self.options.skipmetadata:
+            metaData = self.get_object_from_parameter(scene_variables, "exr_header_attributes")
+            if metaData:
+                self.write_object(metaData)
+
+        camera = self.get_object_from_parameter(scene_variables, "camera")
+        if not camera:
+            for scene_class in self.rdl2_print_dict.keys():
+                camera_class_list = ['Camera']
+                if 'Camera' in scene_class:
+                    camera_class_list.append(scene_class)
+            camera = self.get_first_object_of_type(camera_class_list)
+        if camera:
+            self.write_object(camera)
+        else:
+            print("Warning: No camera specified in SceneVariables and no camera found in scene")
+
+        self.layer_assignments = list()
+        layer = self.get_object_from_parameter(scene_variables, "layer")
+        if not layer:
+            layer = self.get_first_object_of_type('Layer')
+        if not layer:
+            print("Error: No Layer object found in scene")
+            return
+
+        self.get_layer_assignments(layer)
+
+        self.light_set_list = set()
+        self.shadow_set_list = set()
+        self.light_filter_set_list = set()
+        self.geom_list = set()
+        self.material_list = set()
+        self.displacement_list = set()
+        self.volume_list = set()
+
+        self.get_assignment_objects()
+
+        if not self.options.skiplights:
+            self.output_handle.write('\n---------- LIGHTS ----------\n\n')
+
+            sorted_light_set_list = sorted(self.light_set_list, key=lambda x: x.name)
+            for l in sorted_light_set_list:
+                self.write_object_and_dependents(l)
+
+            sorted_shadow_set_list = sorted(self.shadow_set_list, key=lambda x: x.name)
+            for s in sorted_shadow_set_list:
+                self.write_object_and_dependents(s)
+
+            sorted_light_filter_set_list = sorted(self.light_filter_set_list, key=lambda x: x.name)
+            for l in sorted_light_filter_set_list:
+                self.write_object_and_dependents(l)
+
+        if len(self.geom_list) > 0:
+            self.output_handle.write('\n---------- GEOMETRY ----------\n\n')
+
+            sorted_geom_list = sorted(self.geom_list, key=lambda x: x.name)
+            for g in sorted_geom_list:
+                self.write_object_and_dependents(g)
+
+            self.write_geometry_set()
+
+        if len(self.displacement_list) > 0:
+            self.output_handle.write('\n---------- DISPLACEMENTS ----------\n\n')
+
+            sorted_displacement_list = sorted(self.displacement_list, key=lambda x: x.name)
+            for d in sorted_displacement_list:
+                self.write_object_and_dependents(d)
+
+        if len(self.volume_list) > 0:
+            self.output_handle.write('\n---------- VOLUMES ----------\n\n')
+
+            sorted_volume_list = sorted(self.volume_list, key=lambda x: x.name)
+            for v in sorted_volume_list:
+                self.write_object_and_dependents(v)
+
+        self.replacement_materials = dict()
+        if len(self.material_list) > 0:
+            self.output_handle.write('\n---------- MATERIALS ----------\n\n')
+
+            sorted_material_list = sorted(self.material_list, key=lambda x: x.name)
+            for m in sorted_material_list:
+                if self.options.replacematerials:
+                    self.replacement_materials[m.name] = (m, self.create_material(m.name))
+                    self.write_object_and_dependents(self.replacement_materials[m.name][1])
+                else:
+                    self.write_object_and_dependents(m)
+
+        self.write_layer(layer)
+
+        if not self.options.skiprenderoutputs:
+            self.write_render_outputs()
+
+        self.output_handle.close()
+
+    def load_scene_with_api(self):
+        """Load the scene using scene_rdl2 API instead of regex parsing."""
+        # Determine file type from extension
+        _, ext = os.path.splitext(self.source_rdla_file)
+        ext = ext.lower()
+
+        # Create scene context and load all classes
+        self.scene_context = scene_rdl2.SceneContext()
+        self.scene_context.setProxyModeEnabled(True)
+        self.scene_context.loadAllSceneClasses()
+
+        # Build default value cache: for each class, create a default object
+        # to compare against
+        self.default_cache = dict()  # class_name -> { attr_name -> default_rdla_string }
+
+        # Pre-populate SceneVariables defaults NOW, before loading the scene.
+        # createSceneObject("SceneVariables", ...) always returns the singleton,
+        # so calling get_default_values() after fromFile() would return the
+        # scene's loaded values instead of the class defaults, causing every
+        # attribute to appear to match its "default" and be silently dropped.
+        sv_defaults = dict()
+        try:
+            sv = self.scene_context.getSceneVariables()
+            sv_class = sv.getSceneClass()
+            for attr_name in sv_class.getAttributeNames():
+                attr = sv_class.getAttribute(attr_name)
+                type_name = attr.getTypeName()
+                try:
+                    value = sv.get(attr_name)
+                    formatted = self.format_value_as_rdla(value, type_name)
+                    if formatted is not None:
+                        sv_defaults[attr_name] = formatted
+                except:
+                    pass
+        except:
+            pass
+        self.default_cache["SceneVariables"] = sv_defaults
+
+        # Load the scene file
+        if ext == '.rdlb':
+            reader = scene_rdl2.BinaryReader(self.scene_context)
+        else:
+            reader = scene_rdl2.AsciiReader(self.scene_context)
+        reader.fromFile(self.source_rdla_file)
+
+        # Process all scene objects
+        for obj_name in self.scene_context.getSceneObjectNames():
+            # SceneVariables is a singleton handled specially below and should
+            # not be emitted as a normal named object.
+            if obj_name == "__SceneVariables__":
+                continue
+            api_obj = self.scene_context.getSceneObject(obj_name)
+            scene_class = api_obj.getSceneClass()
+            class_name = scene_class.getName()
+
+            # Store API object reference
+            self.api_objects[(class_name, obj_name)] = api_obj
+
+            # Generate rdla-formatted contents from API data
+            contents = self.format_object_as_rdla(api_obj, class_name, obj_name)
+
+            scene_obj = SceneObject(obj_name, class_name, "", contents)
+            scene_obj.api_obj = api_obj
+            self.add_scene_object(scene_obj)
+
+        # Always add SceneVariables via the API singleton.  The main loop
+        # above skips "__SceneVariables__" so this is the only path that
+        # creates the SceneVariables entry.
+        try:
+            sv = self.scene_context.getSceneVariables()
+            contents = self.format_scenevariables_as_rdla(sv)
+            scene_obj = SceneObject("SceneVariables", "SceneVariables", "", contents)
+            scene_obj.api_obj = sv
+            self.add_scene_object(scene_obj)
+            self.api_objects[("SceneVariables", "SceneVariables")] = sv
+        except Exception as e:
+            print("Warning: Could not load SceneVariables: %s" % e)
+
+    def get_default_values(self, class_name):
+        """Get default attribute values for a scene class as rdla strings."""
+        if class_name in self.default_cache:
+            return self.default_cache[class_name]
+
+        defaults = dict()
+        try:
+            temp_name = "_rdla_filter_default_%s" % class_name
+            temp_obj = self.scene_context.createSceneObject(class_name, temp_name)
+            scene_class = temp_obj.getSceneClass()
+
+            for attr_name in scene_class.getAttributeNames():
+                attr = scene_class.getAttribute(attr_name)
+                type_name = attr.getTypeName()
+                try:
+                    value = temp_obj.get(attr_name)
+                    formatted = self.format_value_as_rdla(value, type_name)
+                    if formatted is not None:
+                        defaults[attr_name] = formatted
+                except:
+                    pass
+
+            self.scene_context.deleteSceneObject(temp_name)
+        except:
+            pass
+
+        self.default_cache[class_name] = defaults
+        return defaults
+
+    def _fmt(self, v):
+        """Format a float using the current --round-values precision."""
+        return "%.*f" % (self.options.roundvalues, float(v))
+
+    def format_value_as_rdla(self, value, type_name):
+        """Format a single API value as an rdla string."""
+        if value is None:
+            return None
+
+        if type_name == "Bool":
+            return "true" if value else "false"
+        elif type_name in ("Int", "Long"):
+            return str(int(value))
+        elif type_name in ("Float", "Double"):
+            return self._fmt(value)
+        elif type_name == "String":
+            return '"%s"' % str(value)
+        elif type_name == "Rgb":
+            v = self._to_list(value)
+            if v and len(v) >= 3:
+                return "Rgb(%s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]))
+        elif type_name == "Rgba":
+            v = self._to_list(value)
+            if v and len(v) >= 4:
+                return "Rgba(%s, %s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]), self._fmt(v[3]))
+        elif type_name == "Vec2f":
+            v = self._to_list(value)
+            if v and len(v) >= 2:
+                return "Vec2(%s, %s)" % (self._fmt(v[0]), self._fmt(v[1]))
+        elif type_name == "Vec2d":
+            v = self._to_list(value)
+            if v and len(v) >= 2:
+                return "Vec2(%s, %s)" % (self._fmt(v[0]), self._fmt(v[1]))
+        elif type_name == "Vec3f":
+            v = self._to_list(value)
+            if v and len(v) >= 3:
+                return "Vec3(%s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]))
+        elif type_name == "Vec3d":
+            v = self._to_list(value)
+            if v and len(v) >= 3:
+                return "Vec3(%s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]))
+        elif type_name == "Vec4f":
+            v = self._to_list(value)
+            if v and len(v) >= 4:
+                return "Vec4(%s, %s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]), self._fmt(v[3]))
+        elif type_name == "Vec4d":
+            v = self._to_list(value)
+            if v and len(v) >= 4:
+                return "Vec4(%s, %s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2]), self._fmt(v[3]))
+        elif type_name in ("Mat4d", "Mat4f"):
+            v = self._to_list(value)
+            if v and len(v) == 16:
+                vals = ", ".join(self._fmt(x) for x in v)
+                return "Mat4(%s)" % vals
+        elif type_name == "SceneObject":
+            if value is None:
+                return None
+            try:
+                ref_class = value.getSceneClass().getName()
+                ref_name = value.getName()
+                return '%s("%s")' % (ref_class, ref_name)
+            except:
+                return None
+        elif type_name.endswith("Vector") or type_name == "SceneObjectIndexable":
+            return self.format_vector_as_rdla(value, type_name)
+
+        return None
+
+    def format_vector_as_rdla(self, value, type_name):
+        """Format a vector/array value as rdla text."""
+        items = []
+        try:
+            if hasattr(value, 'toList'):
+                item_list = list(value.toList())
+            elif hasattr(value, '__iter__') and not isinstance(value, str):
+                item_list = list(value)
+            else:
+                return None
+
+            if len(item_list) == 0:
+                return None
+
+            for item in item_list:
+                if type_name in ("SceneObjectVector", "SceneObjectIndexable"):
+                    if item is None:
+                        items.append("undef()")
+                    elif hasattr(item, 'getSceneClass'):
+                        items.append('%s("%s")' % (item.getSceneClass().getName(), item.getName()))
+                    else:
+                        items.append("undef()")
+                elif type_name == "StringVector":
+                    items.append('"%s"' % str(item))
+                elif type_name == "RgbVector":
+                    v = self._to_list(item)
+                    items.append("Rgb(%s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2])))
+                elif type_name == "Vec3fVector":
+                    v = self._to_list(item)
+                    items.append("Vec3(%s, %s, %s)" % (self._fmt(v[0]), self._fmt(v[1]), self._fmt(v[2])))
+                elif type_name == "Vec2fVector":
+                    v = self._to_list(item)
+                    items.append("Vec2(%s, %s)" % (self._fmt(v[0]), self._fmt(v[1])))
+                elif type_name in ("Mat4dVector", "Mat4fVector"):
+                    v = self._to_list(item)
+                    vals = ", ".join(self._fmt(x) for x in v)
+                    items.append("Mat4(%s)" % vals)
+                else:
+                    # Scalar types (Int, Float, etc.)
+                    items.append(str(item))
+
+            return "{ %s }" % ", ".join(items)
+        except:
+            return None
+
+    def _to_list(self, value):
+        """Convert a value to a flat list (handles scene_rdl2 types with toList()).
+           Matrix types return nested lists from toList(), which are flattened here."""
+        if hasattr(value, 'toList'):
+            result = list(value.toList())
+            # Matrix types (Mat4d, Mat4f) return nested lists [[row0], [row1], ...]
+            # Flatten to a single list of scalars
+            if result and isinstance(result[0], (list, tuple)):
+                return [elem for row in result for elem in row]
+            return result
+        elif isinstance(value, (tuple, list)):
+            return list(value)
+        else:
+            # Fallback: try flat indexing via __getitem__
+            try:
+                return [value[i] for i in range(16)]
+            except:
+                try:
+                    return [value[i] for i in range(4)]
+                except:
+                    try:
+                        return [value[i] for i in range(3)]
+                    except:
+                        try:
+                            return [value[i] for i in range(2)]
+                        except:
+                            return None
+
+    def format_object_as_rdla(self, api_obj, class_name, obj_name):
+        """Generate rdla-formatted content lines for a scene object."""
+        contents = []
+        contents.append('%s("%s") {' % (class_name, obj_name))
+
+        scene_class = api_obj.getSceneClass()
+        defaults = self.get_default_values(class_name)
+
+        # Skip these Layer-specific attributes since they're handled
+        # specially in format_layer_as_rdla
+        layer_assignment_attrs = {'geometries', 'parts', 'surface_shaders',
+                                  'lightsets', 'displacements', 'volume_shaders',
+                                  'lightfiltersets', 'shadowsets', 'shadowreceiversets'}
+
+        # LightSet / ShadowSet / LightFilterSet members are emitted as bare
+        # object references directly in the block body (rdla syntax), not as a
+        # named attribute like ["lights"] = { ... }.
+        set_member_attrs = {
+            'LightSet':       'lights',
+            'ShadowSet':      'lights',
+            'LightFilterSet': 'lightfilters',
+        }
+
+        for attr_name in scene_class.getAttributeNames():
+            attr = scene_class.getAttribute(attr_name)
+            type_name = attr.getTypeName()
+
+            # For Layer objects, handle assignment attributes specially
+            if class_name == "Layer" and attr_name in layer_assignment_attrs:
+                continue
+
+            # For set objects, skip the member attribute — handled below
+            if class_name in set_member_attrs and attr_name == set_member_attrs[class_name]:
+                continue
+
+            # Check for binding first
+            if attr.isBindable():
+                try:
+                    binding = api_obj.getBinding(attr_name)
+                    if binding:
+                        bound_class = binding.getSceneClass().getName()
+                        bound_name = binding.getName()
+                        line = '\t["%s"] = bind(%s("%s")),' % (attr_name, bound_class, bound_name)
+                        contents.append(line)
+                        continue
+                except:
+                    pass
+
+            # Get the value
+            try:
+                value = api_obj.get(attr_name)
+            except:
+                continue
+
+            # Format the value
+            formatted = self.format_value_as_rdla(value, type_name)
+            if formatted is None:
+                continue
+
+            # For blurrable Mat4 attributes, check for blur *before* the
+            # default comparison — a blurred attribute whose TIMESTEP_BEGIN
+            # value equals the default must still be emitted.
+            blurred = False
+            if type_name in ("Mat4d", "Mat4f") and attr.isBlurrable():
+                blurred_formatted = self.format_blurred_mat4(api_obj, attr_name, type_name)
+                if blurred_formatted:
+                    formatted = blurred_formatted
+                    blurred = True
+
+            # Skip if value matches default (but never skip blurred attributes)
+            if not blurred:
+                default_formatted = defaults.get(attr_name)
+                if default_formatted is not None and formatted == default_formatted:
+                    continue
+
+            line = '\t["%s"] = %s,' % (attr_name, formatted)
+            contents.append(line)
+
+        # For Layer objects, add assignment rows
+        if class_name == "Layer":
+            self.format_layer_assignments(api_obj, contents)
+
+        # For set objects, emit members as bare object references
+        if class_name in set_member_attrs:
+            member_attr = set_member_attrs[class_name]
+            try:
+                members = api_obj.get(member_attr)
+                if hasattr(members, 'toList'):
+                    members = list(members.toList())
+                elif not isinstance(members, (list, tuple)):
+                    members = []
+                for member in members:
+                    if member is None:
+                        continue
+                    try:
+                        ref_class = member.getSceneClass().getName()
+                        ref_name = member.getName()
+                        contents.append('\t%s("%s"),' % (ref_class, ref_name))
+                    except:
+                        pass
+            except:
+                pass
+
+        contents.append("}")
+        return contents
+
+    def format_scenevariables_as_rdla(self, sv):
+        """Generate rdla-formatted content lines for SceneVariables."""
+        contents = []
+        contents.append("SceneVariables {")
+
+        scene_class = sv.getSceneClass()
+        defaults = self.get_default_values("SceneVariables")
+
+        for attr_name in scene_class.getAttributeNames():
+            attr = scene_class.getAttribute(attr_name)
+            type_name = attr.getTypeName()
+
+            try:
+                value = sv.get(attr_name)
+            except:
+                continue
+
+            formatted = self.format_value_as_rdla(value, type_name)
+            if formatted is None:
+                continue
+
+            default_formatted = defaults.get(attr_name)
+            if default_formatted is not None and formatted == default_formatted:
+                continue
+
+            line = '\t["%s"] = %s,' % (attr_name, formatted)
+            contents.append(line)
+
+        contents.append("}")
+        return contents
+
+    def format_blurred_mat4(self, api_obj, attr_name, type_name):
+        """Return blur(Mat4(...), Mat4(...)) if the attribute has different
+           values at TIMESTEP_BEGIN and TIMESTEP_END, otherwise return None."""
+        try:
+            val_begin = api_obj.get(attr_name, int(scene_rdl2.AttributeTimestep.TIMESTEP_BEGIN))
+            val_end = api_obj.get(attr_name, int(scene_rdl2.AttributeTimestep.TIMESTEP_END))
+        except Exception as e:
+            print("Warning: Could not get blurred values for %s.%s: %s" %
+                  (api_obj.getName(), attr_name, e), file=sys.stderr)
+            return None
+
+        begin_list = self._to_list(val_begin)
+        end_list = self._to_list(val_end)
+
+        if not begin_list or not end_list:
+            return None
+        if len(begin_list) != 16 or len(end_list) != 16:
+            return None
+
+        # If both timesteps are identical, no blur needed
+        if begin_list == end_list:
+            return None
+
+        begin_vals = ", ".join(self._fmt(x) for x in begin_list)
+        end_vals = ", ".join(self._fmt(x) for x in end_list)
+        return "blur(Mat4(%s), Mat4(%s))" % (begin_vals, end_vals)
+
+    def format_layer_assignments(self, layer_api_obj, contents):
+        """Generate layer assignment rows from API Layer attributes."""
+        try:
+            geometries = layer_api_obj.get("geometries")
+            parts = layer_api_obj.get("parts")
+            surface_shaders = layer_api_obj.get("surface_shaders")
+            lightsets = layer_api_obj.get("lightsets")
+            displacements = layer_api_obj.get("displacements")
+            volume_shaders = layer_api_obj.get("volume_shaders")
+            lightfiltersets = layer_api_obj.get("lightfiltersets")
+            shadowsets = layer_api_obj.get("shadowsets")
+            shadowreceiversets = layer_api_obj.get("shadowreceiversets")
+        except Exception as e:
+            print("Warning: Could not read Layer assignment attributes: %s" % e)
+            return
+
+        # Convert to Python lists
+        def to_list(val):
+            if val is None:
+                return []
+            if hasattr(val, 'toList'):
+                return list(val.toList())
+            if hasattr(val, '__iter__') and not isinstance(val, str):
+                return list(val)
+            return []
+
+        geom_list = to_list(geometries)
+        parts_list = to_list(parts)
+        shader_list = to_list(surface_shaders)
+        ls_list = to_list(lightsets)
+        disp_list = to_list(displacements)
+        vol_list = to_list(volume_shaders)
+        lfs_list = to_list(lightfiltersets)
+        ss_list = to_list(shadowsets)
+        srs_list = to_list(shadowreceiversets)
+
+        num = len(geom_list)
+
+        def obj_ref(obj):
+            if obj is None:
+                return "undef()"
+            try:
+                return '%s("%s")' % (obj.getSceneClass().getName(), obj.getName())
+            except:
+                return "undef()"
+
+        def safe_get(lst, idx):
+            if idx < len(lst):
+                return lst[idx]
+            return None
+
+        for i in range(num):
+            geom = safe_get(geom_list, i)
+            part = safe_get(parts_list, i)
+            shader = safe_get(shader_list, i)
+            ls = safe_get(ls_list, i)
+            disp = safe_get(disp_list, i)
+            vol = safe_get(vol_list, i)
+            lfs = safe_get(lfs_list, i)
+            ss = safe_get(ss_list, i)
+            srs = safe_get(srs_list, i)
+
+            part_str = '"%s"' % str(part) if part else '""'
+
+            row = "\t{%s, %s, %s, %s, %s, %s, %s, %s, %s}," % (
+                obj_ref(geom),
+                part_str,
+                obj_ref(shader),
+                obj_ref(ls),
+                obj_ref(disp),
+                obj_ref(vol),
+                obj_ref(lfs),
+                obj_ref(ss),
+                obj_ref(srs))
+            contents.append(row)
+
+    def build_rdl2_print_from_api(self):
+        """Build the rdl2_print_dict from scene_rdl2 API instead of subprocess."""
+        for class_name in self.scene_context.getSceneClassNames():
+            try:
+                scene_class = self.scene_context.getSceneClass(class_name)
+            except:
+                continue
+
+            param_dict = dict()
+            try:
+                attr_names = scene_class.getAttributeNames()
+            except:
+                continue
+
+            for attr_name in attr_names:
+                try:
+                    attr = scene_class.getAttribute(attr_name)
+                    type_name = attr.getTypeName()
+
+                    # Get default value as string
+                    default_str = ""
+                    defaults = self.get_default_values(class_name)
+                    if attr_name in defaults:
+                        default_str = defaults[attr_name]
+
+                    # Check if enumerable and get enum values
+                    enumerable = attr.isEnumerable()
+                    enumeration = None
+                    if enumerable:
+                        try:
+                            enumeration = dict(attr.getEnumValMap())
+                        except:
+                            enumeration = dict()
+
+                    # Get comment from metadata
+                    comment = None
+                    if attr.metadataExists("comment"):
+                        comment = "\t-- comment: %s" % attr.getMetadata("comment")
+
+                    param_dict[attr_name] = RdlParameterDef(
+                        attr_name, type_name, default_str,
+                        enumerable, enumeration, comment)
+                except:
+                    continue
+
+            if param_dict:
+                self.rdl2_print_dict[class_name] = param_dict
+
+    def add_scene_object(self, obj):
+        if not obj._type in self.scene_objects:
+            self.scene_objects[obj._type] = dict()
+        if not obj.name in self.scene_objects[obj._type]:
+            self.scene_objects[obj._type][obj.name] = obj
+
+    def get_scene_object(self, object_type, object_name):
+        if object_type in self.scene_objects:
+            if object_name in self.scene_objects[object_type]:
+                return self.scene_objects[object_type][object_name]
+        return None
+
+    def write_render_outputs(self):
+        self.output_handle.write('-- Render Outputs\n')
+        if 'RenderOutput' in self.scene_objects:
+            for object_name in self.scene_objects['RenderOutput'].keys():
+                o = self.scene_objects['RenderOutput'][object_name]
+                self.write_object(o)
+
+    def replace_with_variables(self, line):
+        new_parts = list()
+        for part in line.split(","):
+            (obj_type, obj_name) = get_type_and_name(part, self.component_regex)
+            if obj_type and obj_name:
+                o = self.get_scene_object(obj_type, obj_name)
+                if o and o in self.unique_object_set:
+                    part = o.variable_name
+                else:
+                    part = "undef()"
+            new_parts.append(part)
+        new_line = ', '.join(new_parts)
+        new_line = new_line[0:-2]
+        if new_line.endswith("}") :
+            new_line = "    {%s," % new_line
+        else:
+            new_line = "    {%s}," % new_line
+
+        return new_line
+
+    def create_material(self, material_name):
+        contents = list()
+        contents.append("DwaEmissiveMaterial(\"%s\") {" % material_name)
+        contents.append("    [\"emission\"] = Rgb(%f, %f, %f)," % (random.uniform(0.0, 1.0), random.uniform(0.0, 1.0), random.uniform(0.0, 1.0)))
+        contents.append("}")
+        material = SceneObject(material_name,
+                               "DwaEmissiveMaterial",
+                               self.generate_variable_name("DwaEmissiveMaterial", material_name),
+                               contents)
+        self.add_scene_object(material)
+        return material
+
+    def replace_layer_material(self, line):
+        for key in self.replacement_materials.keys():
+            if key in line:
+                orig_type = self.replacement_materials[key][0]._type
+                orig_string = '%s(\"%s\")' % (orig_type, key)
+                new_type = self.replacement_materials[key][1]._type
+                new_string = '%s(\"%s\")' % (new_type, key)
+                line = line.replace(orig_string, new_string)
+        return line
+
+    def write_layer(self, layer):
+        self.output_handle.write('-- Layer\n')
+        self.output_handle.write('%s("%s") {\n' % (layer._type, layer.name))
+        num_assignments = len(self.layer_assignments)
+        for asset_name in self.asset_names:
+            for i, l in enumerate(self.layer_assignments):
+
+                # Split the assigments in half if --binarysplit option is present
+                if self.options.binarysplit == 0:
+                    if i >= (num_assignments / 2):
+                        continue
+                elif self.options.binarysplit == 1:
+                    if i < (num_assignments / 2):
+                        continue
+
+                if re.search(asset_name, l.geo_name):
+                    line = l.assignment_line
+                    if self.options.replacematerials:
+                        line = self.replace_layer_material(line)
+                    if self.options.usevariablenames:
+                        line = self.replace_with_variables(line)
+                    self.output_handle.write(line)
+                    self.output_handle.write('\n')
+        self.output_handle.write('}\n')
+        self.output_handle.write('\n')
+
+    def write_geometry_set(self):
+        self.output_handle.write('GeometrySet("/Scene/geoset") {\n')
+        for g in self.geom_list:
+            if self.options.usevariablenames:
+                self.output_handle.write('\t%s,\n' % g.variable_name)
+            else:
+                self.output_handle.write('\t%s("%s"),\n' % (g._type, g.name))
+        self.output_handle.write('}\n')
+        self.output_handle.write('\n')
+
+    def get_assignment_objects(self):
+        # Gather objects from the layer assignents and asset names
+        # command line argument
+        num_assignments = len(self.layer_assignments)
+        for asset_name in self.asset_names:
+            for i, l in enumerate(self.layer_assignments):
+
+                # Split the assigments in half if --binarysplit option is present
+                if self.options.binarysplit == 0:
+                    if i >= (num_assignments / 2):
+                        continue
+                elif self.options.binarysplit == 1:
+                    if i < (num_assignments / 2):
+                        continue
+
+                if not re.search(asset_name, l.geo_name):
+                    continue
+
+                o = self.get_scene_object("LightSet", l.light_set_name)
+                if o: self.light_set_list.add(o)
+
+                o = self.get_scene_object("ShadowSet", l.shadow_set_name)
+                if o: self.shadow_set_list.add(o)
+
+                o = self.get_scene_object("LightFilterSet", l.light_filter_set_name)
+                if o: self.light_filter_set_list.add(o)
+
+                o = self.get_scene_object(l.geo_type, l.geo_name)
+                if o: self.geom_list.add(o)
+
+                o = self.get_scene_object(l.material_type, l.material_name)
+                if o: self.material_list.add(o)
+
+                o = self.get_scene_object(l.displacement_type, l.displacement_name)
+                if o: self.displacement_list.add(o)
+
+                o = self.get_scene_object(l.volume_type, l.volume_name)
+                if o: self.volume_list.add(o)
+
+    def get_scene_variables(self):
+        if "SceneVariables" in self.scene_objects:
+            return self.scene_objects["SceneVariables"]["SceneVariables"]
+        else:
+            return None
+
+    def get_first_object_of_type(self, type_names):
+        for obj_type in self.scene_objects:
+            if type(type_names) is not list:
+                type_names = [type_names]
+            for tn in type_names:
+                if obj_type == tn:
+                    for obj_name in self.scene_objects[obj_type]:
+                        obj = self.scene_objects[obj_type][obj_name]
+                        if type(obj) == SceneObject:
+                            return obj
+        return None
+
+
+    def get_object_from_parameter(self, parent_object, parameter_name):
+        """ Gets an object that is assigned to a parameter through
+            a binding or other reference.  Uses the scene_rdl2 API
+            to look up the attribute value. """
+        if hasattr(parent_object, 'api_obj') and parent_object.api_obj:
+            try:
+                value = parent_object.api_obj.get(parameter_name)
+                if value is not None and hasattr(value, 'getSceneClass'):
+                    ref_class = value.getSceneClass().getName()
+                    ref_name = value.getName()
+                    return self.get_scene_object(ref_class, ref_name)
+            except:
+                pass
+        # Fallback: parse contents text
+        for c in parent_object.contents:
+            if ('[\"%s\"]' % parameter_name) in c:
+                (object_type, object_name) = get_type_and_name(c.split('=')[1], self.component_regex)
+                if object_type and object_name:
+                    return self.get_scene_object(object_type, object_name)
+        return None
+
+    def get_rdl_parameter_def(self, obj_type, param_name):
+        if obj_type in self.rdl2_print_dict:
+            if param_name in self.rdl2_print_dict[obj_type]:
+                return self.rdl2_print_dict[obj_type][param_name]
+        return None
+
+    def parse_parameter(self, line):
+        match = re.search(self.param_regex, line)
+        if match:
+            return (match.group(1), match.group(2))
+        else:
+            return (None, None)
+
+    def is_value_default(self, line, obj):
+        (param_name, param_value) = self.parse_parameter(line)
+        if not param_name or not param_value:
+            return False
+
+        if 'bind' in param_value:
+            return False
+
+        param_def = self.get_rdl_parameter_def(obj._type, param_name)
+        if not param_def:
+            return False
+
+        if param_def._type == "Float":
+            if self.options.roundvalues:
+                try:
+                    param_value = round(float(param_value), self.options.roundvalues)
+                except:
+                    return False
+            if param_value == float(param_def.default):
+                return True
+        elif param_def._type in {"Vec2f", "Vec3f", "Rgb"}:
+            regex = re.compile(".*\((.*?),(.*?)(?:,(.*?))*\)")
+            match = re.search(regex, param_value)
+            match_default = re.search(regex, param_def.default)
+            if match and match_default:
+                for i in range(len(match.groups())):
+                    try:
+                        default_value = float(match_default.group(i+1))
+                        param_value = round(float(match.group(i+1)), self.options.roundvalues)
+                        if default_value != param_value:
+                            return False
+                    except:
+                        return False
+                return True
+        else:
+            if param_value == param_def.default:
+                return True
+
+        return False
+
+    def replace_enum(self, line, obj):
+        (param_name, param_value) = self.parse_parameter(line)
+        if param_name and param_value:
+            param_def = self.get_rdl_parameter_def(obj._type, param_name)
+            if param_def and param_def.enumerable:
+                enum_value = param_def.get_enumeration(param_value)
+                if enum_value.startswith("\""):
+                    return line.replace(param_value, enum_value)
+                else:
+                    return line.replace(param_value, "\"" + enum_value + "\"")
+        return line
+
+    def replace_object_names_with_variables(self, obj, line):
+        new_line = ""
+        new_lineParts = list()
+        for p in line.split(','):
+            newP = p
+            (object_type, object_name) = get_type_and_name(p, self.component_regex)
+            if object_type and object_name:
+                o = self.get_scene_object(object_type, object_name)
+                if o:
+                    self.generate_object_variable_name(o)
+                    newP = p.replace(("%s(\"%s\")" % (object_type, object_name)), o.variable_name)
+            new_lineParts.append(newP)
+        new_line = ','.join(new_lineParts)
+        return new_line
+
+    def round_value(self, line, obj):
+        (param_name, param_value) = self.parse_parameter(line)
+        if not param_name or not param_value:
+            return line
+
+        param_def = self.get_rdl_parameter_def(obj._type, param_name)
+        if not param_def:
+            return line
+
+        if param_def._type == "Float":
+            try:
+                rounded_value = str(round(float(param_value), self.options.roundvalues))
+                return line.replace(param_value, rounded_value)
+            except:
+                return line
+
+        elif param_def._type in {"Vec2f", "Vec3f", "Rgb"}:
+            match = re.search("^(Rgb|Vec2|Vec3)\((.*?), (.*?), (.*?)\)$", param_value)
+            if match:
+                try:
+                    typ = match.group(1)
+                    x = str(round(float(match.group(2)), self.options.roundvalues))
+                    y = str(round(float(match.group(3)), self.options.roundvalues))
+                    if match.group(4):
+                        z = str(round(float(match.group(4)), self.options.roundvalues))
+                        replacement = "%s(%s, %s, %s)" % (typ, x, y, z)
+                    else:
+                        replacement = "%s(%s, %s)" % (typ, x, y)
+                    return line.replace(param_value, replacement)
+                except:
+                    return line
+        return line
+
+    def get_comment(self, line, obj):
+        (param_name, param_value) = self.parse_parameter(line)
+        if param_name and param_value:
+            param_def = self.get_rdl_parameter_def(obj._type, param_name)
+            if param_def:
+                comment = ""
+                if param_def.comment:
+                    comment += "%s\n" % param_def.comment
+                if param_def.enumerable:
+                    for k in param_def.enumeration.keys():
+                        comment += "\t\t-- %s = %s\n" % (k, param_def.get_enumeration(k))
+                return comment
+        return ""
+
+    def write_object(self, obj):
+        # Skip if the object has already been written
+        if obj in self.unique_object_set:
+            return
+
+        if self.options.skipuserdata and obj._type == "UserData":
+            return
+
+        # Write comment showing dependent objects
+        if self.options.addreferencecomments:
+            for d in obj.dependents:
+                if self.options.usevariablenames:
+                    self.generate_object_variable_name(d)
+                    self.output_handle.write('-- Referenced by: %s = %s(%s)\n' % (d.variable_name, d._type, d.name))
+                else:
+                    self.output_handle.write('-- Referenced by: %s(%s)\n' % (d._type, d.name))
+
+        no_variables = { "SceneVariables",
+                         "PerspectiveCamera",
+                         "RenderOutput",
+                         "Metadata" }
+
+
+        for i, c in enumerate(obj.contents):
+            if self.options.skipuserdata and ("UserData" in c or "part_list" in c):
+                continue
+
+            if self.options.usevariablenames and i == 0 and not obj._type in no_variables:
+                self.generate_object_variable_name(obj)
+                c = "%s = %s" % (obj.variable_name, c)
+
+            if self.options.skipidentity and check_identity(c):
+                continue
+
+            if len(c) > self.options.splitdata:
+                # Reconstruct the parameter line, splitting the values
+                # one per line for vector types and 4 per line for
+                # scalar types
+                (param_name, param_value) = self.parse_parameter(c)
+                match_array = self.array_type_regex.search(c)
+                if match_array:
+                    # The parameter is an array type
+                    # i.e. ["float_values_0"] = { 1.25455, -1.54564, 6.43243, 64.245 }
+
+                    c = f'\t["{param_name}"] = ' + "{"
+
+                    values = match_array.group(1)
+
+                    vector_array = self.vector_type_regex.findall(values)
+                    if (len(vector_array)):
+                        # Found a vector array
+                        # i.e
+                        # ["vertex_list_0"] = {
+                        #     Vec3(-1219.3360600000, 504.3591000000, -244.2785950000),
+                        #     Vec3(-1219.3372800000, 504.3577580000, -244.2675020000),
+                        #  ...
+                        #  },
+                        # Matches Vec3, Vec2, and Rgb types
+
+                        c = c + '\n'
+                        for i, d in enumerate(vector_array):
+                            # filter out empty strings from the match tuple
+                            filtered_match = [item for item in d if item]
+                            for item in filtered_match:
+                                match_vector_type = self.vector_regex.search(item)
+                                if match_vector_type:
+                                    # Extract the type and values
+                                    type_name = match_vector_type.group(1)
+                                    x = match_vector_type.group(2)
+                                    y = match_vector_type.group(3)
+                                    z = match_vector_type.group(4)
+                                    wd = 15
+                                    if self.options.roundvalues:
+                                        pr = self.options.roundvalues
+                                        x = round(float(x), pr)
+                                        y = round(float(y), pr)
+                                        if z is not None:
+                                            z = round(float(z), pr)
+
+                                        x = f"{x:.{pr}f}"
+                                        y = f"{y:.{pr}f}"
+                                        if z is not None:
+                                            z = f"{z:.{pr}f}"
+                                        wd = pr + 3
+
+                                    if z is not None:
+                                        c = c + f'\t\t{type_name}({x:>{wd}}, {y:>{wd}}, {z:>{wd}}),\t-- {i}\n'
+                                    else:
+                                        c = c + f'\t\t{type_name}({x:>{wd}}, {y:>{wd}}),\t-- {i}\n'
+                                else:
+                                    c = c + f'\t\t{item},\t-- {i}\n'
+                    else:
+                        # Found a scalar array
+                        for i, d in enumerate(values.split(',')):
+                            if i % 4 == 0:
+                                c = c + '\n\t\t'
+
+                            d = d.strip()
+
+                            wd = 15
+                            if self.options.roundvalues:
+                                try:
+                                    pr = self.options.roundvalues
+                                    d = round(float(d), pr)
+                                    wd = pr + 3
+                                except ValueError:
+                                    pass
+
+                            c = c + f'{d:>{wd}},'
+
+                    c = c + '\n\t},'
+
+            if self.options.removeblur:
+                if 'node_xform' in c and 'blur(' in c:
+                    (name, val) = self.parse_parameter(c)
+                    match = re.search(self.blur_regex, val)
+                    if match:
+                        val = match.group()
+                        c = '\t["node_xform"]=%s,' % (val)
+
+            if self.options.skipdefault:
+                if self.is_value_default(c, obj):
+                    continue
+
+            if self.options.replaceenums:
+                c = self.replace_enum(c, obj)
+
+            if self.options.roundvalues != 13:
+                c = self.round_value(c, obj)
+
+            if self.options.usevariablenames and i != 0 and not obj._type in no_variables:
+                c = self.replace_object_names_with_variables(obj, c)
+
+            self.output_handle.write(c)
+            self.output_handle.write('\n')
+
+            if self.options.addparamcomments:
+                comment = self.get_comment(c, obj)
+                if comment:
+                    self.output_handle.write(comment)
+
+        self.output_handle.write('\n')
+        self.unique_object_set.add(obj)
+
+    def write_object_and_dependents(self, parent_object):
+        if not parent_object in self.unique_object_set:
+            if self.options.addreferencecomments:
+                self.output_handle.write('-- Network for: %s(%s)\n\n' % (parent_object._type, parent_object.name))
+        dependent_objects = list()
+        self.get_dependent_objects(parent_object, dependent_objects)
+        for do in dependent_objects:
+            self.write_object(do)
+        self.write_object(parent_object)
+
+    def get_parameter_type(self, object_type, parameter_name):
+        if object_type in self.rdl2_print_dict:
+            if parameter_name in self.rdl2_print_dict[object_type]:
+                parameter = self.rdl2_print_dict[object_type][parameter_name]
+                return parameter._type
+
+
+    def get_dependent_objects(self, current_object, output_object_list):
+        """Find all objects that this object depends on (bindings and references)
+           using the scene_rdl2 API."""
+        if hasattr(current_object, 'api_obj') and current_object.api_obj:
+            api_obj = current_object.api_obj
+            try:
+                scene_class = api_obj.getSceneClass()
+                for attr_name in scene_class.getAttributeNames():
+                    attr = scene_class.getAttribute(attr_name)
+                    type_name = attr.getTypeName()
+
+                    # Check bindings
+                    if attr.isBindable():
+                        try:
+                            binding = api_obj.getBinding(attr_name)
+                            if binding:
+                                ref_class = binding.getSceneClass().getName()
+                                ref_name = binding.getName()
+                                o = self.get_scene_object(ref_class, ref_name)
+                                if o and o not in output_object_list:
+                                    o.dependents.add(current_object)
+                                    self.get_dependent_objects(o, output_object_list)
+                                    output_object_list.append(o)
+                                continue
+                        except:
+                            pass
+
+                    # Check SceneObject references
+                    if type_name == "SceneObject":
+                        try:
+                            value = api_obj.get(attr_name)
+                            if value is not None and hasattr(value, 'getSceneClass'):
+                                ref_class = value.getSceneClass().getName()
+                                ref_name = value.getName()
+                                o = self.get_scene_object(ref_class, ref_name)
+                                if o and o not in output_object_list:
+                                    o.dependents.add(current_object)
+                                    self.get_dependent_objects(o, output_object_list)
+                                    output_object_list.append(o)
+                        except:
+                            pass
+
+                    # Check SceneObjectVector references
+                    elif type_name in ("SceneObjectVector", "SceneObjectIndexable"):
+                        try:
+                            value = api_obj.get(attr_name)
+                            if value is not None:
+                                items = list(value.toList()) if hasattr(value, 'toList') else list(value)
+                                for item in items:
+                                    if item is not None and hasattr(item, 'getSceneClass'):
+                                        ref_class = item.getSceneClass().getName()
+                                        ref_name = item.getName()
+                                        o = self.get_scene_object(ref_class, ref_name)
+                                        if o and o not in output_object_list:
+                                            o.dependents.add(current_object)
+                                            self.get_dependent_objects(o, output_object_list)
+                                            output_object_list.append(o)
+                        except:
+                            pass
+            except:
+                pass
+            return
+
+        # Fallback: parse contents text (for objects without API reference)
+        for i, c in enumerate(current_object.contents):
+            if i == 0:
+                continue
+            if len(c) > 1000: continue
+            for p in c.split(','):
+                (object_type, object_name) = get_type_and_name(p, self.component_regex)
+                if object_type and object_name:
+                    o = self.get_scene_object(object_type, object_name)
+                    if o and not o in output_object_list:
+                        o.dependents.add(current_object)
+                        self.get_dependent_objects(o, output_object_list)
+                        output_object_list.append(o)
+
+    def get_layer_assignments(self, layer):
+        if not layer:
+            print("No Layer object found")
+            return
+
+        # Use the scene_rdl2 API to extract Layer assignments from parallel arrays
+        if hasattr(layer, 'api_obj') and layer.api_obj:
+            self._get_layer_assignments_from_api(layer)
+            return
+
+        # Fallback: parse contents text
+        for c in layer.contents:
+            match = re.search('{(.*)}', c)
+            if not match:
+                continue
+
+            assignment_line = c
+            geo_type = None
+            geo_name = None
+            material_type = None
+            material_name = None
+            displacement_type = None
+            displacement_name = None
+            volume_type = None
+            volumeName = None
+            light_set_name = None
+            shadow_set_name = None
+            light_filter_set_name = None
+
+            for ac in match.group(1).split(','):
+                (object_type, object_name) = get_type_and_name(ac, self.component_regex)
+                if object_type and object_name:
+                    if 'undef()' in ac:
+                        continue
+
+                    if object_type == 'LightSet':
+                        light_set_name = object_name
+                    elif object_type == 'ShadowSet':
+                        shadow_set_name = object_name
+                    elif object_type == 'LightFilterSet':
+                        light_filter_set_name = object_name
+                    elif 'Displacement' in object_type:
+                        displacement_type = object_type
+                        displacement_name = object_name
+                    elif 'Volume' in object_type:
+                        volume_type = object_type
+                        volumeName = object_name
+                    elif 'Geometry' in object_type:
+                        geo_type = object_type
+                        geo_name = object_name
+                    elif 'ND_standard_surface_surfaceshader' in object_type or 'Material' in object_type or 'Surface' in object_type:
+                        material_type = object_type
+                        material_name = object_name
+
+            layer_assignment = LayerAssignment(assignment_line,
+                                               geo_type,
+                                               geo_name,
+                                               material_type,
+                                               material_name,
+                                               displacement_type,
+                                               displacement_name,
+                                               volume_type,
+                                               volumeName,
+                                               light_set_name,
+                                               shadow_set_name,
+                                               light_filter_set_name)
+            self.layer_assignments.append(layer_assignment)
+
+    def _get_layer_assignments_from_api(self, layer):
+        """Extract layer assignments using the scene_rdl2 API."""
+        api_obj = layer.api_obj
+
+        def to_list(val):
+            if val is None:
+                return []
+            if hasattr(val, 'toList'):
+                return list(val.toList())
+            if hasattr(val, '__iter__') and not isinstance(val, str):
+                return list(val)
+            return []
+
+        def obj_info(obj):
+            """Return (class_name, obj_name) for an API SceneObject, or (None, None)."""
+            if obj is None:
+                return (None, None)
+            try:
+                return (obj.getSceneClass().getName(), obj.getName())
+            except:
+                return (None, None)
+
+        def obj_ref_str(obj):
+            """Return rdla reference string for an API SceneObject."""
+            if obj is None:
+                return "undef()"
+            try:
+                return '%s("%s")' % (obj.getSceneClass().getName(), obj.getName())
+            except:
+                return "undef()"
+
+        def safe_get(lst, idx):
+            return lst[idx] if idx < len(lst) else None
+
+        try:
+            geom_list = to_list(api_obj.get("geometries"))
+            parts_list = to_list(api_obj.get("parts"))
+            shader_list = to_list(api_obj.get("surface_shaders"))
+            ls_list = to_list(api_obj.get("lightsets"))
+            disp_list = to_list(api_obj.get("displacements"))
+            vol_list = to_list(api_obj.get("volume_shaders"))
+            lfs_list = to_list(api_obj.get("lightfiltersets"))
+            ss_list = to_list(api_obj.get("shadowsets"))
+            srs_list = to_list(api_obj.get("shadowreceiversets"))
+        except Exception as e:
+            print("Warning: Could not read Layer attributes via API: %s" % e)
+            return
+
+        num = len(geom_list)
+        for i in range(num):
+            geom_obj = safe_get(geom_list, i)
+            part = safe_get(parts_list, i)
+            shader_obj = safe_get(shader_list, i)
+            ls_obj = safe_get(ls_list, i)
+            disp_obj = safe_get(disp_list, i)
+            vol_obj = safe_get(vol_list, i)
+            lfs_obj = safe_get(lfs_list, i)
+            ss_obj = safe_get(ss_list, i)
+            srs_obj = safe_get(srs_list, i)
+
+            (geo_type, geo_name) = obj_info(geom_obj)
+            (material_type, material_name) = obj_info(shader_obj)
+            (displacement_type, displacement_name) = obj_info(disp_obj)
+            (volume_type, volumeName) = obj_info(vol_obj)
+
+            light_set_name = obj_info(ls_obj)[1]
+            shadow_set_name = obj_info(ss_obj)[1]
+            light_filter_set_name = obj_info(lfs_obj)[1]
+
+            part_str = '"%s"' % str(part) if part else '""'
+
+            # Build the assignment line in rdla format
+            assignment_line = "\t{%s, %s, %s, %s, %s, %s, %s, %s, %s}," % (
+                obj_ref_str(geom_obj),
+                part_str,
+                obj_ref_str(shader_obj),
+                obj_ref_str(ls_obj),
+                obj_ref_str(disp_obj),
+                obj_ref_str(vol_obj),
+                obj_ref_str(lfs_obj),
+                obj_ref_str(ss_obj),
+                obj_ref_str(srs_obj))
+
+            layer_assignment = LayerAssignment(assignment_line,
+                                               geo_type,
+                                               geo_name,
+                                               material_type,
+                                               material_name,
+                                               displacement_type,
+                                               displacement_name,
+                                               volume_type,
+                                               volumeName,
+                                               light_set_name,
+                                               shadow_set_name,
+                                               light_filter_set_name)
+            self.layer_assignments.append(layer_assignment)
+
+
+    def generate_variable_name(self, object_type, object_name):
+        # Extract the last part of the object's path/name
+        # e.g. "/Scene/Materials/sky_mat" -> "sky_mat"
+        last_part = object_name.rsplit('/', 1)[-1] if '/' in object_name else object_name
+        # Sanitize: replace non-alphanumeric characters with underscores
+        last_part = re.sub(r'[^a-zA-Z0-9]', '_', last_part).strip('_').lower()
+        # Strip any leading digits so the name is a valid Lua identifier
+        last_part = last_part.lstrip('0123456789').strip('_')
+
+        if last_part:
+            base_name = "%s_%s" % (last_part, object_type.lower())
+        else:
+            base_name = object_type.lower()
+
+        n = 0
+        variable_name = base_name
+        while variable_name in self.unique_variable_names:
+            variable_name = "%s_%s" % (base_name, str(n))
+            n = n + 1
+        self.unique_variable_names.add(variable_name)
+        return variable_name
+
+    def generate_object_variable_name(self, obj):
+        if obj.variable_name != "":
+            return
+        else:
+            obj.variable_name = self.generate_variable_name(obj._type, obj.name)
+
+
+    def parse_command_line(self):
+        parser = OptionParser(usage="%prog [options] <input rdla file> <output rdla file>\n\n" +
+                                    "   Required arguments:\n\n" +
+                                    "           <input rdla file>   - Input rdla file to read and filter\n\n" +
+                                    "           <output rdla file>  - Output filtered rdla file\n",
+                              description="Filters the assets in an rdla file.   Keeps only selected assets and their dependents " +
+                                          "grouping them together in a logical and easy to follow ordering.  The scene variables, " +
+                                          "camera, layer, are retained in the output.   Other object types are also retained based " +
+                                          "on the selected options.")
+
+        parser.add_option("--assets-to-keep",
+                          dest="assetstokeep",
+                          help="Space separated list of asset names to keep.  " +
+                               "Use quotes for multiple assets.  " +
+                               "The asset names should be the names of the " +
+                               "geometry objects assigned in the Layer of the " +
+                               "input rdla file.  The full path can be used, " +
+                               "just a portion of it, or a regular expression " +
+                               "which could match multiple objects.\n\n")
+
+        parser.add_option("--binary-split",
+                          dest="binarysplit",
+                          type="int",
+                          default=-1,
+                          help="Keep only half of the layer assignments.  A value of 0 " +
+                               "keeps the first half and a value of 1 keeps the second half")
+
+        parser.add_option("--skip-identity",
+                          dest="skipidentity",
+                          action="store_true",
+                          help="Skips writing node_xform parameter if it's value is identity")
+
+        parser.add_option("--skip-default",
+                          dest="skipdefault",
+                          action="store_true",
+                          help="Skips writing parameter if it's value is the same as the default value")
+
+        parser.add_option("--replace-enums",
+                          dest="replaceenums",
+                          action="store_true",
+                          help="If parameter is an enumerated list, replace integer value with string")
+
+        parser.add_option("--add-param-comments",
+                          dest="addparamcomments",
+                          action="store_true",
+                          help="Add help comments under parameters")
+
+        parser.add_option("--add-reference-comments",
+                          dest="addreferencecomments",
+                          action="store_true",
+                          help="Add comments above objects showing which objects reference them")
+
+        parser.add_option("--remove-xform-blur",
+                          dest="removeblur",
+                          action="store_true",
+                          help="Removes use of the blur() function on the node_xform and keeps only the first motion step")
+
+        parser.add_option("--round-values",
+                          dest="roundvalues",
+                          type="int",
+                          default=7,
+                          help="Round float, Vec2, Vec3, and Rgb types to the specified decimal place")
+
+        parser.add_option("--use-variable-names",
+                          dest="usevariablenames",
+                          action="store_true",
+                          help="Assigns each object to a variable and refers to this instead of the full name")
+
+        parser.add_option("--replace-materials",
+                          dest="replacematerials",
+                          action="store_true",
+                          help="Replaces all materials with DwaEmissiveMaterial")
+
+        parser.add_option("--skip-metadata",
+                          dest="skipmetadata",
+                          action="store_true",
+                          help="Skips writing the MetaData object")
+
+        parser.add_option("--skip-lights",
+                          dest="skiplights",
+                          action="store_true",
+                          help="Skips writing out lights")
+
+        parser.add_option("--skip-render-outputs",
+                          dest="skiprenderoutputs",
+                          action="store_true",
+                          help="Skips writing render outputs")
+
+        parser.add_option("--skip-user-data",
+                          dest="skipuserdata",
+                          action="store_true",
+                          help="Skips writing user data")
+
+        parser.add_option("--split-data",
+                          dest="splitdata",
+                          type="int",
+                          default=1000,
+                          help="Splits data lines (i.e. Vec3, Vec2, Rgb vectors) " + \
+                               "longer than the specified length")
+
+        parser.add_option("--nice-and-clean",
+                          dest="niceandclean",
+                          action="store_true",
+                          help="Applies the following options: --skip-identity, --skip-default, " + \
+                               "--replace-enums, --round-values 5")
+
+        parser.add_option("--minimal",
+                          action="store_true",
+                          help="Applies the following options: --nice-and-clean, --replace-materials, " + \
+                               "--skip-lights, --skip-render-outputs, --skip-user-data, --skip-metadata")
+
+        (self.options, args) = parser.parse_args()
+
+        if len(args) != 2:
+            parser.error("incorrect number of arguments")
+            return False
+
+        if self.options.binarysplit < -1 or self.options.binarysplit > 1:
+            parser.error("The --binarysplit option must be 0 or 1")
+            return False
+
+
+        if self.options.assetstokeep and self.options.binarysplit != -1:
+            parser.error("Must use either --assetstokeep or --binarysplit but not both")
+            return False
+
+        if self.options.minimal:
+            self.options.niceandclean = True
+            self.options.replacematerials = True
+            self.options.skiplights = True
+            self.options.skiprenderoutputs = True
+            self.options.skipuserdata = True
+            self.options.skipmetadata = True
+
+        if self.options.niceandclean:
+            self.options.skipidentity = True
+            self.options.skipdefault = True
+            self.options.replaceenums = True
+            if self.options.roundvalues == 13:
+                self.options.roundvalues = 5
+
+        self.source_rdla_file = args[0]
+        self.output_rdla_file = args[1]
+
+        if self.options.assetstokeep:
+            self.asset_names = self.options.assetstokeep.split()
+        else:
+            self.asset_names = [".*"]
+
+        return True
+
+if __name__ == '__main__':
+    RdlaFilter()
+

@@ -1,0 +1,336 @@
+// File: crates/ppf-cts-formats/src/kinds/scene.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// Scene wire format encoded as CBOR.
+//
+// The Python producer at blender_addon/core/encoder/mesh.py:280-462
+// emits a `list[dict]` of object groups. Each group has a `type` tag
+// and an `object` array, where each object carries either a canonical
+// mesh (vert + face/edge + optional uv/stitch) OR a `mesh_ref` UUID
+// pointing at an earlier object in the same payload that holds the
+// canonical mesh, plus a 4x4 world transform. Object types: STATIC | SAND |
+// SOLID | SHELL | ROD | COSSERAT | PDRD.
+//
+// The Python consumer at frontend/_decoder_.py:851-1430 reads the
+// same structure. The addon emits CBOR via `cbor2.dumps`, and we
+// serialize/deserialize through serde with the envelope from
+// `crate::envelope`.
+
+use serde::{Deserialize, Serialize};
+
+/// Top-level: list of object groups.
+pub type ScenePayload = Vec<ObjectGroup>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectGroup {
+    /// One of "STATIC", "SOLID", "SHELL", "ROD", "COSSERAT", "PDRD", "SAND".
+    /// Kept as a string (not enum) so unknown future types don't fail
+    /// decode hard; the consumer logic in _decoder_.py branches on
+    /// the string value at lines 986/1112, so we mirror that surface.
+    #[serde(rename = "type")]
+    pub group_type: String,
+
+    #[serde(rename = "object")]
+    pub objects: Vec<ObjectInfo>,
+}
+
+/// Object slot. `vert`+`face`/`edge` and `mesh_ref` are mutually
+/// exclusive: producers fill exactly one branch (canonical mesh vs.
+/// reference to an earlier object in the same payload that holds
+/// the canonical mesh). The decoder picks at
+/// frontend/_decoder_.py:1002-1030.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ObjectInfo {
+    pub name: String,
+    pub uuid: String,
+
+    // -- Canonical mesh (emitted iff `mesh_ref` is None) --
+    /// Local-space vertex positions, shape (N, 3). float32 in pickle;
+    /// addon emits via `arr.astype(np.float32).tolist()` for CBOR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vert: Option<Vec<[f32; 3]>>,
+
+    /// SHELL only, optional: local-space reference vertices for the
+    /// bending rest angle, shape (N, 3), same vertex order as `vert`.
+    /// Present when the object opted into a per-object reference rest
+    /// angle (see mesh.py `_encode_bend_reference_verts`); the solver
+    /// computes this object's hinge rest angles from these positions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bend_rest_vert: Option<Vec<[f32; 3]>>,
+
+    /// SHELL only, optional: the bending reference over time, present when
+    /// the object's rest angle follows an animated shape-key mix. Each
+    /// keyframe is a full local-space vertex set in `vert`'s order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bend_rest_vert_anim: Option<BendRestVertAnim>,
+
+    /// Triangulated faces, shape (M, 3). uint32 in pickle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<Vec<[u32; 3]>>,
+
+    /// Rod edges, shape (K, 2). uint32 in pickle. Required when group
+    /// type is ROD or COSSERAT; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<Vec<[u32; 2]>>,
+
+    /// COSSERAT only, optional: the authored roll of the material frame about
+    /// the tangent, in radians, one value per vertex in `vert` order. The
+    /// frame builder rolls each edge's frame by the mean of its two
+    /// endpoints' values. A position-only ROD has no twist degree of freedom,
+    /// so it never carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt: Option<Vec<f32>>,
+
+    /// Per-face UV data (SHELL only). Length matches `face` row count.
+    /// Each entry is the per-triangle UV layout the addon's
+    /// `loop_triangulate_mesh` produces (one (3, 2) corner-UV block per
+    /// loop triangle); variable inner shape, kept as a CBOR-flexible
+    /// value to avoid coupling to UV layout choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv: Option<ciborium::Value>,
+
+    /// Loose-edge stitch rows `(Ind, W)`, each shape (K, 4), as
+    /// `detect_stitch_edges` returns them: a source vertex `Ind[k, 0]` and a
+    /// target point `Ind[k, 1..4]` weighted by `W[k, 1..4]`. uint32 / float32
+    /// in pickle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stitch: Option<(Vec<[u32; 4]>, Vec<[f32; 4]>)>,
+
+    // -- Mesh reference (emitted iff vert/face/edge are None) --
+    /// UUID of the canonical mesh to reuse, set on duplicate
+    /// instances. See mesh.py:331-339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_ref: Option<String>,
+
+    // -- Transform (always present when there's geometry) --
+    /// 4x4 world matrix, row-major. float64 in pickle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<[[f64; 4]; 4]>,
+
+    // -- STATIC group only: animation. Mutually exclusive; the
+    // encoder picks fcurve-based `transform_animation` over
+    // UI-assigned `static_ops`. --
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_animation: Option<TransformAnimation>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_ops: Option<Vec<StaticOp>>,
+
+    // -- STATIC groups only: captured per-frame deformation cache. --
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_deform_animation: Option<StaticDeformAnimation>,
+
+    // -- Non-STATIC groups only: pin spec. Vertex indices to pin to
+    // their world-transformed rest pose. --
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<Vec<i32>>,
+}
+
+/// Captured per-frame STATIC deformation. Row i of `vert_frames` IS frame
+/// offset i (row 0 = the pose at the resolved start frame); there is no
+/// time array on the wire, so this channel cannot desync from the Param
+/// payload's fps by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticDeformAnimation {
+    pub vert_frames: Vec<Vec<[f32; 3]>>,
+}
+
+/// A shell's animated bending reference. Decoder reads it beside
+/// `bend_rest_vert` in frontend/_decoder_.py.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BendRestVertAnim {
+    /// Keyframe frame offsets relative to the resolved start frame (frames,
+    /// float; fps-free), strictly increasing. Seconds are derived by the
+    /// decoder from the Param payload's fps, as for `TransformAnimation`.
+    pub frame_offset: Vec<f32>,
+    /// One local-space vertex set per keyframe, each in `vert`'s order.
+    pub vert: Vec<Vec<[f32; 3]>>,
+}
+
+/// Keyframe-driven STATIC animation. Decoder reads at
+/// frontend/_decoder_.py:1156, 1202-1206.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformAnimation {
+    /// Keyframe frame offsets relative to the resolved start frame
+    /// (frames, float; fps-free). The decoder derives seconds by dividing
+    /// by the Param payload's fps, so the data payload never carries a
+    /// time base and is invariant under Time Scale / FPS changes.
+    pub frame_offset: Vec<f32>,
+    pub translation: Vec<[f32; 3]>,
+    /// (w, x, y, z) quaternion components, as Blender's `Quaternion` orders
+    /// them.
+    pub quaternion: Vec<[f32; 4]>,
+    pub scale: Vec<[f32; 3]>,
+    /// Optional segment markers; producers may omit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<ciborium::Value>,
+}
+
+/// UI-assigned static operation. The discriminant `op_type` tells which
+/// payload fields are set; we keep all of them optional and let the
+/// consumer branch on `op_type`, mirroring frontend/_decoder_.py:
+/// 1219-1239.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticOp {
+    /// "MOVE_BY" | "SPIN" | "SCALE".
+    pub op_type: String,
+    /// Op window as frame offsets relative to the resolved start frame,
+    /// each independently clamped >= 0 (an inverted window passes through
+    /// inverted, matching the old seconds-level semantics since fps > 0).
+    /// Seconds are derived at decode from the Param payload's fps.
+    pub frame_offset_start: f32,
+    pub frame_offset_end: f32,
+    /// Easing curve name, e.g. "linear". Producer always emits via
+    /// `str(...).lower()` (mesh.py:385).
+    pub transition: String,
+
+    // MOVE_BY
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<[f32; 3]>,
+
+    // SPIN
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis: Option<[f32; 3]>,
+    /// Authored degrees per ANIMATION second, unscaled. The decoder
+    /// multiplies by the Param payload's time_scale to get the solver
+    /// rate, keeping the data payload timing-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular_velocity_anim: Option<f32>,
+
+    // SCALE
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{from_cbor, to_cbor};
+    use crate::kinds::KIND_SCENE;
+
+    #[test]
+    fn scene_canonical_roundtrip() {
+        let payload: ScenePayload = vec![ObjectGroup {
+            group_type: "SHELL".into(),
+            objects: vec![ObjectInfo {
+                name: "cloth".into(),
+                uuid: "abc-123".into(),
+                vert: Some(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+                face: Some(vec![[0, 1, 2]]),
+                transform: Some([
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+                ..Default::default()
+            }],
+        }];
+        let bytes = to_cbor(KIND_SCENE, &payload).unwrap();
+        let back: ScenePayload = from_cbor(KIND_SCENE, &bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].group_type, "SHELL");
+        assert_eq!(back[0].objects[0].uuid, "abc-123");
+        assert_eq!(back[0].objects[0].face.as_deref().unwrap()[0], [0, 1, 2]);
+    }
+
+    #[test]
+    fn scene_mesh_ref_roundtrip() {
+        let payload: ScenePayload = vec![ObjectGroup {
+            group_type: "SOLID".into(),
+            objects: vec![ObjectInfo {
+                name: "instance".into(),
+                uuid: "def-456".into(),
+                mesh_ref: Some("abc-123".into()),
+                transform: Some([
+                    [2.0, 0.0, 0.0, 1.0],
+                    [0.0, 2.0, 0.0, 0.0],
+                    [0.0, 0.0, 2.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ]),
+                ..Default::default()
+            }],
+        }];
+        let bytes = to_cbor(KIND_SCENE, &payload).unwrap();
+        let back: ScenePayload = from_cbor(KIND_SCENE, &bytes).unwrap();
+        let obj = &back[0].objects[0];
+        assert_eq!(obj.mesh_ref.as_deref(), Some("abc-123"));
+        assert!(obj.vert.is_none());
+    }
+
+    #[test]
+    fn scene_cosserat_tilt_roundtrip_and_absent_tilt_decodes() {
+        let tilted: ScenePayload = vec![ObjectGroup {
+            group_type: "COSSERAT".into(),
+            objects: vec![ObjectInfo {
+                name: "strand".into(),
+                uuid: "cos-1".into(),
+                vert: Some(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+                edge: Some(vec![[0, 1], [1, 2]]),
+                tilt: Some(vec![0.0, 0.5, 1.0]),
+                ..Default::default()
+            }],
+        }];
+        let bytes = to_cbor(KIND_SCENE, &tilted).unwrap();
+        let back: ScenePayload = from_cbor(KIND_SCENE, &bytes).unwrap();
+        assert_eq!(back[0].group_type, "COSSERAT");
+        assert_eq!(back[0].objects[0].tilt.as_deref(), Some(&[0.0f32, 0.5, 1.0][..]));
+
+        // An object written without the field, as every non-Cosserat object
+        // and every payload from before the field existed is, still decodes,
+        // and an absent tilt is not written back out.
+        let plain: ScenePayload = vec![ObjectGroup {
+            group_type: "ROD".into(),
+            objects: vec![ObjectInfo {
+                name: "rope".into(),
+                uuid: "rod-1".into(),
+                vert: Some(vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+                edge: Some(vec![[0, 1]]),
+                ..Default::default()
+            }],
+        }];
+        let bytes = to_cbor(KIND_SCENE, &plain).unwrap();
+        let back: ScenePayload = from_cbor(KIND_SCENE, &bytes).unwrap();
+        assert!(back[0].objects[0].tilt.is_none());
+        let mut raw = Vec::new();
+        ciborium::into_writer(&plain[0].objects[0], &mut raw).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(raw.as_slice()).unwrap();
+        let map = value.as_map().expect("ObjectInfo encodes as a map");
+        assert!(map.iter().all(|(k, _)| k.as_text() != Some("tilt")));
+    }
+
+    #[test]
+    fn scene_static_op_spin() {
+        let op = StaticOp {
+            op_type: "SPIN".into(),
+            frame_offset_start: 0.0,
+            frame_offset_end: 5.0,
+            transition: "linear".into(),
+            axis: Some([0.0, 1.0, 0.0]),
+            angular_velocity_anim: Some(90.0),
+            ..no_optionals()
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&op, &mut bytes).unwrap();
+        let back: StaticOp = ciborium::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(back.op_type, "SPIN");
+        assert_eq!(back.angular_velocity_anim, Some(90.0));
+        assert!(back.delta.is_none());
+        assert!(back.factor.is_none());
+    }
+
+    fn no_optionals() -> StaticOp {
+        StaticOp {
+            op_type: String::new(),
+            frame_offset_start: 0.0,
+            frame_offset_end: 0.0,
+            transition: String::new(),
+            delta: None,
+            axis: None,
+            angular_velocity_anim: None,
+            factor: None,
+        }
+    }
+}

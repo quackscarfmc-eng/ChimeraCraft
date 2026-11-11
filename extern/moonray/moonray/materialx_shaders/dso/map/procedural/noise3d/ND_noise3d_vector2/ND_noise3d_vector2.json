@@ -1,0 +1,31 @@
+{
+    "attributes" : 
+    {
+        "amplitudeAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amplitude",
+            "type" : "Vec2f",
+            "comment" : "the center-to-peak amplitude of the noise"
+        },
+        "pivotAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE", 
+            "name" : "pivot",
+            "type" : "Float",
+            "comment" : "the center value of the output noise"
+        },
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position", 
+            "type" : "Vec3f",
+            "comment" : "the 3D position at which the noise is evaluated"
+        }
+    },
+    "name" : "ND_noise3d_vector2",
+    "type" : "Map"
+}

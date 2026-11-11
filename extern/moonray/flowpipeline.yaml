@@ -1,0 +1,68 @@
+# -*- coding: utf-8 -*-
+syntax: 1
+
+pipeline-configurations:
+
+  continuous-integration:
+    checkout:
+      fresh: true
+    build:
+      rez_args: -b cmake
+      prepend_release_dir: true
+      resource:
+        os-rocky-9: EL9
+    test:
+      enabled: false
+    release:
+      enabled: true
+    finalize:
+      email_enabled: false
+      zulip_enabled: false
+    initialize:
+      email_enabled: true
+      zulip_enabled: false
+
+  pre-release:
+    checkout:
+      fresh: true
+    build:
+      rez_args: -b cmake
+      prepend_release_dir: true
+      resource:
+        os-rocky-9: EL9
+    test:
+      enabled: false
+    finalize:
+      zulip_enabled: false
+    initialize:
+      zulip_enabled: false
+
+  release:
+    build:
+      rez_args: -b cmake
+      resource:
+        os-rocky-9: EL9
+    test:
+      enabled: false
+    finalize:
+      zulip_enabled: false
+    initialize:
+      email_enabled: false
+      zulip_enabled: false
+
+package-configurations:
+
+  rez-2-testmap:
+    build_context:
+    - buildtools
+    environment: {}
+    packages_path:
+    - /rel/rez/dwa
+    - /rel/rez/third_party
+    - /rel/rez/pypi
+    - /rel/lang/python/packages
+    release_packages_path: /rel/rez/dwa
+    symlink_directory: null
+    symlinks: false
+    variants: true
+    yaml: false

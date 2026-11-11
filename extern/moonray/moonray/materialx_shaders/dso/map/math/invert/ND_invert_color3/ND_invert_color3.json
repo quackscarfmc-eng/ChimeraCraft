@@ -1,0 +1,27 @@
+{
+    "attributes" : 
+    {
+        "amountAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Rgb"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_invert_color3",
+    "type" : "Map"
+}

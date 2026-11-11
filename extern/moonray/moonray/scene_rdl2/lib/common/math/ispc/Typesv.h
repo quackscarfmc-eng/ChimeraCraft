@@ -1,0 +1,45 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//
+
+#pragma once
+
+#include <scene_rdl2/common/platform/IspcUtil.h>
+#include <scene_rdl2/common/math/ispc/Types_ispc_stubs.h>
+
+namespace scene_rdl2 {
+namespace math {
+
+#ifndef __APPLE__
+// basic types
+typedef int8_t SCENE_RDL2_SIMD_ALIGN Boolv[VLEN];
+typedef int8_t SCENE_RDL2_SIMD_ALIGN Int8v[VLEN];
+typedef int32_t SCENE_RDL2_SIMD_ALIGN Intv[VLEN];
+typedef float SCENE_RDL2_SIMD_ALIGN Floatv[VLEN];
+#else
+//TODO: Need to figure this one out
+typedef int8_t Int8v[VLEN];
+typedef int32_t Intv[VLEN];
+typedef float Floatv[VLEN];
+#endif
+
+typedef Intv Mask;
+
+// TODO move to standalone header/ispc files if we start requiring
+// more ispc export math functionality from C++ side
+// (right now only partial Xform3f ispc library got exported to C++)
+ISPC_UTIL_TYPEDEF_STRUCT(Col3f, Colorv);
+ISPC_UTIL_TYPEDEF_STRUCT(Mat3f, Mat3fv);
+ISPC_UTIL_TYPEDEF_STRUCT(Vec2f, Vec2fv);
+ISPC_UTIL_TYPEDEF_STRUCT(Vec3f, Vec3fv);
+ISPC_UTIL_TYPEDEF_STRUCT(Xform3f, Xform3fv);
+
+ISPC_UTIL_TYPEDEF_STRUCT(Col4f, Rgbav);
+ISPC_UTIL_TYPEDEF_STRUCT(Mat4f, Mat4fv);
+ISPC_UTIL_TYPEDEF_STRUCT(Vec4f, Vec4fv);
+
+
+} // namespace math
+} // namespace scene_rdl2
+

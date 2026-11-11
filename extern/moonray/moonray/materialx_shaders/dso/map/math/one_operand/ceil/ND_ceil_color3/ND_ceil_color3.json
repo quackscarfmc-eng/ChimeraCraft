@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "Rgb(0.0f,0.0f,0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Rgb"
+		}
+	},
+	"name" : "ND_ceil_color3",
+	"type" : "Map"
+}

@@ -1,0 +1,19 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"fpsAttr" : 
+		{
+			"default" : 24.0,
+			"name" : "fps",
+			"type" : "Float"
+		}
+	},
+	"name" : "ND_time_float",
+	"type" : "Map"
+}

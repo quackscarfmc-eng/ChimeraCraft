@@ -1,0 +1,138 @@
+# Copyright 2024-2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+# -*- coding: utf-8 -*-
+import os
+import sys
+
+unittestflags = (['@run_all', '--unittest-xml']
+                 if os.environ.get('BROKEN_CUSTOM_ARGS_UNITTESTS') else [])
+ratsflags = (['@rats'] if os.environ.get('BROKEN_CUSTOM_ARGS_RATS') else [])
+
+name = 'hdMoonray'
+
+if 'early' not in locals() or not callable(early):
+    def early(): return lambda x: x
+
+@early()
+def version():
+    _version = '7.6'
+    from rezbuild import earlybind
+    return earlybind.version(this, _version)
+
+description = "Hydra delegate for Moonray"
+
+authors = [
+    'DreamWorks Animation PSW - Hydra Moonray Team',
+    'moonbase-dev@dreamworks.com',
+    'hd-moonray@dreamworks.com'
+]
+
+help = ('For assistance, '
+        "please contact the folio's owner at: moonbase-dev@dreamworks.com")
+
+if 'scons' in sys.argv:
+    build_system = 'scons'
+    build_system_pbr = 'bart_scons-10'
+else:
+    build_system = 'cmake'
+    build_system_pbr = 'cmake_modules-1.1'
+
+variants = [
+    [   # variant 0
+        'os-rocky-9',
+        'refplat-vfx2023.1',
+        'usd_imaging-0.23.8.x',
+        'openimageio-2.4.8.0.x',
+        'opt_level-optdebug',
+        'python-3.10'
+    ],
+    [   # variant 1
+        'os-rocky-9',
+        'refplat-vfx2023.1',
+        'usd_imaging-0.23.8.x',
+        'openimageio-2.4.8.0.x',
+        'opt_level-debug',
+        'python-3.10'
+    ],
+    [   # variant 2
+        'os-rocky-9',
+        'refplat-vfx2024.0',
+        'usd_imaging-0.24.3.x',
+        'openimageio-2.4.8.0.x',
+        'opt_level-optdebug',
+        'python-3.11'
+    ],
+    [   # variant 3
+        'os-rocky-9',
+        'refplat-vfx2025.0',
+        'usd_imaging-0.25.5.1.x',
+        'openimageio-3.0',
+        'opt_level-optdebug',
+        'python-3.11'
+    ],
+    [   # variant 4
+        'os-rocky-9',
+        'refplat-houdini21.0',
+        'usd_imaging-0.25.5.1.x.5',
+        'openimageio-3.0',
+        'opt_level-optdebug',
+        'python-3.11'
+    ],
+    [   # variant 5
+        'os-rocky-9',
+        'refplat-vfx2022.0',
+        'usd_imaging-0.22.5.x.4',
+        'openimageio-2.3.20.0.x',
+        'opt_level-optdebug',
+        'python-3.13'
+    ],
+]
+
+conf_CI_variants = variants
+
+sconsTargets = {
+    'refplat-vfx2022.0': ['@install'] + unittestflags + ratsflags,
+    'refplat-vfx2023.0': ['@install'] + unittestflags + ratsflags,
+}
+
+requires = [
+    'moonray-18.4',
+    'moonshine_dwa-15.6',
+    'moonshine-15.6',
+    'mcrt_computation-16.4',
+    'arras4_core-4.10',
+    'mcrt_messages-15.0',
+    'mcrt_dataio-16.2',
+    'mkl'
+]
+
+private_build_requires = [
+    build_system_pbr,
+    'gcc-6.3.x|9.3.x|11.x',
+    'cppunit'
+]
+
+tests = {
+    # "rats-debug": {
+    #     "command": "rats -a --rco=2 --nohtml --rac --var res 14 --ofwc hd_render",
+    #     "requires": ["rats", "opt_level-debug", "usd_core_dwa_plugin"]
+    #     },
+    "rats-opt-debug": {
+        "command": "rats -a --rco=2 --nohtml --rac --maxConcurrentTests=10",
+        "requires": ["rats", "opt_level-optdebug", "usd_core_dwa_plugin", "moonshine_usd", "usd_imaging-0.22.5", "moonshine_dwa", "houdini_dwa-19", "python-3.13", "gcc", "refplat-vfx2022"]
+        }
+    }
+
+def commands():
+    prependenv('PXR_PLUGINPATH_NAME', '{root}/plugin/pxr') # usd_core-0.23.5 and later
+    prependenv('PXR_PLUGIN_PATH', '{root}/plugin/pxr') # usd_core-0.23.2 and earlier
+    prependenv('PATH', '{root}/bin')
+    prependenv('LD_LIBRARY_PATH', '{root}/lib64')
+    prependenv('ARRAS_SESSION_PATH', '{root}/sessions/dwa')
+    prependenv('HOUDINI_PATH', '{root}/plugin/houdini')
+    prependenv('HDMOONRAY_DOUBLESIDED', '1')
+    setenv('RATS_CANONICAL_PATH', '/work/rd/raas/hydra/rats/canonicals/')
+    setenv('RATS_TESTSUITE_PATH', '{root}/testSuite')
+
+config_version = 0

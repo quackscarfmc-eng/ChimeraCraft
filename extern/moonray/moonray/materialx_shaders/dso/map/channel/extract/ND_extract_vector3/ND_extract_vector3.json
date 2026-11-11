@@ -1,0 +1,28 @@
+{
+    "attributes" :
+    {
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec3f"
+        },
+        "indexAttr" :
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "min" : "0",
+            "name" : "index",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_extract_vector3",
+    "type" : "Map"
+}

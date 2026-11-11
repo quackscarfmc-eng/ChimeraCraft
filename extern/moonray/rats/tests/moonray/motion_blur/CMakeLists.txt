@@ -1,0 +1,13 @@
+# Copyright 2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+add_subdirectory(camera_focal)
+add_subdirectory(camera_rz)
+add_subdirectory(camera_shutter)
+add_subdirectory(camera_shutter_delta)
+add_subdirectory(camera_tx)
+add_subdirectory(camera_txrz)
+add_subdirectory(camera_tz)
+add_subdirectory(curved)
+add_subdirectory(simple)
+

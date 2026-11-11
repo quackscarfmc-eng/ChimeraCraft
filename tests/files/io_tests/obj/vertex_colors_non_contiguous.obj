@@ -1,0 +1,13 @@
+# convering https://projects.blender.org/blender/blender/issues/117367
+v 0 0 0 1 0 0
+v 0 0 1
+v 0 1 1
+v 1 0 1
+v 0 1 0 1 0 0
+v 1 0 0 1 0 0
+
+o Red
+f 1 5 6
+
+o NoColor
+f 2 3 4

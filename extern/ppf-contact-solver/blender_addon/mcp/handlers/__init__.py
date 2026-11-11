@@ -1,0 +1,17 @@
+# License: GPL-3.0-or-later
+"""Solver handler subpackage: re-exports all handlers for backward compatibility."""
+
+from .connection import *  # noqa: F401, F403
+from .group import *  # noqa: F401, F403
+from .simulation import *  # noqa: F401, F403
+from .scene import *  # noqa: F401, F403
+from .debug import *  # noqa: F401, F403
+from .remote import *  # noqa: F401, F403
+from .console import *  # noqa: F401, F403
+from .object_ops import *  # noqa: F401, F403
+from .dyn_params import *  # noqa: F401, F403
+from .mesh_cleaning import *  # noqa: F401, F403
+from .statistics import *  # noqa: F401, F403
+from .material_maps import *  # noqa: F401, F403
+from .presets import *  # noqa: F401, F403
+from .force_field import *  # noqa: F401, F403

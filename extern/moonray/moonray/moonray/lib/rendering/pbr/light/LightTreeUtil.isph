@@ -1,0 +1,130 @@
+#pragma once
+
+#include <scene_rdl2/common/platform/Platform.isph>
+
+#include "LightTree.hh"
+#include "Light.isph"
+
+// =====================================================================================================================
+// References:
+// =====================================================================================================================
+// [1] Alejandro Conty Estevez and Christopher Kulla. 2018. 
+//     "Importance Sampling of Many Lights with Adaptive Tree Splitting"
+// [2] Cem Yuksel. 2019. 
+//     "Stochastic Lightcuts"
+// =====================================================================================================================
+
+
+/// ----------------------------------------------- LightTreeCone ------------------------------------------------------
+/// This struct represents the orientation cone that bounds the normals and emission falloff for a cluster of lights. 
+/// We use this LightTreeCone structure to 1) decide how to cluster lights, 2) calculate the material and geometric terms
+/// for the importance heuristic. 
+///
+/// @see [1] section 4.1
+
+struct LightTreeCone
+{
+    LIGHT_TREE_CONE_MEMBERS;
+};
+
+
+
+// ------------------------------------------- LightTreeNode -----------------------------------------------------------
+/// A LightTreeNode represents a cluster in our LightTree. @see [1] section 4.1
+
+struct LightTreeNode
+{
+    LIGHT_TREE_NODE_MEMBERS;
+};
+
+/// ------------------------------------- Inline Utils --------------------------------------------------
+
+/// Is this node a leaf?
+inline uniform bool LightTreeNode_isLeaf(const uniform LightTreeNode& node) 
+{ 
+    return node.mLightCount == 1; 
+}
+/// Get center of node
+inline uniform Vec3f LightTreeNode_getCenter(const uniform LightTreeNode& node)
+{
+    return 0.5f * (node.mBBox.lower + node.mBBox.upper);
+}
+/// Get the index of the node's right child
+inline uniform uint LightTreeNode_getRightNodeIndex(const uniform LightTreeNode& node)
+{ 
+    return node.mRightNodeIndex; 
+}
+/// Get the number of lights in this node
+inline uniform uint LightTreeNode_getLightCount(const uniform LightTreeNode& node)
+{ 
+    return node.mLightCount; 
+}
+/// Gets the light index, if it's a leaf. Otherwise, returns -1.
+inline uniform int LightTreeNode_getLightIndex(const uniform LightTreeNode& node)
+{ 
+    return LightTreeNode_isLeaf(node) && node.mLightIndexBegin ? *node.mLightIndexBegin : -1;
+}
+/// Gets the bounding box of the node
+inline const uniform BBox3f& LightTreeNode_getBBox(const uniform LightTreeNode& node)
+{ 
+    return node.mBBox;
+}
+/// Gets the energy variance
+inline uniform float LightTreeNode_getEnergyVariance(const uniform LightTreeNode& node)
+{ 
+    return node.mEnergyVariance;
+}
+/// Gets the energy mean
+inline uniform float LightTreeNode_getEnergyMean(const uniform LightTreeNode& node)
+{ 
+    return node.mEnergyMean;
+}
+
+// cos(max(0, thetaA - thetaB)) (from PBRT v4)
+// this trick only works because cos is monotonic across [0, pi]
+static varying float cosSubClamped(const varying float sinThetaA, const varying float cosThetaA,
+                                   const varying float sinThetaB, const varying float cosThetaB)
+{
+    // if thetaB > thetaA, set the angle difference to 0
+    // (i.e if cosThetaB < cosThetaA, clamp the cosine difference to 1)
+    if (cosThetaB < cosThetaA) { return 1.f; }
+    return cosThetaA * cosThetaB + sinThetaA * sinThetaB;
+}
+
+/// ----------------------------------------------------------------------------------------------------
+
+// Calculate the importance weight for the node
+varying float LightTreeNode_importance(const uniform LightTreeNode& node,
+                              const varying Vec3f& p, 
+                              const varying Vec3f& n,
+                              const uniform LightTreeNode& sibling,
+                              varying bool cullLights);
+
+// Calculate the uncertainty angle (angle subtended by the bounding box)
+static void calcSinCosThetaU(const varying float dSqr, const uniform float rSqr, 
+                             varying float * uniform sinTheta, varying float * uniform cosTheta);
+
+/// Calculate the distance term for the importance weight. @see [2] eq (3)
+static varying float calcDistanceTerm(const varying Vec3f& p,
+                                      const uniform LightTreeNode& sibling,
+                                      const varying float dSqr,
+                                      const uniform float rSqr);
+
+/// Calculate the geometry term (solid angle)
+/// TODO: cull lights before tree traversal?
+/// @see [1] eq (3)
+varying float calcGeometricTerm(const uniform LightTreeNode& node,
+                                const varying Vec3f& p, 
+                                varying float cosThetaU, 
+                                varying float sinThetaU,
+                                const varying Vec3f& dirToPt);
+
+/// Material term calculation
+/// TODO: add some sort of BSDF approximation, perhaps based on Liu et al
+/// @see [1] eq (3)
+varying float calcMaterialTerm(const varying Vec3f& p, 
+                               const varying Vec3f& n, 
+                               varying bool cullLights,
+                               varying float cosThetaU, 
+                               varying float sinThetaU, 
+                               const varying Vec3f& dirToPt);

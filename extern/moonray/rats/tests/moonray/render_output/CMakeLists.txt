@@ -1,0 +1,10 @@
+# Copyright 2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+add_subdirectory(aov)
+add_subdirectory(basic)
+add_subdirectory(cryptomatte)
+add_subdirectory(motion)
+add_subdirectory(pbr_validity)
+add_subdirectory(wireframe)
+

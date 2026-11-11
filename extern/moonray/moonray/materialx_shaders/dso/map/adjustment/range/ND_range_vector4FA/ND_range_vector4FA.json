@@ -1,0 +1,69 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec4f(0.0f, 0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec4f"
+        },
+        "inLowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inlow",
+            "type" : "Float"
+        },
+        "inHighAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inhigh",
+            "type" : "Float"
+        },
+        "outLowAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outlow",
+            "type" : "Float"
+        },
+        "outHighAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outhigh",
+            "type" : "Float"
+        },
+        "gammaAttr" : 
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Float"
+        },
+        "doClampAttr" : 
+        {
+            "default" : 0,
+            "name" : "doclamp",
+            "type" : "Bool"
+        }
+    },
+    "name" : "ND_range_vector4FA",
+    "outputAttributes" : 
+    {
+        "outAttr" : 
+        {
+            "name" : "out",
+            "type" : "Vec4f"
+        }
+    },
+    "type" : "Map"
+}

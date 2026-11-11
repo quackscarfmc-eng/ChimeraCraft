@@ -1,0 +1,30 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fromspaceAttr" : 
+        {
+            "name" : "fromspace",
+            "type" : "String"
+        },
+        "inAttr" : 
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "default" : "Vec3f(0.0f, 0.0f, 1.0f)",
+            "name" : "in",
+            "type" : "Vec3f"
+        },
+        "tospaceAttr" : 
+        {
+            "name" : "tospace",
+            "type" : "String"
+        }
+    },
+    "name" : "ND_transformnormal_vector3",
+    "type" : "Map"
+}

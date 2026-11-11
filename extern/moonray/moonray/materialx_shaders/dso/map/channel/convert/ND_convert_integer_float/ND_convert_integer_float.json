@@ -1,0 +1,14 @@
+{
+	"attributes" : 
+	{
+		"inAttr" : 
+		{
+			"default" : "0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Int"
+		}
+	},
+	"name" : "ND_convert_integer_float",
+	"type" : "Map"
+}

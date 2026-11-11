@@ -1,0 +1,5100 @@
+# File: _scene_.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: Apache v2.0
+
+"""Scene + Object orchestration.
+
+This module is the public entry point for the scene API. It defines
+:class:`Scene`, :class:`FixedScene` (the immutable, validated result of
+:meth:`Scene.build`), :class:`EnumColor`, and :class:`ValidationError`.
+Lighter helpers live in sibling modules:
+
+* ``_scene_collider_``: :class:`Wall`, :class:`Sphere` and their params.
+* ``_scene_transform_``: quaternion / TRS helpers and :class:`TransformAnimation`.
+* ``_scene_pin_``: pin operations, :class:`PinHolder`, :class:`PinData`.
+
+Everything is re-exported here for backward compatibility (older code and
+tests import names directly from ``frontend._scene_``).
+"""
+
+import colorsys
+import os
+import shutil
+from dataclasses import replace as _dc_replace
+from enum import Enum
+from typing import Any, Optional
+
+import numpy as np
+from tqdm.auto import tqdm
+
+from . import _rust  # type: ignore[attr-defined]
+
+from ._asset_ import AssetManager
+from ._contact_gap_ import GapParticipant
+from ._contact_gap_limit_ import GapLimit, resolve_gap_limit, validated_fraction
+from ._force_field_ import (
+    ForceField,
+    fluid_copies_under as _fluid_copies_under,
+    hold_fluid_frames as _hold_fluid_frames,
+    resolve_targets as _resolve_force_field_targets,
+    write_session as _write_force_field,
+)
+from ._param_ import ParamHolder
+from ._pdrd_mass_ import enclosed_moments
+from ._plot_ import Plot, PlotManager, _renumber
+from ._render_ import MitsubaRenderer, Rasterizer
+from ._scene_collider_ import Sphere, Wall
+from ._scene_pin_ import (
+    MoveByOperation,
+    MoveToOperation,
+    PinData,
+    PinHolder,
+    TorqueOperation,
+    TransformKeyframeOperation,
+    _pin_to_toml_dict,
+)
+from ._scene_transform_ import (
+    TransformAnimation,
+    _apply_transform_to_verts,
+    _axis_angle_to_quat,
+    _mat3_to_quat,
+    _quat_multiply,
+    _quat_slerp,
+    _quat_to_mat3,
+)
+from ._utils_ import Utils
+
+# Aggregate rigid-mode lock modes, mirroring the solver's
+# `TranslationLockMode` / `RotationLockMode` in
+# `crates/ppf-cts-solver/src/kernels/data_records.hpp` and its Rust twin in
+# `data.rs`. Written to bin/translation_lock_mode.bin and
+# bin/rotation_lock_mode.bin as uint32.
+#
+# THE MODE CARRIES THE ENABLE BIT, not the axis: an all-axes mode has no
+# direction, so its axis row is exactly zero, which every axis-mode row
+# also uses to mean disabled. The two tables are therefore only readable
+# together, and zero stays the off value in both so a session written
+# without a mode table decodes to the single-axis behavior.
+TRANSLATION_LOCK_AXIS = 0
+TRANSLATION_LOCK_ALL = 1
+ROTATION_LOCK_ALLOW_ONLY = 0
+ROTATION_LOCK_PROHIBIT_AXIS = 1
+ROTATION_LOCK_ALL = 2
+
+
+def _visible_rows(
+    elements: np.ndarray, invisible: Optional[np.ndarray]
+) -> Optional[np.ndarray]:
+    """Which rows of an element array are drawn, or None when all of them are.
+
+    ``elements`` holds vertex indices (one row per triangle, rod segment, or
+    stitch); ``invisible`` flags the vertices of objects hidden with
+    :meth:`Object.invisible`. A row is dropped as soon as one of its vertices
+    is hidden. An element never spans two objects, so this is per-object
+    filtering expressed on the concatenated buffers.
+
+    Returning None rather than an all-true mask lets a caller with nothing
+    hidden skip the filtering and keep its own arrays.
+    """
+    if invisible is None or len(elements) == 0 or not invisible.any():
+        return None
+    index = np.asarray(elements, dtype=np.int64).reshape(len(elements), -1)
+    return ~invisible[index].any(axis=1)
+
+
+def stitch_endpoint_distance(
+    vertex: np.ndarray, ind: np.ndarray, w: np.ndarray
+) -> np.ndarray:
+    """The distance between each stitch's two barycentric points.
+
+    Slots 0..2 of a row of ``ind`` and ``w`` are the source point and slots
+    3..5 the target, each a weighted sum of three vertices of ``vertex``.
+
+    Args:
+        vertex (np.ndarray): ``(N, 3)`` positions the indices name.
+        ind (np.ndarray): ``(M, 6)`` vertex indices.
+        w (np.ndarray): ``(M, 6)`` barycentric weights.
+
+    Returns:
+        np.ndarray: ``(M,)`` float64 distances.
+
+    Raises:
+        ValueError: If a stitch's two points coincide, since a spring with
+            no length has no direction to pull along.
+    """
+    vertex = np.asarray(vertex, dtype=np.float64)
+    ind = np.asarray(ind, dtype=np.int64).reshape(-1, 6)
+    w = np.asarray(w, dtype=np.float64).reshape(-1, 6)
+    source = np.einsum("mk,mkd->md", w[:, 0:3], vertex[ind[:, 0:3]])
+    target = np.einsum("mk,mkd->md", w[:, 3:6], vertex[ind[:, 3:6]])
+    distance = np.linalg.norm(source - target, axis=1)
+    if len(distance) and not (distance > 0.0).all():
+        row = int(np.flatnonzero(~(distance > 0.0))[0])
+        raise ValueError(
+            f"stitch {row} joins two points at the same position, so it has "
+            "no initial length to rest at; give it a rest length, or none to "
+            "derive one from the contact gaps"
+        )
+    return distance
+
+
+# Controller slots per tie, the solver's `driver::tie::TIE_SLOTS`.
+TIE_SLOTS = 8
+
+# How a stitch row's rest length is decided, as the scene build carries it from
+# `Scene.cross_stitch` and `Object.stitch` to `FixedScene.set_stitch`.
+_STITCH_REST_DERIVED = 0  # half the mean contact gap of the six vertices
+_STITCH_REST_AUTHORED = 1  # the number the caller gave
+_STITCH_REST_INITIAL = 2  # measured from the built scene's positions
+
+
+def _stitch_rest_rows(rest_length, rows: int, what: str):
+    """Resolve a ``rest_length`` argument into per-row lengths and modes.
+
+    Returns a float64 ``(rows,)`` length array, meaningful where the mode is
+    authored, and a uint8 ``(rows,)`` mode array of the ``_STITCH_REST_*``
+    values.
+    """
+    lengths = np.zeros(rows, dtype=np.float64)
+    if rest_length is None:
+        return lengths, np.full(rows, _STITCH_REST_DERIVED, dtype=np.uint8)
+    if isinstance(rest_length, str):
+        if rest_length != "initial":
+            raise ValueError(
+                f"{what} rest_length is None, 'initial', a number or a "
+                f"per-stitch array, got the string {rest_length!r}"
+            )
+        return lengths, np.full(rows, _STITCH_REST_INITIAL, dtype=np.uint8)
+    given = np.asarray(rest_length, dtype=np.float64)
+    if given.ndim == 0:
+        given = np.full(rows, float(given))
+    if given.shape != (rows,):
+        raise ValueError(
+            f"{what} rest_length holds {given.shape} entries for {rows} "
+            "stitches; it is one number, or one per stitch"
+        )
+    bad = ~(np.isfinite(given) & (given > 0.0))
+    if bad.any():
+        row = int(np.flatnonzero(bad)[0])
+        raise ValueError(
+            f"{what} rest length of row {row} is {given[row]}; a rest length "
+            "is a finite positive distance"
+        )
+    return given, np.full(rows, _STITCH_REST_AUTHORED, dtype=np.uint8)
+
+
+def _rest_inputs(rest_length, rows: int, what: str) -> dict:
+    """The two per-row rest-length arrays the scene assembly carries."""
+    lengths, mode = _stitch_rest_rows(rest_length, rows, what)
+    return {"stitch_rest_length": lengths, "stitch_rest_mode": mode}
+
+
+class ValidationError(ValueError):
+    """ValueError with structured violation data for visualization."""
+
+    def __init__(self, message, violations=None):
+        super().__init__(message)
+        self.violations = violations or []
+
+
+class EnumColor(Enum):
+    """Dynamic face color enumeration."""
+
+    NONE = 0
+    AREA = 1
+
+
+# `VertexProp::intersect_policy` bits. Mirrored from
+# `crates/ppf-cts-solver/src/data.rs` and
+# `crates/ppf-cts-solver/src/kernels/data_records.hpp`, which is where the
+# solver reads them; keep the three in step.
+_INTERSECT_ALLOW_SELF = 1 << 0
+_INTERSECT_ALLOW_INTER_OBJECT = 1 << 1
+_INTERSECT_ALLOW_INTER_GROUP = 1 << 2
+
+
+class FixedScene:
+    """A fixed scene class.
+
+    ``FixedScene`` is the immutable, validated result of :meth:`Scene.build`.
+    Hand it to :meth:`SessionManager.create` to drive a solver run.
+
+    Example:
+        Build a scene, inspect it, then pass it into a session::
+
+            scene = app.scene.create()
+            scene.add("sheet").at(0, 0.6, 0)
+            fixed = scene.build().report()
+            fixed.preview()
+            session = app.session.create(fixed).build()
+    """
+
+    # Draw-time visibility, one flag per row of the vertex buffer each masks
+    # (`_vert` and `_static_vert`), from `Object.invisible`. None means every
+    # vertex is drawn. Declared at class scope so a FixedScene unpickled from
+    # a session saved before per-object visibility existed still answers the
+    # attribute instead of raising at preview time.
+    _invisible_vert: Optional[np.ndarray] = None
+    _invisible_static_vert: Optional[np.ndarray] = None
+    # Everything a contact pair can be formed with and the gap it brings, for
+    # the session build's check that the step size can solve the smallest one
+    # (`_contact_gap_.py`). Declared at class scope for the same reason as the
+    # masks above; an empty tuple checks nothing.
+    _contact_gap_participants: tuple = ()
+    # Lock Translation axis table, one normalized row per dmap entry, and
+    # its mode table beside it, one uint32 per dmap entry: 0 = axis (the
+    # center of mass is held on the line through that axis), 1 = all
+    # (the center of mass is pinned to its initial point). The axis row
+    # is zero both for a disabled group and for an all-axes group, which
+    # has no direction, so the two tables are only readable together and
+    # the MODE carries the enable bit. Class-scope defaults so a
+    # FixedScene unpickled from a session saved before this feature
+    # existed still answers the attribute instead of raising at export
+    # time.
+    _translation_lock: Optional[np.ndarray] = None
+    _translation_lock_mode: Optional[np.ndarray] = None
+    # Lock Rotation axis table, one normalized row per dmap entry, and
+    # its mode table beside it, one uint32 per dmap entry: 0 = allow-only
+    # (rotation about the axis is the only freedom), 1 = prohibit-axis
+    # (rotation about the axis is forbidden, the perpendicular plane
+    # stays free), 2 = all (there is no net rotation about any axis).
+    # The axis row is zero both for a disabled group and for an all-axes
+    # group, so these two are read together exactly as the translation
+    # pair above. Coexists independently with `_translation_lock`.
+    # Class-scope defaults for the same unpickling reason.
+    _rotation_lock: Optional[np.ndarray] = None
+    _rotation_lock_mode: Optional[np.ndarray] = None
+    # Cosserat rods: one uint8 marker per rod edge, aligned with `_rod`, and
+    # one float32 roll per dynamic vertex, aligned with `_vert[1]`. None when
+    # the scene has no Cosserat rod, or no authored roll. Class-scope defaults
+    # for the same unpickling reason.
+    _cosserat_edge: Optional[np.ndarray] = None
+    _cosserat_tilt: Optional[np.ndarray] = None
+
+    def __init__(
+        self,
+        plot: Optional[PlotManager],
+        name: str,
+        map_by_name: dict[str, list[int]],
+        displacement: np.ndarray,
+        vert: tuple[np.ndarray, np.ndarray],
+        color: np.ndarray,
+        dyn_face_color: list[EnumColor],
+        dyn_face_intensity: list[float],
+        vel: np.ndarray,
+        uv: list[np.ndarray],
+        rod: np.ndarray,
+        tri: np.ndarray,
+        tet: np.ndarray,
+        rod_param: dict[str, list[Any]],
+        tri_param: dict[str, list[Any]],
+        tet_param: dict[str, list[Any]],
+        wall: list[Wall],
+        sphere: list[Sphere],
+        rod_vert_range: tuple[int, int],
+        shell_vert_range: tuple[int, int],
+        rod_count: int,
+        shell_count: int,
+        tri_is_collider: np.ndarray,
+        rod_is_collider: np.ndarray,
+        pinned_vertices: Optional[set[int]] = None,
+        static_vert_for_check: Optional[np.ndarray] = None,
+        static_tri_for_check: Optional[np.ndarray] = None,
+        surface_map_by_name: Optional[dict[str, tuple]] = None,
+        concat_rest_vert: Optional[np.ndarray] = None,
+        rest_vert_mask: Optional[np.ndarray] = None,
+        rest_vert_anim: Optional[np.ndarray] = None,
+        rest_vert_times: Optional[np.ndarray] = None,
+        tri_param_anim: Optional[dict[str, list[list[float]]]] = None,
+        param_anim_times: Optional[list[float]] = None,
+        bend_rest_vert: Optional[np.ndarray] = None,
+        bend_rest_vert_mask: Optional[np.ndarray] = None,
+        bend_rest_vert_anim: Optional[np.ndarray] = None,
+        bend_rest_vert_times: Optional[np.ndarray] = None,
+        pdrd_body_rows: Optional[list[float]] = None,
+        pdrd_vert_index: Optional[np.ndarray] = None,
+        pdrd_vert_list: Optional[list[int]] = None,
+        pdrd_rest_centered: Optional[np.ndarray] = None,
+        cosserat_edge: Optional[np.ndarray] = None,
+        cosserat_tilt: Optional[np.ndarray] = None,
+        sand_param: Optional[dict[str, list[Any]]] = None,
+        invisible_vert: Optional[np.ndarray] = None,
+        translation_lock: Optional[np.ndarray] = None,
+        translation_lock_mode: Optional[np.ndarray] = None,
+        rotation_lock: Optional[np.ndarray] = None,
+        rotation_lock_mode: Optional[np.ndarray] = None,
+        statistics_objects: Optional[list[dict[str, Any]]] = None,
+        collider_vert_mask: Optional[np.ndarray] = None,
+        object_vert_index: Optional[np.ndarray] = None,
+        intersect_policy: Optional[np.ndarray] = None,
+        group_vert_index: Optional[np.ndarray] = None,
+        pin_allow_vertices: Optional[np.ndarray] = None,
+        allow_existing_vertices: Optional[np.ndarray] = None,
+        force_field: Optional[dict] = None,
+        force_field_context: Optional[dict] = None,
+        quiet: bool = False,
+    ):
+        """Initialize the fixed scene.
+
+        Args:
+            plot (Optional[PlotManager]): The plot manager.
+            name (str): The name of the scene.
+            map_by_name (dict[str, list[int]]): Mapping from object name to per-object vertex index arrays.
+            displacement (np.ndarray): The per-object displacement vectors.
+            vert (tuple[np.ndarray, np.ndarray]): The vertices of the scene. The first array is the displacement map reference, the second is local positions.
+            color (np.ndarray): The colors of the vertices.
+            dyn_face_color (list[EnumColor]): The dynamic face colors.
+            dyn_face_intensity (list[float]): The dynamic face color intensities.
+            vel (np.ndarray): The velocities of the vertices.
+            uv (list[np.ndarray]): The per-face UV coordinates for shell faces.
+            rod (np.ndarray): The rod elements.
+            tri (np.ndarray): The triangle elements.
+            tet (np.ndarray): The tetrahedral elements.
+            rod_param (dict[str, list[Any]]): The parameters for the rod elements.
+            tri_param (dict[str, list[Any]]): The parameters for the triangle elements.
+            tet_param (dict[str, list[Any]]): The parameters for the tetrahedral elements.
+            wall (list[Wall]): The invisible walls.
+            sphere (list[Sphere]): The invisible spheres.
+            rod_vert_range (tuple[int, int]): The index range of the rod vertices.
+            shell_vert_range (tuple[int, int]): The index range of the shell vertices.
+            rod_count (int): The number of rod elements.
+            shell_count (int): The number of shell elements.
+            tri_is_collider (np.ndarray): Boolean array indicating collider triangles.
+            rod_is_collider (np.ndarray): Boolean array indicating collider rod edges.
+            pinned_vertices (Optional[set[int]]): Set of pinned vertex indices. Used to skip checking pinned vertices against invisible colliders.
+            static_vert_for_check (Optional[np.ndarray]): Static mesh vertices for intersection check.
+            static_tri_for_check (Optional[np.ndarray]): Static mesh triangles for intersection check.
+            surface_map_by_name (Optional[dict[str, tuple]]): Frame-embedding surface maps for tetrahedralized objects.
+            concat_rest_vert (Optional[np.ndarray]): Concatenated rest-shape vertices for objects whose pins release at ``unpin_time``.
+            rest_vert_mask (Optional[np.ndarray]): Per-vertex uint8 mask marking entries in ``concat_rest_vert`` (and ``rest_vert_anim``) that are valid.
+            rest_vert_anim (Optional[np.ndarray]): Frame-major time-varying rest shape, shape ``(n_frames * n_vert, 3)``, from the operations of the pins tracking the rest shape (``PinHolder.track_rest_shape``). The solver recomputes ``inv_rest`` per frame and interpolates.
+            rest_vert_times (Optional[np.ndarray]): Keyframe times in seconds, length ``n_frames``, aligned to ``rest_vert_anim``.
+            bend_rest_vert (Optional[np.ndarray]): Concatenated reference vertices for the bending rest angle, one row per global vertex (unmasked rows equal the initial vert). The solver computes hinge rest angles from these positions for masked objects.
+            bend_rest_vert_mask (Optional[np.ndarray]): Per-vertex uint8 mask marking rows of ``bend_rest_vert`` that belong to an object with an enabled reference rest angle.
+            cosserat_edge (Optional[np.ndarray]): Per-rod-edge uint8 marker, aligned with ``rod``: 1 where the edge belongs to a Cosserat rod (:meth:`Object.as_cosserat`), 0 where it belongs to a plain rod. None when the scene has no Cosserat rod.
+            cosserat_tilt (Optional[np.ndarray]): Per-vertex float32 roll in radians of a Cosserat rod's material frame about its tangent (:meth:`Object.tilt`), aligned with the dynamic vertices; 0 on every vertex no Cosserat rod authored a roll for. None when no object authored one.
+            invisible_vert (Optional[np.ndarray]): Per-vertex bool mask marking dynamic vertices that belong to an object hidden with :meth:`Object.invisible`. Drawing only; the solver never sees it. None when every object is drawn.
+            translation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Translation axis, aligned with ``concat_displacement``. A zero row means either that the object is not locked or that it is locked on all axes, which is decided by ``translation_lock_mode``. None when no object in the scene has Lock Translation enabled in any mode.
+            translation_lock_mode (Optional[np.ndarray]): Per-dmap-entry (n_objects,) uint32, aligned with ``translation_lock``: 0 means the center of mass is held on the line through that row's axis (or the row is disabled, its axis being zero); 1 means the center of mass is pinned to its initial point, in which case the axis row carries no direction and is exactly zero. Read together with ``translation_lock``, never alone. None under the same condition as ``translation_lock``.
+            rotation_lock (Optional[np.ndarray]): Per-dmap-entry (n_objects, 3) normalized Lock Rotation axis, aligned with ``concat_displacement``. A zero row means either that the object's rotation is not locked or that it is locked on all axes, which is decided by ``rotation_lock_mode``. None when no object in the scene has Lock Rotation enabled in any mode. Independent of ``translation_lock``.
+            rotation_lock_mode (Optional[np.ndarray]): Per-dmap-entry (n_objects,) uint32, aligned with ``rotation_lock``: 0 means allow-only (rotation about that row's axis is the only freedom, or the row is disabled, its axis being zero); 1 means prohibit-axis (rotation about the axis is forbidden, the perpendicular plane stays free); 2 means all axes are locked, in which case the axis row carries no direction and is exactly zero. Read together with ``rotation_lock``, never alone. None under the same condition as ``rotation_lock``.
+            allow_existing_vertices (Optional[np.ndarray]): Per-vertex bool mask marking dynamic vertices whose object set ``allow-existing-intersection``. The scene checks link a pair they find intersecting, or closer than its contact offsets, when either side is marked, instead of refusing it. None when no object set it.
+            quiet (bool): When True, suppress the scene-check summary prints. Defaults to False, preserving the interactive diagnostic output.
+        """
+
+        self._map_by_name = map_by_name
+        self._plot = plot
+        self._name = name
+        self._displacement = displacement
+        self._vert = vert
+        self._color = color
+        self._dyn_face_color = dyn_face_color
+        self._dyn_face_intensity = dyn_face_intensity
+        self._vel = vel
+        self._velocity_schedules = {}
+        self._collision_windows_data = {}
+        self._uv = uv
+        self._rod = rod
+        self._tri = tri
+        self._tet = tet
+        self._rod_param = rod_param
+        self._tri_param = tri_param
+        # Animated material schedule: key -> one per-triangle list per
+        # keyframe, aligned to `param_anim_times`. Both empty for a scene with
+        # no animated material, which writes no bin/param_anim directory and
+        # leaves the solver on its build-time tables.
+        self._tri_param_anim = tri_param_anim or {}
+        self._param_anim_times = param_anim_times or []
+        self._tet_param = tet_param
+        # Scalar SAND (faceless point cloud) params. None for a scene with no
+        # points object; exported on the "sand-" channel (one float per key).
+        self._sand_param = sand_param
+        self._concat_rest_vert = concat_rest_vert
+        self._rest_vert_mask = rest_vert_mask
+        self._rest_vert_anim = rest_vert_anim
+        self._rest_vert_times = rest_vert_times
+        self._bend_rest_vert = bend_rest_vert
+        self._bend_rest_vert_mask = bend_rest_vert_mask
+        self._bend_rest_vert_anim = bend_rest_vert_anim
+        self._bend_rest_vert_times = bend_rest_vert_times
+        # PDRD per-body data, written to bin files at export time.
+        # `pdrd_body_rows` is a flat list of 23 f32 per body (see the
+        # PDRD body table builder); empty when the scene has no PDRD bodies.
+        self._pdrd_body_rows = pdrd_body_rows or []
+        self._pdrd_vert_index = pdrd_vert_index
+        self._pdrd_vert_list = pdrd_vert_list or []
+        self._pdrd_rest_centered = pdrd_rest_centered
+        # Cosserat rods. `_cosserat_edge` marks the rod edges whose segments
+        # carry a material frame and is written as bin/cosserat_edge.bin;
+        # `_cosserat_tilt` is the authored roll per dynamic vertex, written as
+        # bin/cosserat_tilt.bin. Each is None, and its file absent, when the
+        # scene has nothing to say: the solver then reads every rod edge as
+        # plain and every roll as zero.
+        if cosserat_edge is not None:
+            cosserat_edge = np.ascontiguousarray(cosserat_edge, dtype=np.uint8)
+            assert len(cosserat_edge) == len(rod), (
+                f"cosserat_edge has {len(cosserat_edge)} entries but the scene "
+                f"has {len(rod)} rod edges"
+            )
+        if cosserat_tilt is not None:
+            cosserat_tilt = np.ascontiguousarray(cosserat_tilt, dtype=np.float32)
+            assert len(cosserat_tilt) == len(vert[1]), (
+                f"cosserat_tilt has {len(cosserat_tilt)} entries but the scene "
+                f"has {len(vert[1])} dynamic vertices"
+            )
+            assert cosserat_edge is not None, (
+                "cosserat_tilt is set but no rod edge is marked Cosserat"
+            )
+        self._cosserat_edge = cosserat_edge
+        self._cosserat_tilt = cosserat_tilt
+        # Lock Translation: one normalized axis per dmap entry (n_objects,
+        # 3), aligned with `_displacement`/`concat_displacement`, beside
+        # one uint32 mode per dmap entry. None when no object in the
+        # scene has Lock Translation enabled in any mode; a zero axis row
+        # belongs either to an unlocked object or to an all-axes one, and
+        # the mode says which. Written to bin/translation_lock.bin and
+        # bin/translation_lock_mode.bin at export time.
+        self._translation_lock = translation_lock
+        self._translation_lock_mode = translation_lock_mode
+        # Lock Rotation: one normalized axis per dmap entry (n_objects, 3)
+        # beside one uint32 mode per dmap entry, aligned the same way and
+        # read the same way. None when no object in the scene has Lock
+        # Rotation enabled in any mode. Coexists independently with
+        # `_translation_lock`. Written to bin/rotation_lock.bin and
+        # bin/rotation_lock_mode.bin at export time.
+        self._rotation_lock = rotation_lock
+        self._rotation_lock_mode = rotation_lock_mode
+        self._statistics_objects = statistics_objects or []
+        self._collider_vert_mask = collider_vert_mask
+        self._object_vert_index = object_vert_index
+        self._intersect_policy = intersect_policy
+        self._group_vert_index = group_vert_index
+        self._pin_allow_vertices = pin_allow_vertices
+        self._allow_existing_vertices = allow_existing_vertices
+        # Allow Existing Intersections: the vertex links the scene checks
+        # produced, (L, 2) uint32 in the combined namespace (the dynamic
+        # vertices, then the static collision vertices). Filled below.
+        self._start_links = np.zeros((0, 2), dtype=np.uint32)
+        self._n_start_link_pairs = 0
+        self._start_link_pairs: list[dict] = []
+        # The resolved force field (`Scene.build`'s dict of field objects,
+        # scripts and target mask), or None when the scene carries no force
+        # field.
+        self._force_field = force_field
+        # `{"weight": per-vertex weight or None, "group_vertices": label ->
+        # vertex indices}`, the part of the field that belongs to the scene
+        # rather than to its sources.
+        self._force_field_context = force_field_context or {
+            "weight": None, "group_vertices": {}}
+        self._pin: list[PinData] = []
+        # Display pins (see `set_display_pin`): each a dict with the owning
+        # object's name ("uuid"), its Blender vertex indices, their rest
+        # positions, its displacement group ("dmap"), and the PinData whose
+        # operations drive them.
+        self._display_pin: list[dict] = []
+        self._static_vert = (np.zeros(0, dtype=np.uint32), np.zeros(0))
+        self._static_color = np.zeros((0, 0))
+        self._static_tri = np.zeros((0, 0))
+        self._stitch_ind = np.zeros((0, 0))
+        self._stitch_w = np.zeros((0, 0))
+        self._stitch_stiffness = np.zeros(0)
+        self._stitch_rest_length = np.zeros(0, dtype=np.float32)
+        self._stitch_has_rest_length = np.zeros(0, dtype=bool)
+        self._tie_vertex = np.zeros(0, dtype=np.uint32)
+        self._tie_ind = np.zeros((0, TIE_SLOTS), dtype=np.uint32)
+        self._tie_w = np.zeros((0, TIE_SLOTS), dtype=np.float32)
+        self._static_param = {}
+        self._static_transform_animations: list[tuple[int, TransformAnimation]] = []
+        self._wall = wall
+        self._sphere = sphere
+        self._rod_vert_range = rod_vert_range
+        self._shell_vert_range = shell_vert_range
+        self._rod_count = rod_count
+        self._shell_count = shell_count
+        self._has_dyn_color = any(entry != EnumColor.NONE for entry in dyn_face_color)
+
+        self._surface_map_by_name = surface_map_by_name
+
+        # Violation flags - set during validation checks
+        self._has_self_intersection = False
+        self._has_contact_offset_violation = False
+        self._has_wall_violation = False
+        self._has_sphere_violation = False
+
+        if invisible_vert is not None:
+            invisible_vert = np.ascontiguousarray(invisible_vert, dtype=bool)
+            assert len(invisible_vert) == len(self._vert[1]), (
+                f"invisible_vert has {len(invisible_vert)} entries, "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._invisible_vert = invisible_vert
+
+        assert len(self._vert[0]) == len(self._color)
+        assert len(self._vert[1]) == len(self._color)
+        assert len(self._tri) == len(self._dyn_face_color)
+        assert len(self._uv) == shell_count
+
+        for key, value in self._rod_param.items():
+            if value:
+                assert len(value) == len(self._rod), (
+                    f"{key} has {len(value)} entries, but rod has {len(self._rod)} rods"
+                )
+        for key, value in self._tri_param.items():
+            if value:
+                assert len(value) == len(self._tri), (
+                    f"{key} has {len(value)} entries, but tri has {len(self._tri)} faces"
+                )
+        for key, value in self._tet_param.items():
+            if value:
+                assert len(value) == len(self._tet), (
+                    f"{key} has {len(value)} entries, but tet has {len(self._tet)} tets"
+                )
+
+        # ------------------------------------------------------------------
+        # Validation + derived data: hand the entire constructor body to
+        # the Rust kernel `scene_fixed_scene_assemble`:
+        #   * self-intersection scan over (dynamic + static) tris,
+        #   * rod-tri contact-offset pre-check (raises early on fatal),
+        #   * contact-offset scan over the unified element namespace,
+        #   * wall + sphere scans (skip pinned),
+        #   * raise ValidationError with a structured violations payload,
+        #   * compute self._area + self._face_to_vert_weights.
+        n_tris = len(self._tri)
+        n_rods = len(self._rod)
+        tri_offset = self._tri_param.get("contact-offset", [])
+        rod_offset = self._rod_param.get("contact-offset", [])
+
+        # Filter walls/spheres to the "static" subset (single-keyframe
+        # only). Each filter is a single list comprehension; the kernel
+        # consumes the list directly. Kinematic colliders are checked
+        # elsewhere.
+        def _wall_static_entry(w):
+            if not w.is_static_collider():
+                return None
+            entry = w.get_entry()
+            return (list(entry[0][0]), list(getattr(w, "normal", [0.0, 1.0, 0.0])))
+
+        wall_data: list[tuple[list[float], list[float]]] = [
+            d for d in (_wall_static_entry(w) for w in wall) if d is not None
+        ]
+
+        def _sphere_static_entry(s):
+            if not s.is_static_collider():
+                return None
+            pos, radius, _ = s.get_entry()[0]
+            return (
+                list(pos),
+                float(radius),
+                bool(s.is_inverted),
+                bool(s.is_hemisphere),
+            )
+
+        sphere_data: list[tuple[list[float], float, bool, bool]] = [
+            d for d in (_sphere_static_entry(s) for s in sphere) if d is not None
+        ]
+
+        pinned_list: list[int] = (
+            [int(i) for i in pinned_vertices] if pinned_vertices else []
+        )
+
+        # Visible progress for the BVH-based scene checks. The Rust
+        # kernel runs every phase in one call, so we can't surface
+        # per-phase progress without a Python callback bridge. Print a
+        # tqdm bar that names the phases as they advance.
+        checks_pbar = tqdm(
+            total=3,
+            desc="scene checks",
+            bar_format="{desc}: {n_fmt}/{total_fmt} {postfix}",
+        )
+        checks_pbar.set_postfix_str("self-intersection BVH")
+        # Per-dynamic-tri 1-based PDRD body id (0 = not rigid), keyed on each
+        # triangle's first vertex (every vertex of a rigid body shares its
+        # id). Two triangles of the same body are an intra-rigid-body self-
+        # intersection the solver tolerates (a rigid body never deforms), so
+        # the self-intersection scan skips them while still reporting rigid-
+        # vs-external overlaps. Absent PDRD bodies -> all zeros (old behavior).
+        if self._pdrd_vert_index is not None and n_tris > 0:
+            tri_body_id = np.ascontiguousarray(
+                np.asarray(self._pdrd_vert_index)[
+                    np.ascontiguousarray(self._tri, dtype=np.int64)[:, 0]
+                ],
+                dtype=np.int32,
+            )
+        else:
+            tri_body_id = np.zeros(n_tris, dtype=np.int32)
+        result = _rust.scene_fixed_scene_assemble(
+            np.ascontiguousarray(self._vert[0], dtype=np.uint32),
+            np.ascontiguousarray(self._vert[1], dtype=np.float64),
+            np.ascontiguousarray(self._displacement, dtype=np.float64),
+            np.ascontiguousarray(self._tri, dtype=np.int32)
+            if n_tris > 0
+            else np.zeros((0, 3), dtype=np.int32),
+            np.ascontiguousarray(self._rod, dtype=np.int32)
+            if n_rods > 0
+            else np.zeros((0, 2), dtype=np.int32),
+            np.ascontiguousarray(tri_is_collider, dtype=bool),
+            tri_body_id,
+            np.ascontiguousarray(rod_is_collider, dtype=bool),
+            list(tri_offset) if tri_offset else [],
+            list(rod_offset) if rod_offset else [],
+            np.ascontiguousarray(static_vert_for_check, dtype=np.float64)
+            if static_vert_for_check is not None
+            else None,
+            np.ascontiguousarray(static_tri_for_check, dtype=np.int32)
+            if static_tri_for_check is not None
+            else None,
+            pinned_list,
+            wall_data,
+            sphere_data,
+            bool(self._has_dyn_color),
+            # Intersection allowances (issue #138). This build-time check and
+            # the solver's own check_intersection must grant the same set, so
+            # both read the same three per-vertex facts. Object ids are small
+            # and dense here, so the u32 object index narrows to i32 without
+            # loss; -1 is reserved for the STATIC collision vertices the Rust
+            # side appends.
+            vert_object_id=(
+                np.ascontiguousarray(self._object_vert_index, dtype=np.int32)
+                if self._object_vert_index is not None
+                else None
+            ),
+            vert_policy=(
+                np.ascontiguousarray(self._intersect_policy, dtype=np.uint32)
+                if self._intersect_policy is not None
+                else None
+            ),
+            vert_pin_allow=(
+                np.ascontiguousarray(self._pin_allow_vertices, dtype=bool)
+                if self._pin_allow_vertices is not None
+                else None
+            ),
+            vert_group_id=(
+                np.ascontiguousarray(self._group_vert_index, dtype=np.int32)
+                if self._group_vert_index is not None
+                else None
+            ),
+            vert_allow_existing=(
+                np.ascontiguousarray(self._allow_existing_vertices, dtype=bool)
+                if self._allow_existing_vertices is not None
+                else None
+            ),
+        )
+        checks_pbar.update(1)
+        checks_pbar.set_postfix_str("rod-tri offset")
+        checks_pbar.update(1)
+        checks_pbar.set_postfix_str("contact-offset proximity")
+        checks_pbar.update(1)
+        checks_pbar.close()
+
+        self._has_self_intersection = bool(result["has_self_intersection"])
+        self._has_contact_offset_violation = bool(result["has_contact_offset_violation"])
+        self._has_wall_violation = bool(result["has_wall_violation"])
+        self._has_sphere_violation = bool(result["has_sphere_violation"])
+
+        n_self = int(result.get("n_self_intersections_total", 0))
+        n_tri_tri = int(result.get("n_tri_tri", 0))
+        n_rod_tri = int(result.get("n_rod_tri", 0))
+        n_off = int(result.get("n_contact_offset_total", 0))
+        if not quiet:
+            if n_self == 0 and n_off == 0:
+                print("scene checks: clean (0 self-intersections, 0 contact-offset)")
+            else:
+                parts = []
+                if n_self > 0:
+                    parts.append(
+                        f"{n_self} self-intersections ({n_tri_tri} tri-tri, "
+                        f"{n_rod_tri} rod-tri)"
+                    )
+                if n_off > 0:
+                    parts.append(f"{n_off} contact-offset violations")
+                print(f"scene checks found: {'; '.join(parts)}")
+
+        all_violations = result["violations"]
+        if all_violations:
+            raise ValidationError(result["combined_message"], violations=all_violations)
+
+        self._start_links = np.asarray(result["start_links"], dtype=np.uint32).reshape(-1, 2)
+        self._n_start_link_pairs = int(result["n_start_link_pairs"])
+        self._start_link_pairs = list(result["start_link_pairs"])
+        if not quiet and self._n_start_link_pairs > 0:
+            print(
+                f"allow existing intersections: {self._n_start_link_pairs} "
+                f"intersecting or too-close pairs exempted from contact "
+                f"({len(self._start_links)} vertex links)"
+            )
+
+        self._area = np.asarray(result["area"], dtype=np.float64)
+        ftvw = result["face_to_vert_weights"]
+        self._face_to_vert_weights = (
+            np.asarray(ftvw, dtype=np.float64) if ftvw is not None else None
+        )
+
+    @property
+    def start_links(self) -> np.ndarray:
+        """The vertex links Allow Existing Intersections made at build.
+
+        An ``(L, 2)`` uint32 array. Each row links two vertices whose elements
+        started intersecting, or closer than their contact offsets, in a pair
+        an ``allow-existing-intersection`` object belongs to. Indices below
+        the dynamic vertex count name dynamic vertices; the rest name static
+        collider vertices, offset by that count. Two elements are exempt from
+        contact for the whole run when any vertex of one is linked to any
+        vertex of the other. Empty when nothing was linked.
+
+        Example:
+            Count the exempted region after building::
+
+                fixed = scene.build()
+                print(len(fixed.start_links), "vertex links")
+        """
+        return self._start_links
+
+    def start_link_exemptions(self) -> list[dict[str, Any]]:
+        """The pairs Allow Existing Intersections exempted, for display.
+
+        Empty when nothing was linked. Otherwise one record in the shape of a
+        ``ValidationError.violations`` entry, ``{"type":
+        "existing_intersection", "count": N, "pairs": [{"a": [[x, y, z],
+        ...], "b": [...]}, ...]}``, where ``count`` is every exempted element
+        pair and ``pairs`` holds the first few thousand as the world-space
+        vertex positions of their two elements (three for a triangle, two for
+        a rod edge). The Blender add-on draws this over the start frame.
+
+        Example:
+            Report how many pairs the build exempted::
+
+                fixed = scene.build()
+                for record in fixed.start_link_exemptions():
+                    print(record["count"], "pairs start tangled")
+        """
+        if self._n_start_link_pairs == 0:
+            return []
+        return [{
+            "type": "existing_intersection",
+            "count": self._n_start_link_pairs,
+            "pairs": self._start_link_pairs,
+        }]
+
+    @property
+    def contact_gap_participants(self) -> tuple:
+        """Everything a contact pair can be formed with, and the gap it brings.
+
+        One :class:`~frontend._contact_gap_.GapParticipant` per object and per
+        invisible collider, which the session build checks against the step
+        size.
+
+        Example:
+            List the smallest contact gap each object brings to a pair::
+
+                fixed = scene.build()
+                for participant in fixed.contact_gap_participants:
+                    print(participant.label, participant.gap)
+        """
+        return self._contact_gap_participants
+
+    @property
+    def tri_param(self) -> dict[str, list[Any]]:
+        """Get the triangle parameters.
+
+        Example:
+            Inspect per-triangle parameter arrays captured at build time::
+
+                fixed = scene.build()
+                for key, values in fixed.tri_param.items():
+                    print(key, len(values))
+        """
+        return self._tri_param
+
+    @property
+    def has_violations(self) -> bool:
+        """Check if the scene has any violations that prevent simulation.
+
+        Example:
+            Guard the solver launch behind a validation check::
+
+                fixed = scene.build()
+                if fixed.has_violations:
+                    print(fixed.get_violation_messages())
+        """
+        return any([
+            bool(self._has_self_intersection),
+            bool(self._has_contact_offset_violation),
+            bool(self._has_wall_violation),
+            bool(self._has_sphere_violation),
+        ])
+
+    def get_violation_messages(self) -> list[str]:
+        """Get a list of violation messages for the scene.
+
+        Example:
+            Print any validation violations before running the solver::
+
+                for msg in fixed.get_violation_messages():
+                    print(msg)
+        """
+        return list(_rust.scene_violation_messages(
+            bool(self._has_self_intersection),
+            bool(self._has_contact_offset_violation),
+            bool(self._has_wall_violation),
+            bool(self._has_sphere_violation),
+        ))
+
+    def report(self) -> "FixedScene":
+        """Print a summary of the scene.
+
+        Returns:
+            FixedScene: The fixed scene (for chaining).
+
+        Example:
+            Chain a summary printout into the build step::
+
+                fixed = scene.build().report()
+                fixed.preview()
+        """
+        n_pin = sum([len(pin.index) for pin in self._pin]) if len(self._pin) else 0
+        n_static_vert = len(self._static_vert[1])
+        n_static_tri = len(self._static_tri) if len(self._static_tri) else 0
+        entries = _rust.scene_fixed_scene_report_entries(
+            int(len(self._vert[1])),
+            int(len(self._rod)),
+            int(len(self._tri)),
+            int(len(self._tet)),
+            int(n_pin),
+            int(n_static_vert),
+            int(n_static_tri),
+            int(len(self._stitch_ind)),
+            int(len(self._stitch_w)),
+        )
+        data = {label: [value] for label, value in entries}
+
+        from IPython.display import HTML, display
+
+        from ._utils_ import dict_to_html_table
+
+        if self._plot is not None and self._plot.is_jupyter_notebook():
+            html = dict_to_html_table(data, classes="table")
+            display(HTML(html))
+        else:
+            print(data)
+        return self
+
+    def color(self, vert: np.ndarray, hint: Optional[dict] = None) -> np.ndarray:
+        """Compute the per-vertex color for the scene given a vertex array.
+
+        Args:
+            vert (np.ndarray): The current vertex positions.
+            hint (dict, optional): Optional hints for the color computation (e.g. ``"max-area"``). Defaults to None.
+
+        Returns:
+            np.ndarray: The per-vertex colors of the scene.
+
+        Example:
+            Compute colors for the current vertex positions before previewing::
+
+                fixed = scene.build()
+                V = fixed.vertex()
+                colors = fixed.color(V, hint={"max-area": 2.0})
+                fixed.preview(V)
+        """
+        if hint is None:
+            hint = {}
+        if self._has_dyn_color:
+            assert self._face_to_vert_weights is not None
+            assert self._area is not None
+
+            max_area = 2.0
+
+            if "max-area" in hint:
+                max_area = hint["max-area"]
+
+            v = np.ascontiguousarray(vert, dtype=np.float64)
+            tris = np.ascontiguousarray(self._tri, dtype=np.int64)
+            init = np.ascontiguousarray(self._area, dtype=np.float64)
+            weights = np.ascontiguousarray(
+                self._face_to_vert_weights, dtype=np.float64
+            )
+            dfc = np.ascontiguousarray(
+                [0 if c == EnumColor.NONE else 1 for c in self._dyn_face_color],
+                dtype=np.uint8,
+            )
+            dfi = np.ascontiguousarray(self._dyn_face_intensity, dtype=np.float64)
+            base = np.ascontiguousarray(self._color, dtype=np.float64)
+            return _rust.scene_dynamic_color(
+                v, tris, init, weights, dfc, dfi, base, float(max_area),
+            )
+        else:
+            return self._color
+
+    def vertex(self, transform: bool = True) -> np.ndarray:
+        """Get the vertices of the scene.
+
+        Args:
+            transform (bool, optional): Whether to transform the vertices. Defaults to True.
+
+        Returns:
+            np.ndarray: The vertices of the scene.
+
+        Example:
+            Fetch the initial world-space vertex positions::
+
+                vert = fixed.vertex()
+                print(vert.shape)
+        """
+        if transform:
+            return self._vert[1] + self._displacement[self._vert[0]]
+        else:
+            return self._vert[1]
+
+    def export(
+        self,
+        vert: np.ndarray,
+        color: np.ndarray,
+        path: str,
+        include_static: bool = True,
+        args: Optional[dict] = None,
+        delete_exist: bool = False,
+    ) -> "FixedScene":
+        """Export the scene to a mesh file.
+
+        The vertices and vertex colors must be supplied explicitly so callers
+        can pass time-evaluated positions.
+
+        Args:
+            vert (np.ndarray): The vertices of the scene.
+            color (np.ndarray): The colors of the vertices.
+            path (str): The path to the mesh file. Supported formats include ``.ply`` and ``.obj``.
+            include_static (bool, optional): Whether to include the static mesh. Defaults to True.
+            args (dict, optional): Additional arguments passed to the renderer.
+            delete_exist (bool, optional): Whether to delete any existing file at the path. Defaults to False.
+
+        Returns:
+            FixedScene: The fixed scene.
+
+        Example:
+            Write out the scene as a .ply at the initial time::
+
+                vert = fixed.vertex()
+                color = fixed.color(vert)
+                fixed.export(vert, color, "/tmp/scene.ply", delete_exist=True)
+        """
+
+        args = dict(args) if args is not None else {}
+        image_path = path + ".png"
+        if delete_exist:
+            if os.path.exists(path):
+                os.remove(path)
+            if os.path.exists(image_path):
+                os.remove(image_path)
+
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path))
+
+        seg, tri = self._rod, None
+        n_dynamic_vert = len(vert)
+        n_static_vert = 0
+        if not os.path.exists(path) or not os.path.exists(image_path):
+            if include_static and len(self._static_vert[1]) and len(self._static_tri):
+                static_vert = (
+                    self._static_vert[1] + self._displacement[self._static_vert[0]]
+                )
+                n_static_vert = len(static_vert)
+                tri = np.concatenate([self._tri, self._static_tri + len(vert)])
+                vert = np.concatenate([vert, static_vert], axis=0)
+                color = np.concatenate([color, self._static_color], axis=0)
+            else:
+                tri = self._tri
+
+        if tri is not None and len(tri) == 0:
+            tri = np.array([[0, 0, 0]])
+
+        # Check if rendering should be skipped (e.g., on Windows headless)
+        skip_render = args.get("skip_render", False)
+
+        # Export mesh file (also in CI mode when skip_render is set)
+        if not os.path.exists(path) and (Utils.ci_name() is None or skip_render):
+            import trimesh
+
+            mesh = trimesh.Trimesh(
+                vertices=vert, faces=tri, vertex_colors=color, process=False
+            )
+            mesh.export(path)
+
+        # Skip rendering if skip_render is set
+        if not skip_render and not os.path.exists(image_path):
+            renderer_type = args.get("renderer", "software")
+            if Utils.ci_name() is not None:
+                args["width"] = 320
+                args["height"] = 240
+            if renderer_type == "mitsuba":
+                assert shutil.which("mitsuba") is not None
+                renderer = MitsubaRenderer(args)
+            elif renderer_type == "software":
+                renderer = Rasterizer(args)
+            else:
+                raise Exception("unsupported renderer")
+
+            assert tri is not None
+            assert color is not None
+            # The mesh file above carries the whole scene; the picture drops
+            # whatever Object.invisible hid. Compacting rather than masking
+            # here also keeps the hidden geometry out of the renderer's
+            # auto-framing, which fits the mesh to the vertices it is given.
+            shown_vert, shown_color, shown_seg, shown_tri = self._picture_arrays(
+                vert, color, seg, tri, n_dynamic_vert, n_static_vert
+            )
+            renderer.render(shown_vert, shown_color, shown_seg, shown_tri, image_path)
+
+        return self
+
+    def _hold_force_field_frames(self, path: str) -> None:
+        """Before ``path`` is cleared, make every fluid frame this scene's
+        force field reads independent of the files under it (a frame with no
+        copy elsewhere is kept in memory), and check that every frame read
+        back from files can be read at all, raising before anything is
+        cleared when one cannot; the session writer then writes them anew."""
+        if self._force_field is not None:
+            _hold_fluid_frames(self._force_field["fields"], path)
+
+    def _force_field_copies_under(self, path: str) -> bool:
+        """Whether a fluid frame this scene's force field reads was written
+        under ``path``, so a pickle of this scene may name files there."""
+        return self._force_field is not None and _fluid_copies_under(
+            self._force_field["fields"], path)
+
+    def export_fixed(
+        self, path: str, delete_exist: bool, preserve_output: bool = False
+    ) -> "FixedScene":
+        """Export the fixed scene into a set of data files that are read by the simulator.
+
+        Args:
+            path (str): The path to the output directory.
+            delete_exist (bool): Whether to delete the existing directory.
+            preserve_output (bool): When True and ``delete_exist`` is set,
+                skip the solver ``output/`` child while clearing the
+                directory, so a resume can re-decode edited scene input
+                without losing the saved checkpoints.
+
+        Returns:
+            FixedScene: The fixed scene.
+
+        Example:
+            Typically invoked internally by :meth:`Session.build`, but can be
+            called directly to materialize the solver's data directory::
+
+                fixed = scene.build()
+                fixed.export_fixed("/tmp/my_scene_data", delete_exist=True)
+        """
+
+        steps = 14
+        pbar = tqdm(total=steps, desc="build session")
+
+        if os.path.exists(path):
+            if delete_exist:
+                self._hold_force_field_frames(path)
+                for item in os.listdir(path):
+                    if preserve_output and item == "output":
+                        continue
+                    item_path = os.path.join(path, item)
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+            else:
+                raise Exception(f"file {path} already exists")
+        else:
+            os.makedirs(path)
+        pbar.update(1)
+
+        from . import _cbor_bridge_ as _cbor
+
+        map_path = os.path.join(path, "map.pickle")
+        with open(map_path, "wb") as f:
+            f.write(_cbor.dumps_envelope(_cbor.KIND_VERTEX_MAP, self._map_by_name))
+        if self._statistics_objects:
+            import cbor2
+
+            statistics_input_path = os.path.join(path, "statistics_input.cbor")
+            with open(statistics_input_path, "wb") as f:
+                f.write(cbor2.dumps({
+                    "version": 1,
+                    "kind": "StatisticsInput",
+                    "payload": {"objects": self._statistics_objects},
+                }))
+        if self._surface_map_by_name:
+            # Wire format v2: frame-embedding coefs replace barycentric weights.
+            # Wrapped in a versioned envelope so legacy clients (which expected
+            # a bare dict of bary maps) fail loudly instead of silently
+            # applying the wrong reconstruction math.
+            surface_map_path = os.path.join(path, "surface_map.pickle")
+            with open(surface_map_path, "wb") as f:
+                f.write(_cbor.dumps_envelope(
+                    _cbor.KIND_SURFACE_MAP,
+                    {
+                        "version": _cbor.SURFACE_MAP_VERSION,
+                        "maps": self._surface_map_by_name,
+                    },
+                ))
+        # Written for every scene, with no block when it has no display pin, so
+        # the addon can require the file and treat a missing one as an error.
+        # Blocks are in the order the solver writes display_pin_<N>.bin.
+        offsets = np.cumsum(
+            [0] + [len(d["blender_index"]) for d in self._display_pin]
+        )
+        display_pin_map_path = os.path.join(path, "display_pin_map.pickle")
+        with open(display_pin_map_path, "wb") as f:
+            f.write(_cbor.dumps_envelope(
+                _cbor.KIND_DISPLAY_PIN_MAP,
+                {
+                    "version": _cbor.DISPLAY_PIN_MAP_VERSION,
+                    "n_total": int(offsets[-1]),
+                    "blocks": [
+                        {
+                            "uuid": d["uuid"],
+                            "blender_index": np.asarray(
+                                d["blender_index"], dtype=np.int64
+                            ),
+                            "offset": int(offset),
+                        }
+                        for d, offset in zip(
+                            self._display_pin, offsets[:-1], strict=True
+                        )
+                    ],
+                },
+            ))
+        pbar.update(1)
+
+        info_path = os.path.join(path, "info.toml")
+        # Pin to UTF-8: the Rust solver reads info.toml with
+        # fs::read_to_string() which requires UTF-8. Python's default
+        # text mode picks up the locale encoding (cp1252 on Windows),
+        # so a Blender object name like "BézierCurve" gets written
+        # as Latin-1 (é = 0xe9) and then panics the solver with
+        # "stream did not contain valid UTF-8".
+        with open(info_path, "w", encoding="utf-8") as f:
+            f.write("[count]\n")
+            f.write(f"vert = {len(self._vert[1])}\n")
+            f.write(f"rod = {len(self._rod)}\n")
+            f.write(f"tri = {len(self._tri)}\n")
+            f.write(f"tet = {len(self._tet)}\n")
+            f.write(f"static_vert = {len(self._static_vert[1])}\n")
+            f.write(f"static_tri = {len(self._static_tri)}\n")
+            f.write(f"pin_block = {len(self._pin)}\n")
+            f.write(f"display_pin_block = {len(self._display_pin)}\n")
+            f.write(f"wall = {len(self._wall)}\n")
+            f.write(f"sphere = {len(self._sphere)}\n")
+            f.write(f"stitch = {len(self._stitch_ind)}\n")
+            f.write(f"rod_vert_start = {self._rod_vert_range[0]}\n")
+            f.write(f"rod_vert_end = {self._rod_vert_range[1]}\n")
+            f.write(f"shell_vert_start = {self._shell_vert_range[0]}\n")
+            f.write(f"shell_vert_end = {self._shell_vert_range[1]}\n")
+            f.write(f"rod_count = {self._rod_count}\n")
+            f.write(f"shell_count = {self._shell_count}\n")
+            f.write(f"has_rest_vert = {str(self._concat_rest_vert is not None).lower()}\n")
+            f.write(
+                f"has_rest_vert_anim = {str(self._rest_vert_anim is not None).lower()}\n"
+            )
+            n_rest_frames = (
+                len(self._rest_vert_times) if self._rest_vert_times is not None else 0
+            )
+            f.write(f"rest_vert_anim_frames = {n_rest_frames}\n")
+            f.write(
+                f"has_bend_rest_vert = {str(self._bend_rest_vert is not None).lower()}\n"
+            )
+            f.write(
+                "has_bend_rest_vert_anim = "
+                f"{str(self._bend_rest_vert_anim is not None).lower()}\n"
+            )
+            n_bend_frames = (
+                len(self._bend_rest_vert_times)
+                if self._bend_rest_vert_times is not None else 0
+            )
+            f.write(f"bend_rest_vert_anim_frames = {n_bend_frames}\n")
+            f.write("\n")
+
+            if self._static_transform_animations:
+                total_kf = sum(len(a.times) for _, a in self._static_transform_animations)
+                f.write(_rust.scene_format_static_transform_header(
+                    len(self._static_transform_animations),
+                    int(total_kf),
+                    [len(a.times) for _, a in self._static_transform_animations],
+                    [len(a.local_vert) for _, a in self._static_transform_animations],
+                    [int(off) for off, _ in self._static_transform_animations],
+                ))
+
+            # Pin TOML: build pin/op descriptor dicts, then format the
+            # whole block in one Rust call (no per-line write loop).
+            f.write(_rust.scene_format_pin_toml(
+                [_pin_to_toml_dict(pin) for pin in self._pin]
+            ))
+            # Display pins take the same block format under their own
+            # section, so the solver reads them with the same reader.
+            if self._display_pin:
+                f.write(_rust.scene_format_pin_toml(
+                    [_pin_to_toml_dict(d["pin"]) for d in self._display_pin],
+                    section="display-pin",
+                ))
+
+            # Wall TOML: pre-render each param value with Python's str()
+            # to preserve the heterogeneous int/float/string formatting,
+            # then let Rust stitch the section. Same idea for spheres.
+            f.write(_rust.scene_format_wall_toml([
+                {
+                    "keyframe": len(wall.entry),
+                    "normal": [float(wall.normal[0]), float(wall.normal[1]), float(wall.normal[2])],
+                    "transition": wall.transition,
+                    "params": [(str(k), str(v)) for k, v in wall.param.list().items()],
+                }
+                for wall in self._wall
+            ]))
+
+            f.write(_rust.scene_format_sphere_toml([
+                {
+                    "keyframe": len(sphere.entry),
+                    "is_hemisphere": bool(sphere.is_hemisphere),
+                    "is_inverted": bool(sphere.is_inverted),
+                    "transition": sphere.transition,
+                    "params": [(str(k), str(v)) for k, v in sphere.param.list().items()],
+                }
+                for sphere in self._sphere
+            ]))
+        pbar.update(1)
+
+        bin_path = os.path.join(path, "bin")
+        os.makedirs(bin_path)
+        param_path = os.path.join(bin_path, "param")
+        os.makedirs(param_path)
+        pbar.update(1)
+
+        def export_param(param: dict[str, list[Any]], basepath: str, name: str):
+            """Export parameters to a binary file."""
+            for key, value in param.items():
+                if value:
+                    filepath = os.path.join(basepath, f"{name}-{key}.bin")
+                    if key == "model":
+                        # Authoritative name->id table lives in the Rust
+                        # core (ppf_cts_core::datamodel::elastic_model) and is
+                        # shared with the solver's reader, so the numeric
+                        # encoding can't drift. Unknown names raise ValueError.
+                        np.array(
+                            [_rust.scene_model_name_to_id(name) for name in value],
+                            dtype=np.uint8,
+                        ).tofile(filepath)
+                    else:
+                        np.array(value, dtype=np.float32).tofile(filepath)
+
+        self._displacement.astype(np.float64).tofile(
+            os.path.join(bin_path, "displacement.bin")
+        )
+        self._vert[0].astype(np.uint32).tofile(os.path.join(bin_path, "vert_dmap.bin"))
+        # Which vertices belong to a STATIC collider. The solver skips a contact
+        # or intersection pair only when BOTH sides are marked, so a collider
+        # still meets every dynamic object. Written only when the scene has one,
+        # and the solver treats an absent file as "no colliders".
+        if self._collider_vert_mask is not None:
+            assert len(self._collider_vert_mask) == len(self._vert[1]), (
+                f"collider_vert_mask has {len(self._collider_vert_mask)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._collider_vert_mask.astype(np.uint8).tofile(
+                os.path.join(bin_path, "collider_vert.bin")
+            )
+        # Source-object identity per dynamic vertex, read by the solver to tell
+        # a self-intersection from an inter-object one. Absent means the solver
+        # knows no object boundaries and reports every intersecting pair, which
+        # is what a session directory that does not carry this file gets.
+        if self._object_vert_index is not None:
+            assert len(self._object_vert_index) == len(self._vert[1]), (
+                f"object_vert_index has {len(self._object_vert_index)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._object_vert_index.astype(np.uint32).tofile(
+                os.path.join(bin_path, "object_vert.bin")
+            )
+        # Written only when some object actually asks for an allowance, so a
+        # scene that does not use the feature exports byte-identically.
+        if self._intersect_policy is not None:
+            assert len(self._intersect_policy) == len(self._vert[1]), (
+                f"intersect_policy has {len(self._intersect_policy)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._intersect_policy.astype(np.uint8).tofile(
+                os.path.join(bin_path, "intersect_policy.bin")
+            )
+        # Allow Existing Intersections' vertex links, written only when the
+        # build linked something, so a scene that does not use the feature
+        # exports byte-identically. `u32` pairs in the combined namespace; the
+        # solver splits it into its dynamic and collision-mesh pools.
+        if len(self._start_links) > 0:
+            np.ascontiguousarray(self._start_links, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "start_link.bin")
+            )
+        # Written only when some object asks for the inter-group allowance, the
+        # one reader; absent, the solver puts every vertex in one group.
+        if self._group_vert_index is not None:
+            assert len(self._group_vert_index) == len(self._vert[1]), (
+                f"group_vert_index has {len(self._group_vert_index)} entries "
+                f"but the scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._group_vert_index.astype(np.uint32).tofile(
+                os.path.join(bin_path, "group_vert.bin")
+            )
+        self._vert[1].astype(np.float64).tofile(os.path.join(bin_path, "vert.bin"))
+        if self._force_field is not None:
+            ff = self._force_field
+            weight = self._force_field_context["weight"]
+            for what, arr in (("weight", weight), ("mask", ff["mask"])):
+                if arr is not None:
+                    assert len(arr) == len(self._vert[1]), (
+                        f"force-field {what} has {len(arr)} entries "
+                        f"but the scene has {len(self._vert[1])} dynamic vertices"
+                    )
+            _write_force_field(path, ff["fields"], ff["scripts"], weight, ff["mask"])
+        # rest_vert_mask is shared between the static rest_vert and the
+        # time-varying rest_vert_anim, so write it whenever either is present.
+        if self._rest_vert_mask is not None:
+            self._rest_vert_mask.astype(np.uint8).tofile(
+                os.path.join(bin_path, "rest_vert_mask.bin")
+            )
+        if self._concat_rest_vert is not None:
+            self._concat_rest_vert.astype(np.float64).tofile(
+                os.path.join(bin_path, "rest_vert.bin")
+            )
+        if self._rest_vert_anim is not None:
+            self._rest_vert_anim.astype(np.float64).tofile(
+                os.path.join(bin_path, "rest_vert_anim.bin")
+            )
+            self._rest_vert_times.astype(np.float64).tofile(
+                os.path.join(bin_path, "rest_vert_times.bin")
+            )
+        # Bending reference rest angle: full per-vertex reference set plus the
+        # per-vertex mask of which objects opted in. Written together so the
+        # solver can build MeshSet.bend_rest_vertex and gate the from-geometry
+        # rest-angle path on the mask.
+        if self._bend_rest_vert is not None:
+            self._bend_rest_vert.astype(np.float64).tofile(
+                os.path.join(bin_path, "bend_rest_vert.bin")
+            )
+            if self._bend_rest_vert_mask is not None:
+                self._bend_rest_vert_mask.astype(np.uint8).tofile(
+                    os.path.join(bin_path, "bend_rest_vert_mask.bin")
+                )
+        if self._bend_rest_vert_anim is not None:
+            self._bend_rest_vert_anim.astype(np.float64).tofile(
+                os.path.join(bin_path, "bend_rest_vert_anim.bin")
+            )
+            self._bend_rest_vert_times.astype(np.float64).tofile(
+                os.path.join(bin_path, "bend_rest_vert_times.bin")
+            )
+        # Lock Translation: one normalized world-space axis per displacement
+        # group (dmap entry), aligned with vert_dmap/displacement.bin
+        # ordering, beside one uint32 mode per group. Absent entirely when
+        # no object in the scene enabled Lock Translation in any mode
+        # (mirrors the other optional per-scene tables above); the mode
+        # table is written under exactly that same condition, so the pair
+        # is either both present or both absent and the solver never sees
+        # an axis it cannot interpret.
+        #
+        # Reading the pair: 0 = the center of mass is held on the line
+        # through this row's axis, and a zero axis there means the group
+        # is not locked; 1 = the center of mass is pinned to its initial
+        # point, where no direction exists and the axis row is exactly
+        # zero. A zero axis alone therefore does not mean "disabled", and
+        # the mode alone does not either, since 0 is both the axis mode
+        # and the value a disabled row carries.
+        if self._translation_lock is not None:
+            np.ascontiguousarray(self._translation_lock, dtype=np.float32).tofile(
+                os.path.join(bin_path, "translation_lock.bin")
+            )
+        if self._translation_lock_mode is not None:
+            np.ascontiguousarray(self._translation_lock_mode, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "translation_lock_mode.bin")
+            )
+        # Lock Rotation: the same axis-plus-mode pair per displacement
+        # group, aligned the same way as translation_lock.bin above but
+        # independent of it, and absent entirely when no object in the
+        # scene enabled Lock Rotation in any mode.
+        #
+        # Reading the pair: 0 = allow-only (rotation about this row's
+        # axis is the only freedom, and a zero axis there means the group
+        # is not locked); 1 = prohibit-axis (rotation about the axis is
+        # forbidden, the perpendicular plane stays free); 2 = every axis
+        # is locked, where no direction exists and the axis row is
+        # exactly zero.
+        if self._rotation_lock is not None:
+            np.ascontiguousarray(self._rotation_lock, dtype=np.float32).tofile(
+                os.path.join(bin_path, "rotation_lock.bin")
+            )
+        if self._rotation_lock_mode is not None:
+            np.ascontiguousarray(self._rotation_lock_mode, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "rotation_lock_mode.bin")
+            )
+        self._color.astype(np.float32).tofile(os.path.join(bin_path, "color.bin"))
+        self._vel.astype(np.float32).tofile(os.path.join(bin_path, "vel.bin"))
+
+        # Write velocity schedule and collision windows as dyn_param entries
+        dyn_entries = {}
+        dyn_entries.update(self._velocity_schedules)
+        # Collision windows: each entry is a (t_start, t_end) pair written as 2 floats
+        for key, windows in self._collision_windows_data.items():
+            dyn_entries[key] = windows
+
+        if dyn_entries:
+            dyn_path = os.path.join(path, "dyn_param.txt")
+            mode = "a" if os.path.exists(dyn_path) else "w"
+            # Rust formats the entire file body in one shot. Each entry
+            # is normalized into one of two tuple shapes (velocity
+            # `(t, [vx, vy, vz])` or collision-window `(t_start, t_end)`)
+            # via a list comprehension (single C-level allocation, no
+            # dynamic list growth); the kernel discriminates on shape.
+            def _normalize_entry(entry):
+                if isinstance(entry[1], (list, tuple)):
+                    t, vel = entry
+                    return (float(t), [float(vel[0]), float(vel[1]), float(vel[2])])
+                return (float(entry[0]), float(entry[1]))
+
+            blocks = [
+                (
+                    str(key),
+                    [_normalize_entry(e) for e in entries
+                     if isinstance(e, (list, tuple)) and len(e) == 2],
+                )
+                for key, entries in dyn_entries.items()
+            ]
+            with open(dyn_path, mode) as f:
+                f.write(_rust.scene_format_dyn_param_toml(blocks))
+
+        pbar.update(1)
+
+        # ``_uv`` is the per-triangle UV layout: a single (n_tri, 3, 2) float32
+        # array (or, when loaded from an older pickle, a list of (3, 2)
+        # arrays). ``len()`` guards the empty case for both. Writing each
+        # triangle individually used to issue ~1.8M ``tofile`` calls and
+        # dominated the export (~15s); ``np.concatenate`` flattens both shapes
+        # to identical, back-to-back float32 bytes for a single write.
+        if len(self._uv):
+            uv_all = np.ascontiguousarray(np.concatenate(self._uv), dtype=np.float32)
+            uv_all.tofile(os.path.join(bin_path, "uv.bin"))
+        pbar.update(1)
+
+        if len(self._rod):
+            self._rod.astype(np.uint64).tofile(os.path.join(bin_path, "rod.bin"))
+            export_param(self._rod_param, param_path, "rod")
+        # Cosserat rods: one uint8 per rod edge, aligned with rod.bin, marking
+        # the edges whose segments carry a material frame, and one float32 roll
+        # per vertex, aligned with vert.bin. Each is written only when the
+        # scene has something to say; the solver reads an absent marker as
+        # "no Cosserat edge" and an absent roll as zero.
+        if self._cosserat_edge is not None:
+            assert len(self._cosserat_edge) == len(self._rod), (
+                f"cosserat_edge has {len(self._cosserat_edge)} entries but the "
+                f"scene has {len(self._rod)} rod edges"
+            )
+            self._cosserat_edge.astype(np.uint8).tofile(
+                os.path.join(bin_path, "cosserat_edge.bin")
+            )
+        if self._cosserat_tilt is not None:
+            assert self._cosserat_edge is not None, (
+                "cosserat_tilt is set but no rod edge is marked Cosserat"
+            )
+            assert len(self._cosserat_tilt) == len(self._vert[1]), (
+                f"cosserat_tilt has {len(self._cosserat_tilt)} entries but the "
+                f"scene has {len(self._vert[1])} dynamic vertices"
+            )
+            self._cosserat_tilt.astype(np.float32).tofile(
+                os.path.join(bin_path, "cosserat_tilt.bin")
+            )
+        pbar.update(1)
+
+        if len(self._tri):
+            self._tri.astype(np.uint64).tofile(os.path.join(bin_path, "tri.bin"))
+            export_param(self._tri_param, param_path, "tri")
+        # Animated material schedules go to their own directory so the solver
+        # can tell "this scene animates nothing" from "this key is missing".
+        # Layout matches the static files exactly, repeated once per keyframe,
+        # so both go through the same assembly on the far side.
+        if self._tri_param_anim:
+            assert self._param_anim_times, (
+                "an animated material schedule needs param_anim_times"
+            )
+            anim_path = os.path.join(bin_path, "param_anim")
+            os.makedirs(anim_path, exist_ok=True)
+            np.array(self._param_anim_times, dtype=np.float64).tofile(
+                os.path.join(anim_path, "times.bin")
+            )
+            n_frames = len(self._param_anim_times)
+            for key, frames in self._tri_param_anim.items():
+                assert len(frames) == n_frames, (
+                    f"animated 'tri-{key}' has {len(frames)} frames but "
+                    f"param_anim_times has {n_frames}"
+                )
+                flat = np.concatenate(
+                    [np.asarray(f, dtype=np.float32) for f in frames]
+                )
+                flat.tofile(os.path.join(anim_path, f"tri-{key}.bin"))
+        pbar.update(1)
+
+        # PDRD per-body and per-vertex tables. Absent files mean the
+        # scene has no PDRD bodies; the solver tolerates that path.
+        if self._pdrd_body_rows:
+            np.asarray(self._pdrd_body_rows, dtype=np.float32).tofile(
+                os.path.join(bin_path, "pdrd_body.bin")
+            )
+            assert self._pdrd_vert_index is not None
+            assert self._pdrd_rest_centered is not None
+            self._pdrd_vert_index.astype(np.uint32).tofile(
+                os.path.join(bin_path, "pdrd_vert_index.bin")
+            )
+            np.asarray(self._pdrd_vert_list, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "pdrd_vert_list.bin")
+            )
+            np.ascontiguousarray(self._pdrd_rest_centered, dtype=np.float32).tofile(
+                os.path.join(bin_path, "pdrd_rest_centered.bin")
+            )
+
+        if len(self._tet):
+            self._tet.astype(np.uint64).tofile(os.path.join(bin_path, "tet.bin"))
+            export_param(self._tet_param, param_path, "tet")
+        pbar.update(1)
+
+        # SAND scalar params: one float per key, written on the "sand-"
+        # channel (sand-particle-mass.bin, sand-grain-radius.bin,
+        # sand-contact-gap.bin, sand-friction.bin). Read by the solver outside
+        # the per-element length assert. There are no sand element indices to
+        # write; the grains are plain loose vertices already in vert.bin.
+        if self._sand_param:
+            export_param(self._sand_param, param_path, "sand")
+
+        if len(self._static_vert[0]):
+            self._static_vert[0].astype(np.uint32).tofile(
+                os.path.join(bin_path, "static_vert_dmap.bin")
+            )
+            self._static_vert[1].astype(np.float64).tofile(
+                os.path.join(bin_path, "static_vert.bin")
+            )
+            self._static_tri.astype(np.uint64).tofile(
+                os.path.join(bin_path, "static_tri.bin")
+            )
+            self._static_color.astype(np.float32).tofile(
+                os.path.join(bin_path, "static_color.bin")
+            )
+            export_param(self._static_param, param_path, "static")
+        if self._static_transform_animations:
+            all_local = np.vstack([a.local_vert for _, a in self._static_transform_animations])
+            all_local.astype(np.float64).tofile(
+                os.path.join(bin_path, "static_local_vert.bin")
+            )
+            # Concat per-anim keyframes via numpy.concatenate (single C
+            # memcpy per stream, no Python list growth). Each anim's
+            # `.times` is a list[float] and the trans/quat/scale entries
+            # are 1D numpy arrays; we flatten then stack in one shot.
+            kf_counts = [len(a.times) for _, a in self._static_transform_animations]
+            all_times = np.concatenate([
+                np.asarray(a.times, dtype=np.float64)
+                for _, a in self._static_transform_animations
+            ])
+            all_trans = np.concatenate([
+                np.asarray(a.translations, dtype=np.float64).reshape(-1, 3)
+                for _, a in self._static_transform_animations
+            ])
+            all_quats = np.concatenate([
+                np.asarray(a.quaternions, dtype=np.float64).reshape(-1, 4)
+                for _, a in self._static_transform_animations
+            ])
+            all_scales = np.concatenate([
+                np.asarray(a.scales, dtype=np.float64).reshape(-1, 3)
+                for _, a in self._static_transform_animations
+            ])
+            # Rust validates total_kf alignment between the four streams.
+            _rust.scene_concat_static_transform_anims(
+                kf_counts,
+                np.ascontiguousarray(all_times, dtype=np.float64),
+                np.ascontiguousarray(all_trans, dtype=np.float64),
+                np.ascontiguousarray(all_quats, dtype=np.float64),
+                np.ascontiguousarray(all_scales, dtype=np.float64),
+            )
+            all_times.astype(np.float64).tofile(
+                os.path.join(bin_path, "static_transform_time.bin")
+            )
+            all_trans.astype(np.float64).tofile(
+                os.path.join(bin_path, "static_transform_translation.bin")
+            )
+            all_quats.astype(np.float64).tofile(
+                os.path.join(bin_path, "static_transform_quaternion.bin")
+            )
+            all_scales.astype(np.float64).tofile(
+                os.path.join(bin_path, "static_transform_scale.bin")
+            )
+        pbar.update(1)
+
+        if len(self._stitch_ind) and len(self._stitch_w):
+            # Width-6 ABI contract: the solver reads stitch_ind.bin /
+            # stitch_w.bin as 6-wide barycentric-barycentric rows. A wrong
+            # width here silently mis-strides every stitch in the solver,
+            # so guard the producer before the bin write (H2 tripwire).
+            assert self._stitch_ind.shape[1] == 6, (
+                "stitch_ind must be (M, 6); got {}".format(self._stitch_ind.shape)
+            )
+            assert self._stitch_w.shape[1] == 6, (
+                "stitch_w must be (M, 6); got {}".format(self._stitch_w.shape)
+            )
+            self._stitch_ind.astype(np.uint64).tofile(
+                os.path.join(bin_path, "stitch_ind.bin")
+            )
+            self._stitch_w.astype(np.float32).tofile(
+                os.path.join(bin_path, "stitch_w.bin")
+            )
+            # Per-stitch-row stiffness (M,), parallel to stitch_ind/stitch_w.
+            # A count that does not match names no stiffness for some rows,
+            # and any value put in their place would be one nobody authored.
+            n_stitch = self._stitch_ind.shape[0]
+            stiffness = np.asarray(self._stitch_stiffness, dtype=np.float32)
+            if stiffness.shape != (n_stitch,):
+                raise ValueError(
+                    f"this scene carries {n_stitch} stitches but "
+                    f"{stiffness.shape[0] if stiffness.ndim else 0} stitch "
+                    "stiffnesses; rebuild it with Scene.build() so every "
+                    "stitch has the stiffness its object gives it"
+                )
+            stiffness.tofile(os.path.join(bin_path, "stitch_stiffness.bin"))
+            # Per-stitch authored rest lengths and their presence flags,
+            # written as a pair and only when some stitch authors one. With
+            # neither file the solver derives every rest length from the
+            # contact gaps, so a scene that authors none writes exactly the
+            # files it always did.
+            has_rest = np.asarray(self._stitch_has_rest_length, dtype=bool)
+            rest = np.asarray(self._stitch_rest_length, dtype=np.float32)
+            if has_rest.shape != (n_stitch,) or rest.shape != (n_stitch,):
+                raise ValueError(
+                    f"this scene carries {n_stitch} stitches but "
+                    f"{rest.shape[0] if rest.ndim else 0} stitch rest lengths "
+                    f"and {has_rest.shape[0] if has_rest.ndim else 0} presence "
+                    "flags; set them through FixedScene.set_stitch"
+                )
+            if has_rest.any():
+                rest.tofile(os.path.join(bin_path, "stitch_rest_length.bin"))
+                has_rest.astype(np.uint8).tofile(
+                    os.path.join(bin_path, "stitch_has_rest_length.bin")
+                )
+        # Tie constraints: three files written together, and none without a tie,
+        # so every scene without one writes exactly the files it always did. A
+        # FixedScene pickled before ties existed carries no tie fields.
+        tie_vertex = getattr(self, "_tie_vertex", np.zeros(0, dtype=np.uint32))
+        if len(tie_vertex):
+            np.asarray(tie_vertex, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "tie_vertex.bin")
+            )
+            np.asarray(self._tie_ind, dtype=np.uint32).tofile(
+                os.path.join(bin_path, "tie_ind.bin")
+            )
+            np.asarray(self._tie_w, dtype=np.float32).tofile(
+                os.path.join(bin_path, "tie_w.bin")
+            )
+        pbar.update(1)
+
+        def write_pin_bins(section: str, i: int, pin: PinData) -> None:
+            # The bins of one pin block, named after its TOML section (see
+            # `_rust.scene_format_pin_toml`): `pin` for the solver's pins,
+            # `display-pin` for the positions the solver writes out for
+            # display.
+            with open(os.path.join(bin_path, f"{section}-ind-{i}.bin"), "wb") as f:
+                np.array(pin.index, dtype=np.uint64).tofile(f)
+
+            # Optional per-vertex pull weights (aligned to pin.index). The
+            # solver probes for this file; absent means scalar pull / hard
+            # pin as before.
+            if getattr(pin, "pull_weights", None) is not None:
+                with open(os.path.join(bin_path, f"{section}-pullw-{i}.bin"), "wb") as f:
+                    np.asarray(pin.pull_weights, dtype=np.float32).tofile(f)
+
+            # Write operation data
+            for j, op in enumerate(pin.operations):
+                if isinstance(op, MoveByOperation):
+                    # MoveBy operations need to write position delta to binary file
+                    op_path = os.path.join(bin_path, f"{section}-{i}-op-{j}.bin")
+                    with open(op_path, "wb") as f:
+                        np.array(op.delta, dtype=np.float64).tofile(f)
+                elif isinstance(op, MoveToOperation):
+                    # MoveTo operations need to write target positions to binary file
+                    op_path = os.path.join(bin_path, f"{section}-{i}-op-{j}.bin")
+                    with open(op_path, "wb") as f:
+                        np.array(op.target, dtype=np.float64).tofile(f)
+                elif isinstance(op, TransformKeyframeOperation):
+                    # TRS keyframes: separate binaries for verts, times, TRS
+                    # arrays, and per-segment interpolation metadata.
+                    base = os.path.join(bin_path, f"{section}-{i}-op-{j}")
+                    np.asarray(op.local_vert, dtype=np.float64).tofile(base + ".bin")
+                    np.asarray(op.times, dtype=np.float64).tofile(
+                        base + "-time.bin"
+                    )
+                    np.asarray(op.translations, dtype=np.float64).tofile(
+                        base + "-translation.bin"
+                    )
+                    np.asarray(op.quaternions, dtype=np.float64).tofile(
+                        base + "-quaternion.bin"
+                    )
+                    np.asarray(op.scales, dtype=np.float64).tofile(
+                        base + "-scale.bin"
+                    )
+                    # Per-segment: 1 byte interp code (0=linear, 1=bezier,
+                    # 2=constant) and 4 f64 handles. Written as two files to
+                    # avoid struct padding headaches. Defaults stay
+                    # Python-side because dict.get(...) reads
+                    # heterogeneous keys; the kernel just packs the
+                    # resolved values into the two contiguous buffers.
+                    segs = op.segments
+                    interp_strs = [s.get("interpolation", "LINEAR") for s in segs]
+                    handles_right = np.asarray(
+                        [s.get("handle_right", [1/3, 0.0]) for s in segs],
+                        dtype=np.float64,
+                    ).reshape(-1, 2)
+                    handles_left = np.asarray(
+                        [s.get("handle_left", [2/3, 1.0]) for s in segs],
+                        dtype=np.float64,
+                    ).reshape(-1, 2)
+                    interp_codes, handles = _rust.scene_pack_transform_keyframe_segments(
+                        interp_strs,
+                        np.ascontiguousarray(handles_right, dtype=np.float64),
+                        np.ascontiguousarray(handles_left, dtype=np.float64),
+                    )
+                    interp_codes.tofile(base + "-interp.bin")
+                    handles.tofile(base + "-handles.bin")
+                # Spin and Scale operations have all data in info.toml
+
+        for i, pin in enumerate(self._pin):
+            write_pin_bins("pin", i, pin)
+        for i, display in enumerate(self._display_pin):
+            write_pin_bins("display-pin", i, display["pin"])
+            np.ascontiguousarray(display["rest"], dtype=np.float64).tofile(
+                os.path.join(bin_path, f"display-pin-rest-{i}.bin")
+            )
+            np.full(len(display["rest"]), display["dmap"], dtype=np.uint32).tofile(
+                os.path.join(bin_path, f"display-pin-dmap-{i}.bin")
+            )
+        pbar.update(1)
+
+        for i, wall in enumerate(self._wall):
+            with open(os.path.join(bin_path, f"wall-pos-{i}.bin"), "wb") as f:
+                pos = np.array(
+                    [p for pos, _ in wall.entry for p in pos], dtype=np.float64
+                )
+                pos.tofile(f)
+            with open(os.path.join(bin_path, f"wall-timing-{i}.bin"), "wb") as f:
+                timing = np.array([t for _, t in wall.entry], dtype=np.float64)
+                timing.tofile(f)
+        pbar.update(1)
+
+        for i, sphere in enumerate(self._sphere):
+            with open(os.path.join(bin_path, f"sphere-pos-{i}.bin"), "wb") as f:
+                pos = np.array(
+                    [p for pos, _, _ in sphere.entry for p in pos], dtype=np.float64
+                )
+                pos.tofile(f)
+            with open(os.path.join(bin_path, f"sphere-radius-{i}.bin"), "wb") as f:
+                radius = np.array([r for _, r, _ in sphere.entry], dtype=np.float32)
+                radius.tofile(f)
+            with open(os.path.join(bin_path, f"sphere-timing-{i}.bin"), "wb") as f:
+                timing = np.array([t for _, _, t in sphere.entry], dtype=np.float64)
+                timing.tofile(f)
+        pbar.update(1)
+        pbar.close()
+        return self
+
+    def bbox(self) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the bounding box of the scene.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: The maximum and minimum coordinates of the bounding box.
+
+        Example:
+            Print the extents of the built scene::
+
+                hi, lo = fixed.bbox()
+                print("size:", hi - lo)
+        """
+        lv = np.ascontiguousarray(self._vert[1], dtype=np.float64)
+        idx = np.ascontiguousarray(self._vert[0], dtype=np.int64)
+        disp = np.ascontiguousarray(self._displacement, dtype=np.float64)
+        hi, lo = _rust.scene_bbox_displaced(lv, idx, disp)
+        return (hi, lo)
+
+    def center(self) -> np.ndarray:
+        """Compute the area-weighted center of the scene.
+
+        Returns:
+            np.ndarray: The area-weighted center of the scene.
+
+        Example:
+            Aim a camera at the scene's area-weighted center::
+
+                target = fixed.center()
+                fixed.preview(options={"lookat": target.tolist()})
+        """
+        vert = self.vertex()
+        v = np.ascontiguousarray(vert, dtype=np.float64)
+        t = np.ascontiguousarray(self._tri, dtype=np.int64)
+        cx, cy, cz = _rust.scene_area_weighted_center(v, t)
+        return np.array([cx, cy, cz])
+
+    def _average_tri_area(self) -> float:
+        """Compute the average triangle area of the scene.
+
+        Returns:
+            float: The average triangle area of the scene.
+        """
+        return _rust.scene_average_tri_area(
+            np.ascontiguousarray(self._area, dtype=np.float64)
+        )
+
+    def set_pin(self, pin: list[PinData]):
+        """Set the pinning data of all the objects.
+
+        Args:
+            pin (list[PinData]): A list of pinning data.
+
+        Example:
+            Typically invoked internally by :meth:`Scene.build`, but can be
+            called directly to inject pinning data into a fixed scene::
+
+                fixed = scene.build()
+                fixed.set_pin(list_of_pin_data)
+        """
+        self._pin = pin
+
+    def set_display_pin(self, display_pin: list[dict]):
+        """Set the display pins: the Blender vertices exact SOLID pins hold,
+        whose scripted positions the solver writes out every frame
+        (``display_pin_<N>.bin``) so the addon can place them on their script.
+
+        Args:
+            display_pin (list[dict]): One entry per block, each with ``uuid``
+                (the owning object's name), ``blender_index`` (int array of
+                its Blender vertices), ``rest`` ((n, 3) rest positions in the
+                object's untranslated frame), ``dmap`` (the object's
+                displacement group) and ``pin`` (the PinData whose operations
+                drive them).
+
+        Example:
+            Typically invoked internally by :meth:`Scene.build`::
+
+                fixed = scene.build()
+                fixed.set_display_pin(list_of_display_pins)
+        """
+        self._display_pin = display_pin
+
+    def set_static(
+        self,
+        vert: tuple[np.ndarray, np.ndarray],
+        tri: np.ndarray,
+        color: np.ndarray,
+        param: dict[str, list[Any]],
+        transform_animations: Optional[list[tuple[int, TransformAnimation]]] = None,
+        invisible: Optional[np.ndarray] = None,
+    ):
+        """Set the static mesh data.
+
+        Args:
+            vert (tuple[np.ndarray, np.ndarray]): The vertices of the static mesh. The first array is the displacement map reference; the second is local positions.
+            tri (np.ndarray): The triangle elements of the static mesh.
+            color (np.ndarray): The colors of the static mesh.
+            param (dict[str, list[Any]]): Parameters for the static mesh elements.
+            transform_animations: Optional list of ``(vert_offset, TransformAnimation)`` for animated static objects.
+            invisible (Optional[np.ndarray]): Per-vertex bool mask marking static vertices that belong to an object hidden with :meth:`Object.invisible`. Drawing only. None when every static object is drawn.
+
+        Example:
+            Typically invoked internally by :meth:`Scene.build`, but can be
+            called directly to attach a static collider mesh::
+
+                fixed = scene.build()
+                fixed.set_static((ref, V), F, colors, {"area": areas})
+        """
+        self._static_vert = vert
+        self._static_tri = tri
+        self._static_color = color
+        self._static_param = param
+        if transform_animations:
+            self._static_transform_animations = transform_animations
+        if invisible is not None:
+            invisible = np.ascontiguousarray(invisible, dtype=bool)
+            assert len(invisible) == len(vert[1]), (
+                f"invisible has {len(invisible)} entries, "
+                f"but the static mesh has {len(vert[1])} vertices"
+            )
+            self._invisible_static_vert = invisible
+
+    def set_tie(self, vertex, ind, w) -> "FixedScene":
+        """Set the tie constraints in solver vertex indices.
+
+        Typically invoked by :meth:`Scene.build` from :meth:`Scene.tie`.
+
+        Args:
+            vertex: ``(N,)`` held solver vertices.
+            ind: ``(N, 8)`` controller solver vertices.
+            w: ``(N, 8)`` affine weights, each row summing to one, zero in an
+                unused slot.
+        """
+        vertex = np.ascontiguousarray(vertex, dtype=np.uint32)
+        ind = np.ascontiguousarray(ind, dtype=np.uint32).reshape(-1, TIE_SLOTS)
+        w = np.ascontiguousarray(w, dtype=np.float32).reshape(-1, TIE_SLOTS)
+        if ind.shape[0] != len(vertex) or w.shape[0] != len(vertex):
+            raise ValueError(
+                f"{len(vertex)} held vertices but {ind.shape[0]} controller rows and "
+                f"{w.shape[0]} weight rows"
+            )
+        self._tie_vertex, self._tie_ind, self._tie_w = vertex, ind, w
+        return self
+
+    def set_stitch(
+        self,
+        ind: np.ndarray,
+        w: np.ndarray,
+        stiffness: Optional[np.ndarray] = None,
+        rest_length=None,
+        rest_length_given: Optional[np.ndarray] = None,
+    ):
+        """Set the stitch data.
+
+        Args:
+            ind (np.ndarray): The stitch indices, ``(M, 6)`` in the scene's
+                own vertex numbering.
+            w (np.ndarray): The stitch weights, ``(M, 6)``.
+            stiffness (Optional[np.ndarray]): Per-stitch-row stiffness (M,),
+                resolved from each stitch's owning object. Defaults to all
+                ones when omitted.
+            rest_length (optional): The length each stitch's spring holds its
+                two points at. ``None`` (the default) derives it from the
+                contact gaps of the stitch's six vertices, half their
+                weighted mean, which closes a seam to contact distance.
+                ``"initial"`` measures it from the two points' positions in
+                this scene, so a stitch between bodies that rest apart holds
+                them there with no preload. A positive number applies to
+                every stitch, and an ``(M,)`` array gives one per stitch.
+                The spring's energy is in strain units, ``l / l0 - 1``, so a
+                longer rest length makes the same ``stiffness`` a softer
+                spring: the force at an extension ``d`` is
+                ``stiffness * d / l0``.
+            rest_length_given (Optional[np.ndarray]): With an ``(M,)``
+                ``rest_length`` array, which rows it applies to; the others
+                derive theirs from the contact gaps. Defaults to every row.
+
+        Raises:
+            ValueError: If a rest length is not a finite positive distance,
+                an array does not hold one entry per stitch, or
+                ``"initial"`` meets a stitch whose two points coincide.
+
+        Example:
+            Typically invoked internally by :meth:`Scene.build`, but can be
+            called directly to inject stitch constraints::
+
+                fixed = scene.build()
+                fixed.set_stitch(stitch_indices, stitch_weights)
+
+            Hold every stitch at the distance its two points start at::
+
+                fixed.set_stitch(ind, w, stiffness, rest_length="initial")
+        """
+        self._stitch_ind = ind
+        self._stitch_w = w
+        if stiffness is None:
+            stiffness = np.ones(len(ind), dtype=np.float32)
+        self._stitch_stiffness = np.ascontiguousarray(stiffness, dtype=np.float32)
+        n_stitch = len(ind)
+        if rest_length is None:
+            if rest_length_given is not None:
+                raise ValueError(
+                    "rest_length_given names the rows a rest_length array "
+                    "applies to, and no rest_length was given"
+                )
+            lengths = np.zeros(n_stitch, dtype=np.float64)
+            given = np.zeros(n_stitch, dtype=bool)
+        else:
+            if isinstance(rest_length, str):
+                if rest_length != "initial":
+                    raise ValueError(
+                        f"rest_length is None, 'initial', a number or an "
+                        f"array, got the string {rest_length!r}"
+                    )
+                lengths = stitch_endpoint_distance(
+                    self.vertex(True), np.asarray(ind), np.asarray(w)
+                )
+            else:
+                lengths = np.asarray(rest_length, dtype=np.float64)
+                if lengths.ndim == 0:
+                    lengths = np.full(n_stitch, float(lengths))
+            if lengths.shape != (n_stitch,):
+                raise ValueError(
+                    f"rest_length holds {lengths.shape} entries for "
+                    f"{n_stitch} stitches"
+                )
+            if rest_length_given is None:
+                given = np.ones(n_stitch, dtype=bool)
+            else:
+                given = np.asarray(rest_length_given, dtype=bool)
+                if given.shape != (n_stitch,):
+                    raise ValueError(
+                        f"rest_length_given holds {given.shape} entries for "
+                        f"{n_stitch} stitches"
+                    )
+            chosen = lengths[given]
+            bad = ~(np.isfinite(chosen) & (chosen > 0.0))
+            if bad.any():
+                row = int(np.flatnonzero(given)[np.flatnonzero(bad)[0]])
+                raise ValueError(
+                    f"stitch {row} has the rest length {lengths[row]}; a rest "
+                    "length is a finite positive distance"
+                )
+            lengths = np.where(given, lengths, 0.0)
+        self._stitch_rest_length = np.ascontiguousarray(lengths, dtype=np.float32)
+        self._stitch_has_rest_length = np.ascontiguousarray(given, dtype=bool)
+
+    def time(self, time: float) -> np.ndarray:
+        """Compute the vertex positions at a specific time.
+
+        Args:
+            time (float): The time to compute the vertex positions.
+
+        Returns:
+            np.ndarray: The vertex positions at the specified time.
+
+        Example:
+            Evaluate the scene midway through a pin animation::
+
+                vert_mid = fixed.time(0.5)
+                print(vert_mid.shape)
+        """
+        vert = self._vert[1].copy()
+        initial = self._vert[1]
+
+        for pin in self._pin:
+            # Reset to initial before applying ops (matches Rust solver
+            # which computes position = initial + ops independently per pin)
+            vert[pin.index] = initial[pin.index]
+            for op in pin.operations:
+                vert[pin.index] = op.apply(vert[pin.index], time)
+
+        vert += time * self._vel
+        vert += self._displacement[self._vert[0]]
+        return vert
+
+    def static_time(self, time: float) -> np.ndarray:
+        """Compute animated static vertex positions at a specific time.
+
+        Args:
+            time (float): The time to evaluate.
+
+        Returns:
+            np.ndarray: The static vertex positions at the specified time.
+
+        Example:
+            Sample the animated collider mesh halfway through the animation::
+
+                fixed = scene.build()
+                V_static = fixed.static_time(0.5)
+                print(V_static.shape)
+        """
+        if not self._static_transform_animations:
+            if len(self._static_vert[1]) == 0:
+                return np.zeros((0, 3))
+            return self._static_vert[1] + self._displacement[self._static_vert[0]]
+        base = self._static_vert[1] + self._displacement[self._static_vert[0]]
+        result = base.copy()
+        for vert_offset, anim in self._static_transform_animations:
+            n = len(anim.local_vert)
+            result[vert_offset:vert_offset + n] = anim.evaluate(time)
+        return result
+
+    def _hidden_buffer_mask(
+        self, n_total_vert: int, n_dynamic_vert: int, n_static_vert: int
+    ) -> Optional[np.ndarray]:
+        """Per-row hidden flags over an assembled draw buffer.
+
+        The buffer runs ``[dynamic | static | stitch lines]``; only the first
+        two blocks belong to objects that can be hidden, and stitch lines that
+        survived the element filtering are drawn by definition. Returns None
+        when nothing is hidden, so a scene with every object visible draws its
+        whole buffer and skips the compaction entirely.
+        """
+        dyn_hidden = self._invisible_vert is not None and self._invisible_vert.any()
+        static_hidden = (
+            n_static_vert > 0
+            and self._invisible_static_vert is not None
+            and self._invisible_static_vert.any()
+        )
+        if not dyn_hidden and not static_hidden:
+            return None
+        hidden = np.zeros(n_total_vert, dtype=bool)
+        if dyn_hidden:
+            assert self._invisible_vert is not None
+            assert len(self._invisible_vert) == n_dynamic_vert, (
+                f"visibility mask covers {len(self._invisible_vert)} vertices, "
+                f"but the drawn buffer carries {n_dynamic_vert} dynamic ones"
+            )
+            hidden[:n_dynamic_vert] = self._invisible_vert
+        if static_hidden:
+            assert self._invisible_static_vert is not None
+            hidden[n_dynamic_vert : n_dynamic_vert + n_static_vert] = (
+                self._invisible_static_vert
+            )
+        if hidden.all():
+            raise ValueError(
+                "every object in this scene is invisible, so there is nothing "
+                "to draw; call Object.invisible(False) on at least one of them"
+            )
+        return hidden
+
+    def _draw_index(
+        self, n_total_vert: int, n_dynamic_vert: int, n_static_vert: int
+    ) -> Optional[np.ndarray]:
+        """Rows of an assembled draw buffer that belong to a drawn object.
+
+        None when nothing is hidden. Handed to :meth:`Plot.plot`, which keeps
+        the full-width buffer for later frame updates and uploads only these
+        rows.
+        """
+        hidden = self._hidden_buffer_mask(n_total_vert, n_dynamic_vert, n_static_vert)
+        return None if hidden is None else np.flatnonzero(~hidden)
+
+    def _picture_arrays(
+        self,
+        vert: np.ndarray,
+        color: np.ndarray,
+        seg: np.ndarray,
+        tri: np.ndarray,
+        n_dynamic_vert: int,
+        n_static_vert: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Drop hidden objects from the arrays a renderer draws.
+
+        Returns ``(vert, color, seg, tri)`` in the argument order
+        :meth:`Rasterizer.render` takes them, unchanged when nothing is
+        hidden. Unlike the preview path there is no later frame update to
+        stay index-aligned with, so the hidden vertices are removed outright
+        and the surviving elements renumbered onto the compacted buffer.
+        """
+        hidden = self._hidden_buffer_mask(len(vert), n_dynamic_vert, n_static_vert)
+        if hidden is None:
+            return vert, color, seg, tri
+        tri_keep = _visible_rows(tri, hidden)
+        seg_keep = _visible_rows(seg, hidden)
+        tri = tri if tri_keep is None else tri[tri_keep]
+        seg = seg if seg_keep is None else seg[seg_keep]
+        index = np.flatnonzero(~hidden)
+        renumber = np.full(len(vert), -1, dtype=np.int64)
+        renumber[index] = np.arange(len(index), dtype=np.int64)
+        return (
+            vert[index],
+            color[index],
+            _renumber(seg, renumber),
+            _renumber(tri, renumber),
+        )
+
+    def preview(
+        self,
+        vert: Optional[np.ndarray] = None,
+        options: Optional[dict] = None,
+        show_slider: bool = True,
+        engine: str = "threejs",
+    ) -> Optional["Plot"]:
+        """Preview the scene.
+
+        Args:
+            vert (Optional[np.ndarray], optional): The vertices to preview. Defaults to None, in which case ``self.vertex()`` is used.
+            options (dict, optional): The options for the plot. Defaults to None.
+            show_slider (bool, optional): Whether to show the time slider. Defaults to True.
+            engine (str, optional): The rendering engine. Defaults to ``"threejs"``.
+
+        Returns:
+            Optional[Plot]: The plot object if in a Jupyter notebook, otherwise None.
+
+        Example:
+            Preview the initial scene with a custom camera and no pin markers::
+
+                opts = {"eye": [0, 1.4, 2.5], "pin": False, "wireframe": True}
+                fixed.preview(options=opts)
+        """
+        if options is None:
+            options = {}
+        default_opts = {
+            "flat_shading": False,
+            "wireframe": True,
+            "stitch": True,
+            "pin": True,
+        }
+        options = dict(options)
+        for key, value in default_opts.items():
+            if key not in options:
+                options[key] = value
+
+        if self._plot is not None and self._plot.is_jupyter_notebook():
+            if vert is None:
+                vert = self.vertex()
+            assert vert is not None
+            color = self.color(vert, options)
+            assert len(color) == len(vert)
+            # Hidden objects (Object.invisible) lose their elements here and
+            # their vertices at upload time, below. The vertices stay in this
+            # buffer so a live session's frames, which are indexed over every
+            # dynamic vertex, keep landing on the rows they belong to.
+            tri_keep = _visible_rows(self._tri, self._invisible_vert)
+            edge_keep = _visible_rows(self._rod, self._invisible_vert)
+            tri = self._tri.copy() if tri_keep is None else self._tri[tri_keep]
+            edge = self._rod.copy() if edge_keep is None else self._rod[edge_keep]
+            pts = np.zeros(0)
+            plotter = self._plot.create(engine)
+
+            n_dynamic_vert = len(vert)
+            has_static = len(self._static_vert[1]) > 0 or self._static_transform_animations
+            n_static_vert = len(self._static_vert[1])
+            if has_static:
+                static_vert = self.static_time(0.0)
+                static_color = np.zeros_like(static_vert)
+                static_color[:, :] = self._static_color
+                static_keep = _visible_rows(
+                    self._static_tri, self._invisible_static_vert
+                )
+                static_tri = (
+                    self._static_tri if static_keep is None
+                    else self._static_tri[static_keep]
+                )
+                if len(tri):
+                    tri = np.vstack([tri, static_tri + len(vert)])
+                else:
+                    tri = static_tri + len(vert)
+                vert = np.vstack([vert, static_vert])
+                color = np.vstack([color, static_color])
+            assert vert is not None and color is not None
+            assert len(color) == len(vert)
+
+            if options["stitch"] and len(self._stitch_ind) and len(self._stitch_w):
+                # 6D format: ind=[s0, s1, s2, t0, t1, t2],
+                # w=[ws0, ws1, ws2, wt0, wt1, wt2]. Rust kernel returns
+                # absolute edge indices (n_vert + 2*i, n_vert + 2*i + 1) so
+                # the appended edge buffer is ready.
+                stitch_ind = np.asarray(self._stitch_ind).reshape(-1, 6)
+                stitch_w = np.asarray(self._stitch_w).reshape(-1, 6)
+                stitch_keep = _visible_rows(stitch_ind, self._invisible_vert)
+                if stitch_keep is not None:
+                    stitch_ind = stitch_ind[stitch_keep]
+                    stitch_w = stitch_w[stitch_keep]
+                if len(stitch_ind):
+                    stitch_vert, stitch_edge = _rust.scene_stitch_preview_lines(
+                        np.ascontiguousarray(vert, dtype=np.float64),
+                        np.ascontiguousarray(stitch_ind, dtype=np.int64),
+                        np.ascontiguousarray(stitch_w, dtype=np.float64),
+                    )
+                    stitch_color = np.tile(
+                        np.array([1.0, 1.0, 1.0]), (len(stitch_vert), 1)
+                    )
+                    vert = np.vstack([vert, stitch_vert])
+                    edge = (
+                        np.vstack([edge, stitch_edge]) if len(edge) else stitch_edge
+                    )
+                    color = np.vstack([color, stitch_color])
+
+            if options["pin"] and self._pin:
+                # Triangle area is the natural marker scale for surface
+                # meshes; for rod-only scenes, fall back to a fraction of
+                # the average rod edge length so pin dots stay visible.
+                if len(self._area):
+                    options["pts_scale"] = float(np.sqrt(self._area.mean()))
+                elif len(self._rod):
+                    rest = self._vert[1]
+                    diff = rest[self._rod[:, 0]] - rest[self._rod[:, 1]]
+                    options["pts_scale"] = 0.5 * float(
+                        np.linalg.norm(diff, axis=1).mean()
+                    )
+                # Static-moving pin-shells pin every vertex as an
+                # implementation detail; hide those dots in preview.
+                # Rust kernel filters by hide_in_preview and concatenates
+                # in one pass.
+                pts = _rust.scene_collect_pin_marker_indices(
+                    [bool(pin.hide_in_preview) for pin in self._pin],
+                    [list(pin.index) for pin in self._pin],
+                )
+                if self._invisible_vert is not None and len(pts):
+                    pts = pts[~self._invisible_vert[np.asarray(pts, dtype=np.int64)]]
+
+            draw_index = self._draw_index(
+                len(vert), n_dynamic_vert, n_static_vert
+            )
+            plotter.plot(vert, color, tri, edge, pts, options, draw_index)
+
+            has_vel = np.linalg.norm(self._vel) > 0
+            has_static_anim = bool(self._static_transform_animations)
+            if show_slider and (self._pin or has_vel or has_static_anim):
+                max_time = 0
+                if self._pin:
+                    for pin in self._pin:
+                        for op in pin.operations:
+                            _, t_end = op.get_time_range()
+                            if t_end == float("inf"):
+                                max_time = max(max_time, 1.0)
+                            else:
+                                max_time = max(max_time, t_end)
+                if has_vel:
+                    max_time = max(max_time, 1.0)
+                for _, anim in self._static_transform_animations:
+                    max_time = max(max_time, anim.max_time())
+                if max_time > 0:
+
+                    def update(time=0):
+                        dyn_vert = self.time(time)
+                        if has_static:
+                            static_v = self.static_time(time)
+                            combined = np.vstack([dyn_vert, static_v])
+                        else:
+                            combined = dyn_vert
+                        plotter.update(combined)
+
+                    from ipywidgets import interact
+
+                    interact(update, time=(0, max_time, 0.01))
+            return plotter
+        else:
+            return None
+
+
+# Imported after the classes above so ``_scene_object_`` (which imports
+# EnumColor from this module) resolves cleanly during the import cycle.
+from ._scene_object_ import Object
+
+
+class SceneManager:
+    """SceneManager class. Use this to manage scenes.
+
+    Example:
+        Create a scene through the app's scene manager and build it::
+
+            app = App.create("demo")
+            scene = app.scene.create()
+            scene.add("sheet").at(0, 0.6, 0)
+            fixed = scene.build()
+    """
+
+    def __init__(self, plot: Optional[PlotManager], asset: AssetManager):
+        """Initialize the scene manager."""
+        self._plot = plot
+        self._asset = asset
+        self._scene: dict[str, Scene] = {}
+
+    def create(self, name: str = "") -> "Scene":
+        """Create a new scene.
+
+        If a scene with the given name already exists, it is replaced.
+
+        Args:
+            name (str): The name of the scene to create. If empty, defaults to ``"scene"``.
+
+        Returns:
+            Scene: The created scene.
+
+        Example:
+            Create two named scenes side by side::
+
+                cloth_scene = app.scene.create("cloth")
+                rods_scene = app.scene.create("rods")
+        """
+        if name == "":
+            name = "scene"
+
+        if name in self._scene:
+            del self._scene[name]
+
+        scene = Scene(name, self._plot, self._asset)
+        self._scene[name] = scene
+        return scene
+
+    def select(self, name: str, create: bool = True) -> "Scene":
+        """Select a scene.
+
+        If the scene exists, it is returned. If it does not exist and ``create`` is True, a new scene is created and returned.
+
+        Args:
+            name (str): The name of the scene to select.
+            create (bool, optional): Whether to create a new scene if it does not exist. Defaults to True.
+
+        Returns:
+            Scene: The selected (or newly created) scene.
+
+        Example:
+            Fetch an existing scene by name, creating it lazily::
+
+                scene = app.scene.select("cloth")
+                scene.add("sheet")
+        """
+        if create and name not in self._scene:
+            return self.create(name)
+        else:
+            return self._scene[name]
+
+    def remove(self, name: str):
+        """Remove a scene from the manager.
+
+        Args:
+            name (str): The name of the scene to remove.
+
+        Example:
+            Drop a scene that is no longer needed::
+
+                app.scene.remove("cloth")
+        """
+        if name in self._scene:
+            del self._scene[name]
+
+    def clear(self):
+        """Clear all the scenes in the manager.
+
+        Example:
+            Remove every scene before rebuilding from scratch::
+
+                app.scene.clear()
+                scene = app.scene.create()
+        """
+        self._scene = {}
+
+    def list(self) -> list[str]:
+        """List all the scenes in the manager.
+
+        Returns:
+            list[str]: A list of scene names.
+
+        Example:
+            Inspect which scenes are currently registered::
+
+                for name in app.scene.list():
+                    print(name)
+        """
+        return list(self._scene.keys())
+
+
+class SceneInfo:
+    """Lightweight metadata handle carrying the scene name.
+
+    Example:
+        Look up the name of the scene you are currently editing::
+
+            print(scene.info.name)
+    """
+
+    def __init__(self, name: str, scene: "Scene"):
+        self._scene = scene
+        self.name = name
+
+
+class InvisibleAdder:
+    """Helper for attaching invisible colliders (walls and spheres) to a scene.
+
+    Obtained via ``scene.add.invisible``.
+
+    Example:
+        Add a ground wall and a ball collider together::
+
+            scene.add.invisible.wall([0, 0, 0], [0, 1, 0])
+            scene.add.invisible.sphere([0, 0.5, 0], 0.25)
+    """
+
+    def __init__(self, scene: "Scene"):
+        self._scene = scene
+
+    def sphere(self, position: list[float], radius: float) -> Sphere:
+        """Add an invisible sphere to the scene.
+
+        Args:
+            position (list[float]): The position of the sphere.
+            radius (float): The radius of the sphere.
+        Returns:
+            Sphere: The invisible sphere.
+
+        Example:
+            Place an inverted hemispherical bowl under the cloth::
+
+                scene.add.invisible.sphere([0, 1, 0], 1.0).invert().hemisphere()
+        """
+        sphere = Sphere().add(position, radius)
+        self._scene.sphere_list.append(sphere)
+        return sphere
+
+    def wall(self, position: list[float], normal: list[float]) -> Wall:
+        """Add an invisible wall to the scene.
+
+        Args:
+            position (list[float]): The position of the wall.
+            normal (list[float]): The outer normal of the wall.
+        Returns:
+            Wall: The invisible wall.
+
+        Example:
+            Seal a simulation box with four side walls::
+
+                scene.add.invisible.wall([1, 0, 0], [-1, 0, 0])
+                scene.add.invisible.wall([-1, 0, 0], [1, 0, 0])
+                scene.add.invisible.wall([0, 0, 1], [0, 0, -1])
+                scene.add.invisible.wall([0, 0, -1], [0, 0, 1])
+        """
+        wall = Wall().add(position, normal)
+        self._scene.wall_list.append(wall)
+        return wall
+
+
+class ObjectAdder:
+    """Factory for introducing meshes into a :class:`Scene`.
+
+    Reached as ``scene.add``. Calling it returns an :class:`Object` that can
+    be chained with transforms, pins, and colors. Invisible colliders live
+    under ``scene.add.invisible``.
+
+    Example:
+        Drop a cloth sheet and an invisible ground wall into a scene::
+
+            scene = app.scene.create()
+            scene.add("sheet").at(0, 0.6, 0)
+            scene.add.invisible.wall([0, 0, 0], [0, 1, 0])
+            fixed = scene.build()
+    """
+
+    def __init__(self, scene: "Scene"):
+        self._scene = scene
+        self.invisible = InvisibleAdder(
+            scene
+        )  #: InvisibleAdder: The invisible object adder.
+
+    def __call__(self, mesh_name: str, ref_name: str = "") -> "Object":
+        """Add a mesh to the scene.
+
+        Args:
+            mesh_name (str): The name of the mesh to add.
+            ref_name (str, optional): The reference name of the object.
+
+        Returns:
+            Object: The added object.
+
+        Example:
+            Drop two instances of a registered asset into the scene,
+            the second as a static collider::
+
+                scene = app.scene.create()
+                scene.add("sheet").at(0, 0.6, 0)
+                scene.add("sphere").at(0, 0, 0).pin()  # static collider
+                scene = scene.build()
+        """
+        if ref_name == "":
+            ref_name = mesh_name
+            count = 0
+            while ref_name in self._scene.object_dict:
+                count += 1
+                ref_name = f"{mesh_name}_{count}"
+        mesh_list = self._scene.asset_manager.list()
+        if mesh_name not in mesh_list:
+            raise Exception(f"mesh_name '{mesh_name}' does not exist")
+        elif ref_name in self._scene.object_dict:
+            raise Exception(f"ref_name '{ref_name}' already exists")
+        else:
+            obj = Object(self._scene.asset_manager, mesh_name)
+            self._scene.object_dict[ref_name] = obj
+            # Auto-set UV from asset if available
+            asset_data = self._scene.asset_manager.fetch.get(mesh_name)
+            if "UV" in asset_data and "F" in asset_data:
+                vertex_uv = asset_data["UV"]
+                faces = asset_data["F"]
+                # Convert vertex UV to per-face UV via Rust kernel; emits
+                # an (n_face, 3, 2) array. set_uv expects a list of (3,2)
+                # arrays so we wrap with `list(...)` (an O(n) shallow
+                # iteration over a numpy view, no per-element append).
+                uv_arr = _rust.scene_face_uv_expand(
+                    np.ascontiguousarray(vertex_uv, dtype=np.float64),
+                    np.ascontiguousarray(faces, dtype=np.int64),
+                )
+                obj.set_uv(list(uv_arr))
+            return obj
+
+
+class Scene:
+    """A scene class.
+
+    A ``Scene`` collects objects, pins, invisible colliders, and stitch data,
+    then compiles them into a :class:`FixedScene` via :meth:`build`.
+
+    Example:
+        Build a tiny drape scene from registered assets::
+
+            scene = app.scene.create()
+            sheet = scene.add("sheet").at(0, 0.6, 0)
+            sheet.pin(sheet.grab([-1, 0, -1]) + sheet.grab([1, 0, -1]))
+            scene.add("sphere").at(0, 0, 0).pin()
+            fixed = scene.build().report()
+    """
+
+    def __init__(self, name: str, plot: Optional[PlotManager], asset: AssetManager):
+        self._name = name
+        self._plot = plot
+        self._asset = asset
+        self._object: dict[str, Object] = {}
+        self._sphere: list[Sphere] = []
+        self._wall: list[Wall] = []
+        self._surface_map_by_name: dict[str, tuple] = {}
+        self._cross_stitch: list[dict] = []
+        # Tie constraints, one dict per Scene.tie call.
+        self._tie: list[dict] = []
+        # Keyframe times shared by every animated material in this scene.
+        # Empty means no object animates a material, which writes no
+        # bin/param_anim and leaves the solver on its build-time tables.
+        self._param_anim_times: list[float] = []
+        #: ForceField: The external force field (field objects and exact scripts).
+        self.force_field = ForceField()
+        self.add = ObjectAdder(self)  #: ObjectAdder: The object adder.
+        self.info = SceneInfo(name, self)  #: SceneInfo: The scene information.
+
+    def clear(self) -> "Scene":
+        """Clear all objects from the scene.
+
+        Returns:
+            Scene: The cleared scene.
+
+        Example:
+            Start from a blank slate before re-adding objects::
+
+                scene.clear()
+                scene.add("sheet").at(0, 0.6, 0)
+        """
+        self._object.clear()
+        return self
+
+    def set_surface_map(
+        self,
+        name: str,
+        tri_indices: np.ndarray,
+        coefs: np.ndarray,
+        surf_tri: np.ndarray,
+    ):
+        """Store frame-embedding surface mapping for a tetrahedralized object.
+
+        Args:
+            name: Object UUID key.
+            tri_indices: Closest triangle index in tet surface per original vertex (N,).
+            coefs: Frame coefficients (c1, c2, c3) per original vertex (N, 3).
+            surf_tri: Surface triangles of the tet mesh (Q, 3).
+
+        Example:
+            Typically invoked internally by the Blender add-on decoder when a
+            TetMesh is registered, but can be called directly to attach a
+            surface map::
+
+                scene.set_surface_map("obj-uuid", tri_idx, coefs, surf_tri)
+        """
+        _rust.scene_validate_surface_map_key(name)
+        self._surface_map_by_name[name] = (tri_indices, coefs, surf_tri)
+
+    def select(self, name: str) -> "Object":
+        """Select an object from the scene by its name.
+
+        Args:
+            name (str): The reference name of the object to select.
+
+        Returns:
+            Object: The selected object.
+
+        Example:
+            Adjust an already-added object by ref name::
+
+                scene.add("sheet")
+                sheet = scene.select("sheet")
+                sheet.at(0, 0.6, 0)
+        """
+        _rust.scene_validate_scene_select(name in self._object, name)
+        return self._object[name]
+
+    def _axis_bound(self, axis: str, is_min: bool) -> float:
+        """Compute the min or max vertex coordinate along an axis.
+
+        ``is_min`` selects the reduction (True for the lower bound, False
+        for the upper bound). Both :meth:`min` and :meth:`max` delegate
+        here so the per-object gather/cumsum/concat path is defined once.
+        """
+        ax = _rust.scene_axis_letter_to_index(axis)
+        # Stack every object's vertices into a single (sum_n, 3) buffer
+        # plus per-object cumulative offsets, then let Rust compute the
+        # bound in one pass. Cumulative offsets come from `np.cumsum` on
+        # the per-object vertex counts (single C-level allocation).
+        per_obj_vert = [
+            v for v in (obj.vertex(True) for obj in self._object.values())
+            if v is not None
+        ]
+        if not per_obj_vert:
+            return _rust.scene_reduce_axis_bound([], "min" if is_min else "max")
+        counts = np.asarray([len(v) for v in per_obj_vert], dtype=np.int64)
+        offsets = np.concatenate(([0], np.cumsum(counts))).tolist()
+        flat = np.concatenate([np.asarray(v, dtype=np.float64) for v in per_obj_vert])
+        return _rust.scene_per_object_axis_bound(
+            np.ascontiguousarray(flat, dtype=np.float64),
+            offsets,
+            ax,
+            is_min,
+        )
+
+    def min(self, axis: str) -> float:
+        """Get the minimum value of the scene along a specific axis.
+
+        Args:
+            axis (str): The axis to get the minimum value along, either "x", "y", or "z".
+
+        Returns:
+            float: The minimum vertex coordinate along the specified axis.
+
+        Example:
+            Place a ground wall just below the lowest vertex::
+
+                y_min = scene.min("y")
+                scene.add.invisible.wall([0, y_min - 0.01, 0], [0, 1, 0])
+        """
+        return self._axis_bound(axis, True)
+
+    def max(self, axis: str) -> float:
+        """Get the maximum value of the scene along a specific axis.
+
+        Args:
+            axis (str): The axis to get the maximum value along, either "x", "y", or "z".
+
+        Returns:
+            float: The maximum vertex coordinate along the specified axis.
+
+        Example:
+            Place a ceiling wall just above the highest vertex::
+
+                y_max = scene.max("y")
+                scene.add.invisible.wall([0, y_max + 0.01, 0], [0, -1, 0])
+        """
+        return self._axis_bound(axis, False)
+
+    @property
+    def sphere_list(self) -> list[Sphere]:
+        """Get the list of spheres.
+
+        Example:
+            Enumerate invisible sphere colliders currently on the scene::
+
+                for sphere in scene.sphere_list:
+                    print(sphere.entry)
+        """
+        return self._sphere
+
+    @property
+    def wall_list(self) -> list[Wall]:
+        """Get the list of walls.
+
+        Example:
+            Enumerate invisible wall colliders currently on the scene::
+
+                for wall in scene.wall_list:
+                    print(wall.normal, wall.entry)
+        """
+        return self._wall
+
+    @property
+    def object_dict(self) -> dict[str, "Object"]:
+        """Get the object dictionary.
+
+        Example:
+            Iterate every added object by its reference name::
+
+                for name, obj in scene.object_dict.items():
+                    print(name, obj.obj_type)
+        """
+        return self._object
+
+    @property
+    def asset_manager(self) -> AssetManager:
+        """Get the asset manager.
+
+        Example:
+            Reach into the asset manager attached to this scene::
+
+                mgr = scene.asset_manager
+                print(mgr.list())
+        """
+        return self._asset
+
+    def set_param_anim_times(self, times: list[float]) -> "Scene":
+        """Set the keyframe times shared by every animated material in the scene.
+
+        Args:
+            times (list[float]): Times in seconds, strictly increasing. Each
+                object's ``set_param_anim`` values align to these, in order.
+
+        Returns:
+            Scene: This scene, for chaining.
+        """
+        t = [float(x) for x in times]
+        if any(b <= a for a, b in zip(t, t[1:])):
+            raise ValueError(f"param_anim_times must be strictly increasing, got {t}")
+        self._param_anim_times = t
+        return self
+
+    def cross_stitch(
+        self,
+        source: str,
+        target: str,
+        ind,
+        w,
+        stiffness: float = 1.0,
+        rest_length=None,
+    ) -> "Scene":
+        """Stitch points on one object to points on another.
+
+        Each row of ``ind`` and ``w`` is one stitch between a point on
+        ``source`` and a point on ``target``. Slots 0..2 name three vertices
+        of ``source`` and slots 3..5 three vertices of ``target``, each in
+        that object's own vertex numbering (a tetrahedral object's is its
+        tetrahedral mesh), and ``w`` holds each point's barycentric weights,
+        which sum to one on each side. A point at a single vertex ``i`` is
+        ``[i, i, i]`` with weights ``[1, 0, 0]``. The solver pulls the two
+        points together with a spring whose rest length, unless
+        ``rest_length`` gives one, comes from the contact gaps of the six
+        vertices, so the seam closes to contact distance rather than to zero.
+
+        This is a soft stitch, not a weld: both objects keep their own
+        vertices and contact still applies between them. Each call adds a set
+        of stitches, and a pair of objects may be stitched more than once.
+        A seam WITHIN one object is :meth:`Object.stitch`.
+
+        An object a stitch names is always simulated, because a stitch joins
+        simulated vertices only. A fully pinned object with no pin operations
+        would otherwise become a static collision mesh; here it stays
+        simulated with every vertex held at rest by its pins, so it can serve
+        as a fixed anchor for the seam.
+
+        Args:
+            source (str): Reference name of the object the slots 0..2 name.
+            target (str): Reference name of the object the slots 3..5 name.
+            ind: ``(K, 6)`` integer vertex indices.
+            w: ``(K, 6)`` barycentric weights, each non-negative, with
+                ``w[:, 0:3]`` and ``w[:, 3:6]`` each summing to one per row.
+            stiffness (float, optional): Force factor of every stitch in this
+                set, applied as is with no mass or time-step scaling. Zero
+                keeps the stitches and applies no force. Defaults to 1.0.
+
+        Returns:
+            Scene: This scene, for chaining.
+
+        Raises:
+            ValueError: If an object is unknown, both names are the same
+                object, an object has no vertices a stitch can hold, or
+                ``ind``, ``w`` or ``stiffness`` violate the shapes, ranges
+                or sums above.
+
+        Example:
+            Stitch every vertex along a sleeve's cuff to the closest points
+            of a shirt, then hold the shirt fixed::
+
+                scene.add("shirt").pin()
+                scene.add("sleeve")
+                ind = [[i, i, i, *tri] for i, tri in zip(cuff, shirt_tris)]
+                w = [[1, 0, 0, *bary] for bary in shirt_barys]
+                scene.cross_stitch("sleeve", "shirt", ind, w, stiffness=10.0)
+        """
+        labels = {n: self._label(n, self.select(n)) for n in (source, target)}
+        if source == target:
+            raise ValueError(
+                f"a cross-stitch joins two objects, and both sides name "
+                f"'{labels[source]}'; a seam within one object is Object.stitch"
+            )
+        counts = []
+        for side, name in (("source", source), ("target", target)):
+            obj = self.select(name)
+            if obj.obj_type not in ("tri", "tet", "rod"):
+                raise ValueError(
+                    f"cross-stitch {side} '{labels[name]}' is a '{obj.obj_type}' "
+                    "object; a stitch holds the vertices of a surface, a "
+                    "tetrahedral mesh or a rod"
+                )
+            counts.append(len(obj.get("V")))
+        ind_arr = np.asarray(ind)
+        w_arr = np.asarray(w, dtype=np.float64)
+        if ind_arr.ndim != 2 or ind_arr.shape[1] != 6 or ind_arr.shape[0] == 0:
+            raise ValueError(
+                f"cross-stitch ind must be (K, 6) with K > 0, got shape "
+                f"{ind_arr.shape}"
+            )
+        if w_arr.shape != ind_arr.shape:
+            raise ValueError(
+                f"cross-stitch w has shape {w_arr.shape} but ind has "
+                f"{ind_arr.shape}; they hold one weight per index"
+            )
+        if not np.issubdtype(ind_arr.dtype, np.integer):
+            raise ValueError(
+                f"cross-stitch ind must hold integers, got {ind_arr.dtype}"
+            )
+        ind_arr = ind_arr.astype(np.int64)
+        for side, name, cols, n_vert in (
+            ("source", source, slice(0, 3), counts[0]),
+            ("target", target, slice(3, 6), counts[1]),
+        ):
+            side_ind = ind_arr[:, cols]
+            if side_ind.min() < 0 or side_ind.max() >= n_vert:
+                raise ValueError(
+                    f"cross-stitch {side} indices span "
+                    f"[{int(side_ind.min())}, {int(side_ind.max())}] but "
+                    f"'{labels[name]}' has {n_vert} vertices"
+                )
+            side_w = w_arr[:, cols]
+            if not np.all(np.isfinite(side_w)) or side_w.min() < 0.0:
+                raise ValueError(
+                    f"cross-stitch {side} weights must be finite and "
+                    "non-negative"
+                )
+            sums = side_w.sum(axis=1)
+            worst = int(np.argmax(np.abs(sums - 1.0)))
+            if abs(sums[worst] - 1.0) > 1e-4:
+                raise ValueError(
+                    f"cross-stitch {side} weights of row {worst} sum to "
+                    f"{float(sums[worst])}; each side is a barycentric point "
+                    "and sums to one"
+                )
+        stiffness = float(stiffness)
+        if not np.isfinite(stiffness) or stiffness < 0.0:
+            raise ValueError(
+                f"cross-stitch stiffness must be finite and non-negative, got "
+                f"{stiffness}"
+            )
+        # Resolved now so a malformed rest length is refused at the call
+        # that names it; the build resolves it again against the rows.
+        _stitch_rest_rows(
+            rest_length,
+            int(ind_arr.shape[0]),
+            f"cross-stitch '{labels[source]}' to '{labels[target]}'",
+        )
+        if rest_length is not None and not isinstance(rest_length, str):
+            rest_length = np.array(rest_length, dtype=np.float64)
+        self._cross_stitch.append(
+            {
+                "source_name": source,
+                "target_name": target,
+                "ind": ind_arr,
+                "w": w_arr,
+                "stitch_stiffness": stiffness,
+                "rest_length": rest_length,
+            }
+        )
+        return self
+
+    def tie(
+        self,
+        source: str,
+        vertex,
+        targets,
+        ind,
+        w,
+        target_of=None,
+    ) -> "Scene":
+        """Hold vertices of one object exactly on affine combinations of others.
+
+        Each held vertex ``source[vertex[k]]`` is constrained to
+        ``sum_i w[k, i] * x(target_of[k, i], ind[k, i])``, with each row of
+        ``w`` summing to one. The held vertex owns no degree of freedom: it
+        moves exactly with its controllers, its mass and forces act on them,
+        and no stiffness is involved. Weights may lie outside ``[0, 1]``,
+        which is how a point above a surface or a yarn layer is reached; use
+        :func:`frontend.tie_weights` to compute least-norm weights over nearby
+        vertices. Contact between the held vertex and everything else,
+        its controllers included, stays on.
+
+        A held vertex may not be pinned and may not control another tie, and
+        a scene with ties is solved with the block-Jacobi preconditioner
+        (Cosserat rods are supported; PDRD bodies and Lock Translation or
+        Rotation are refused beside ties).
+
+        Args:
+            source (str): Reference name of the object whose vertices are held.
+            vertex: ``(N,)`` held vertices, local to ``source``.
+            targets (str or list[str]): The controller objects.
+            ind: ``(N, K)`` controller vertices, ``K <= 8``, each local to its
+                target object.
+            w: ``(N, K)`` affine weights, each row summing to one. A zero
+                weight leaves its slot unused.
+            target_of: ``(N, K)`` index into ``targets`` per slot; omitted
+                when ``targets`` names one object.
+
+        Returns:
+            Scene: This scene, for chaining.
+
+        Raises:
+            ValueError: On a malformed row, an out-of-range index, a row whose
+                weights do not sum to one, or a vertex held twice.
+
+        Example:
+            Hold a floss vertex at a combination of four ground vertices::
+
+                scene.tie("floss", [10], "ground", [[3, 4, 9, 10]],
+                          [[0.4, 0.3, -0.2, 0.5]])
+        """
+        if isinstance(targets, str):
+            targets = [targets]
+        targets = list(targets)
+        for name in [source, *targets]:
+            obj = self.select(name)
+            if obj.obj_type not in ("tri", "tet", "rod"):
+                raise ValueError(
+                    f"tie object '{self._label(name, obj)}' is a "
+                    f"'{obj.obj_type}' object; a tie holds the vertices of a "
+                    "surface, a tetrahedral mesh or a rod"
+                )
+        vertex_arr = np.asarray(vertex)
+        ind_arr = np.asarray(ind)
+        w_arr = np.asarray(w, dtype=np.float64)
+        if vertex_arr.ndim != 1 or len(vertex_arr) == 0:
+            raise ValueError(f"tie vertex must be (N,) with N > 0, got {vertex_arr.shape}")
+        n = len(vertex_arr)
+        if ind_arr.ndim != 2 or ind_arr.shape[0] != n or not 1 <= ind_arr.shape[1] <= TIE_SLOTS:
+            raise ValueError(
+                f"tie ind must be (N, K) with N = {n} and 1 <= K <= {TIE_SLOTS}, got "
+                f"{ind_arr.shape}"
+            )
+        if w_arr.shape != ind_arr.shape:
+            raise ValueError(f"tie w has shape {w_arr.shape} but ind has {ind_arr.shape}")
+        if not np.issubdtype(ind_arr.dtype, np.integer) or not np.issubdtype(
+            vertex_arr.dtype, np.integer
+        ):
+            raise ValueError("tie vertex and ind must hold integers")
+        if target_of is None:
+            if len(targets) != 1:
+                raise ValueError(
+                    "tie target_of is required when targets names more than one object"
+                )
+            target_of_arr = np.zeros(ind_arr.shape, dtype=np.int64)
+        else:
+            target_of_arr = np.asarray(target_of, dtype=np.int64)
+            if target_of_arr.shape != ind_arr.shape:
+                raise ValueError(
+                    f"tie target_of has shape {target_of_arr.shape} but ind has "
+                    f"{ind_arr.shape}"
+                )
+            if target_of_arr.min() < 0 or target_of_arr.max() >= len(targets):
+                raise ValueError(
+                    f"tie target_of spans [{int(target_of_arr.min())}, "
+                    f"{int(target_of_arr.max())}] but {len(targets)} targets are named"
+                )
+        n_source = len(self.select(source).get("V"))
+        if vertex_arr.min() < 0 or vertex_arr.max() >= n_source:
+            raise ValueError(
+                f"tie vertices span [{int(vertex_arr.min())}, {int(vertex_arr.max())}] but "
+                f"'{self._label(source, self.select(source))}' has {n_source} vertices"
+            )
+        for k, name in enumerate(targets):
+            sel = target_of_arr == k
+            if sel.any():
+                count = len(self.select(name).get("V"))
+                used = ind_arr[sel]
+                if used.min() < 0 or used.max() >= count:
+                    raise ValueError(
+                        f"tie controllers in '{self._label(name, self.select(name))}' "
+                        f"span [{int(used.min())}, {int(used.max())}] but it has "
+                        f"{count} vertices"
+                    )
+        if not np.all(np.isfinite(w_arr)):
+            raise ValueError("tie weights must be finite")
+        sums = w_arr.sum(axis=1)
+        worst = int(np.argmax(np.abs(sums - 1.0)))
+        if abs(sums[worst] - 1.0) > 1e-5:
+            raise ValueError(
+                f"tie weights of row {worst} sum to {float(sums[worst])}; a tie is an "
+                "affine combination and its weights sum to one"
+            )
+        if len(np.unique(vertex_arr)) != n:
+            raise ValueError("tie holds one vertex twice in one call")
+        self._tie.append(
+            {
+                "source_name": source,
+                "vertex": vertex_arr.astype(np.int64),
+                "targets": targets,
+                "ind": ind_arr.astype(np.int64),
+                "w": w_arr,
+                "target_of": target_of_arr,
+            }
+        )
+        return self
+
+    def _resolve_ties(self, map_by_name, vertex_world):
+        """Map every tie to solver vertex indices and check it holds at rest.
+
+        Returns ``(vertex (N,), ind (N, TIE_SLOTS), w (N, TIE_SLOTS))``. A
+        shorter row is padded with weight zero on a repeat of its first
+        controller. A held vertex built off its tie is refused rather than
+        pulled onto it by the solver, which would kick it with a velocity.
+        """
+        rows_v, rows_i, rows_w = [], [], []
+        for tie in self._tie:
+            src = np.asarray(map_by_name[tie["source_name"]], dtype=np.int64)
+            held = src[tie["vertex"]]
+            n, k = tie["ind"].shape
+            glob = np.empty((n, k), dtype=np.int64)
+            for t, name in enumerate(tie["targets"]):
+                sel = tie["target_of"] == t
+                glob[sel] = np.asarray(map_by_name[name], dtype=np.int64)[tie["ind"][sel]]
+            ind = np.repeat(glob[:, :1], TIE_SLOTS, axis=1)
+            w = np.zeros((n, TIE_SLOTS), dtype=np.float64)
+            ind[:, :k] = glob
+            w[:, :k] = tie["w"]
+            rows_v.append(held)
+            rows_i.append(ind)
+            rows_w.append(w)
+        vertex = np.concatenate(rows_v)
+        ind = np.concatenate(rows_i)
+        w = np.concatenate(rows_w)
+        if len(np.unique(vertex)) != len(vertex):
+            raise ValueError("a vertex is held by two ties; a vertex is held by one tie")
+        target = np.einsum("nk,nkd->nd", w, vertex_world[ind])
+        miss = np.linalg.norm(target - vertex_world[vertex], axis=1)
+        scale = max(1.0, float(np.abs(vertex_world).max()))
+        worst = int(np.argmax(miss))
+        if miss[worst] > 1e-6 * scale:
+            raise ValueError(
+                f"tie of solver vertex {int(vertex[worst])} misses its combination by "
+                f"{float(miss[worst]):.3e} at rest; build the weights against the "
+                "positions the scene is built at (frontend.tie_weights)"
+            )
+        return vertex.astype(np.uint32), ind.astype(np.uint32), w.astype(np.float32)
+
+    @staticmethod
+    def _label(name: str, obj: "Object") -> str:
+        """The name a refusal gives the object keyed `name`.
+
+        A scene decoded from the Blender add-on keys its objects by UUID and
+        records each Blender name on the object (`_statistics_name`); a
+        notebook's key is already the name it chose.
+        """
+        return getattr(obj, "_statistics_name", "") or name
+
+    @staticmethod
+    def _flag(obj: "Object", key: str) -> bool:
+        """Whether ``obj`` carries the float-encoded boolean ``key`` set."""
+        return key in obj.param.key_list() and float(obj.param.get(key)) != 0.0
+
+    @staticmethod
+    def _forms_own_pairs(obj: "Object") -> bool:
+        """Whether two elements of ``obj`` can be in contact with each other.
+
+        False for a static object, which is a collision mesh, for a PDRD body,
+        whose elements never move against each other, and for an object that
+        allows its own intersections.
+        """
+        return not (
+            obj.static or obj.pdrd or Scene._flag(obj, "allow-self-intersection")
+        )
+
+    def _contact_gap_limits(self) -> dict[str, GapLimit]:
+        """Each object's ``contact-gap-limit``, resolved onto its elements.
+
+        Keyed by the scene's object key and holding only the objects the limit
+        applies to: one that sets it, has triangles or rod segments to measure,
+        and does not allow its own intersections. A static collider and a PDRD
+        body form no pair among their own elements, but the limit holds them
+        all the same: it keeps the gap at the scale of the mesh, so a gap
+        sized from a large object's bounding box does not reach far past its
+        elements. Every object's value is checked all the same, so a fraction
+        that is out of range is refused whether or not it would have applied.
+
+        The room is measured against the LARGEST contact offset the object
+        takes, animated values and a map's target included, so the bound holds
+        at every frame and every element without becoming a schedule itself.
+
+        The rule and the paper it follows, Gomez-Nogales et al., "Unlocking
+        Thickness Modeling for Codimensional Contact Simulation"
+        (arXiv:2510.10256), are stated in ``frontend/_contact_gap_limit_.py``.
+        """
+        limits: dict[str, GapLimit] = {}
+        for name, obj in self._object.items():
+            label = self._label(name, obj)
+            key = "contact-gap-limit"
+            if key in obj.param_anim or key in obj.param_spatial:
+                raise ValueError(
+                    f"'{label}' animates or maps '{key}', which is one "
+                    "fraction per object. Animate or map 'contact-gap' "
+                    "instead; the limit holds every value it takes."
+                )
+            fraction = validated_fraction(obj.param.get(key), label)
+            if fraction == 0.0 or self._flag(obj, "allow-self-intersection"):
+                continue
+            elements = obj.get("E") if obj.obj_type == "rod" else obj.get("F")
+            if elements is None or not len(elements):
+                continue
+            offsets = [float(obj.param.get("contact-offset"))] + [
+                float(v) for v in obj.param_anim.get("contact-offset", [])
+            ]
+            mapped = obj.param_spatial.get("contact-offset")
+            if mapped is not None:
+                offsets.append(float(mapped[2]))
+            limits[name] = resolve_gap_limit(
+                fraction, obj.vertex(False), elements, max(offsets)
+            )
+        return limits
+
+    def _contact_gap_participants(
+        self, gap_limits: dict[str, GapLimit]
+    ) -> list[GapParticipant]:
+        """What a contact pair can be formed with in this scene, and its gap.
+
+        An object's gap is the smallest value its ``contact-gap`` takes,
+        animated values and a spatial map included. A map blends each element
+        from the object's value toward its target by a weight, so the smallest
+        blend is reached at one end of the value's range and one end of the
+        weights' range. A contact gap limit lowers an element to its bound, so
+        the smallest gap is the smaller of that and the smallest bound, and
+        the participant records the bound when it is the one that counts. A
+        static object is a collision mesh, which has
+        no pair with itself or with another collider, and neither has a PDRD
+        body with itself. An object that allows its own intersections has no
+        pair with itself, and one that allows intersections with other objects
+        or other groups is left out of the pairs across objects, since which
+        of those the allowance covers is the allowance rule's to say.
+        """
+        flag = self._flag
+
+        def smallest_gap(obj: "Object") -> float:
+            values = [float(obj.param.get("contact-gap"))] + [
+                float(v) for v in obj.param_anim.get("contact-gap", [])
+            ]
+            mapped = obj.param_spatial.get("contact-gap")
+            if mapped is None:
+                return min(values)
+            target = mapped[2]
+            reduced = obj._reduced_weights("contact-gap", obj.map_element_key)
+            weights = (
+                min(float(w.min()) for w in reduced),
+                max(float(w.max()) for w in reduced),
+            )
+            return min(
+                value + (target - value) * weight
+                for value in (min(values), max(values))
+                for weight in weights
+            )
+
+        participants = []
+        for name, obj in self._object.items():
+            gap = smallest_gap(obj)
+            limit = ""
+            bounded = gap_limits.get(name)
+            tightest = bounded.tightest() if bounded is not None else None
+            if tightest is not None and bounded.bound[tightest] < gap:
+                gap = float(bounded.bound[tightest])
+                limit = bounded.describe(tightest)
+            if obj.static:
+                role = "collider"
+            elif obj.pdrd:
+                role = "rigid"
+            else:
+                role = "solved"
+            participants.append(
+                GapParticipant(
+                    label=self._label(name, obj),
+                    gap=gap,
+                    role=role,
+                    own_pairs=self._forms_own_pairs(obj),
+                    cross_pairs=not (
+                        flag(obj, "allow-inter-object-intersection")
+                        or flag(obj, "allow-inter-group-intersection")
+                    ),
+                    limit=limit,
+                )
+            )
+        for kind, colliders in (("wall", self._wall), ("sphere", self._sphere)):
+            for i, collider in enumerate(colliders):
+                participants.append(
+                    GapParticipant(
+                        label=f"invisible {kind} {i + 1}",
+                        gap=float(collider.param.list()["contact-gap"]),
+                        role="analytic",
+                    )
+                )
+        return participants
+
+    @staticmethod
+    def _check_static_material(name: str, obj: "Object") -> None:
+        """Refuse a varying material on an object built as a collision mesh.
+
+        A static object (every vertex pinned, and no pin carrying an
+        operation, a pull or a release time) leaves the solved vertices for a
+        contact-only collision mesh, whose parameters are one value per face,
+        written once at build. An animated value has no per-frame table to
+        reach there and a spatial map is never reduced onto those faces, so
+        building the object would run the solve on its plain parameters with
+        nothing to say the rest was dropped.
+        """
+        if not obj.static:
+            return
+        name = Scene._label(name, obj)
+        varying = sorted(set(obj.param_anim) | set(obj.param_spatial))
+        if varying:
+            raise ValueError(
+                f"'{name}' is built as a static collision mesh (every vertex "
+                "pinned and no pin operation, pull or release), whose "
+                "parameters are fixed at build, but it animates or maps "
+                f"{', '.join(repr(k) for k in varying)}. Remove the animation "
+                "and the map, or give one of its pins an operation, a pull or "
+                "a release time so it is simulated."
+            )
+
+    @staticmethod
+    def _check_rest_shape_tracking(name: str, obj: "Object") -> None:
+        """Refuse rest-shape tracking that would move only part of `obj`.
+
+        The builder applies each tracking pin's operations to the rest shape
+        of the vertices that pin holds and leaves every other vertex at its
+        build-time rest. Tracking pins that do not together hold the whole
+        object would therefore give a rest shape moved on one side of a
+        boundary and fixed on the other, whose elastic energy tears along it.
+        A tracking pin with no operation schedules no keyframe at all.
+        """
+        tracking = [p for p in obj.pin_list if p.rest_shape_track]
+        if not tracking:
+            return
+        key, name = name, Scene._label(name, obj)
+        idle = [p.pin_group_id for p in tracking if not p.operations]
+        if idle:
+            # A decoded pin's group id is "<object uuid>:<vertex group>".
+            pin = str(idle[0]).removeprefix(f"{key}:")
+            raise ValueError(
+                f"'{name}': pin '{pin}' tracks the rest shape but carries no "
+                "operation to track"
+            )
+        n_vert = len(obj.get("V"))
+        covered = np.unique(
+            np.concatenate([np.asarray(p.index, dtype=np.int64) for p in tracking])
+        )
+        if covered.size != n_vert or covered[0] != 0 or covered[-1] != n_vert - 1:
+            raise ValueError(
+                f"'{name}': the pins tracking its rest shape hold {covered.size} "
+                f"of its {n_vert} vertices; they must hold every vertex, or the "
+                "rest shape tears where the moved region meets the rest"
+            )
+        # Plasticity creeps the rest shape each step, and the solver replaces
+        # it wholesale with the tracked keyframes on the promise that the two
+        # never ship together, which is kept here.
+        keys = obj.param.key_list()
+        plastic = [
+            key for key in ("plasticity", "bend-plasticity")
+            if key in keys and (
+                float(obj.param.get(key) or 0.0) > 0.0
+                or key in obj.param_anim
+                or key in obj.param_spatial
+            )
+        ]
+        if plastic:
+            raise ValueError(
+                f"'{name}': its rest shape is tracked by a pin and it carries "
+                f"'{plastic[0]}'; both rewrite the rest shape, so set the "
+                "plasticity to 0 or stop tracking"
+            )
+
+    @staticmethod
+    def _check_bend_rest_anim(name: str, obj: "Object") -> None:
+        """Refuse an animated bending rest shape that cannot be honored.
+
+        Bend plasticity creeps each hinge's rest angle every step, and the
+        animated bending rest shape overwrites the same angles every step, so
+        an object may carry one or the other. The keyframe vertices must line
+        up one to one with the object's own.
+        """
+        anim = getattr(obj, "_bend_rest_vert_anim", None)
+        if anim is None:
+            return
+        label = Scene._label(name, obj)
+        n_vert = len(obj.get("V"))
+        if anim.shape[1] != n_vert:
+            raise ValueError(
+                f"'{label}': its animated bending rest shape has "
+                f"{anim.shape[1]} vertices per keyframe but the object has {n_vert}"
+            )
+        keys = obj.param.key_list()
+        if "bend-plasticity" in keys and (
+            float(obj.param.get("bend-plasticity") or 0.0) > 0.0
+            or "bend-plasticity" in obj.param_anim
+            or "bend-plasticity" in obj.param_spatial
+        ):
+            raise ValueError(
+                f"'{label}': its bending rest angle is animated and it carries "
+                "'bend-plasticity'; both rewrite the rest angle, so set the bend "
+                "plasticity to 0 or stop animating the rest angle"
+            )
+
+    def build(self, progress_callback=None, quiet: bool = False) -> FixedScene:
+        """Build the fixed scene from the current scene.
+
+        Args:
+            progress_callback: Optional callable ``f(fraction, step_info)`` invoked as the build progresses.
+            quiet: When True, suppress the merge-pair and scene-check diagnostic prints. Batch/headless drivers that already pass a ``progress_callback`` can set this to silence the bare stdout logs. Defaults to False, preserving the interactive output.
+
+        Returns:
+            FixedScene: The built fixed scene.
+
+        Example:
+            Compile the scene and chain a summary print::
+
+                fixed = scene.build().report()
+                session = app.session.create(fixed).build()
+        """
+        total_steps = 13
+        completed_steps = 0
+
+        def report(step_info: str):
+            if progress_callback is not None:
+                progress_callback(completed_steps / total_steps, step_info)
+
+        def advance(step_info: str):
+            nonlocal completed_steps
+            completed_steps += 1
+            if progress_callback is not None:
+                progress_callback(completed_steps / total_steps, step_info)
+
+        pbar = tqdm(total=total_steps, desc="build scene")
+        report("Building scene: preparing objects...")
+        stitched = {
+            cs[side]
+            for cs in self._cross_stitch
+            for side in ("source_name", "target_name")
+        }
+        # A tie joins simulated vertices only, as a stitch does, so every
+        # object it names stays simulated.
+        stitched |= {t["source_name"] for t in self._tie}
+        stitched |= {name for t in self._tie for name in t["targets"]}
+        for name, obj in self._object.items():
+            if name in stitched and obj.pdrd:
+                raise ValueError(
+                    f"'{self._label(name, obj)}' is a PDRD body and a "
+                    "cross-stitch names it; a "
+                    "PDRD body moves as one rigid transform, which a stitch "
+                    "cannot hold"
+                )
+            obj.update_static(stitched=name in stitched)
+            self._check_static_material(name, obj)
+            self._check_rest_shape_tracking(name, obj)
+            self._check_bend_rest_anim(name, obj)
+        pbar.update(1)
+        advance("Building scene: preparing objects...")
+
+        dyn_objects = [
+            (name, obj) for name, obj in self._object.items() if not obj.static
+        ]
+        n = len(dyn_objects)
+        for i, (_, obj) in enumerate(dyn_objects):
+            r, g, b = colorsys.hsv_to_rgb(i / n, 0.75, 1.0)
+            if obj.object_color is None:
+                obj.default_color(r, g, b)
+
+        # Rod/shell/finalize index-map construction via the Rust kernel.
+        # The per-object dict packaging is a single list comprehension
+        # (no .append in a loop).
+        def _pack_rust_object(name, obj):
+            vert = obj.get("V")
+            if vert is None:
+                return None
+            edge = obj.get("E")
+            tri = obj.get("F")
+            tet = obj.get("T")
+            return {
+                "name": name,
+                "n_verts": int(len(vert)),
+                "edges": (
+                    np.ascontiguousarray(edge, dtype=np.int64)
+                    if edge is not None else None
+                ),
+                "faces": (
+                    np.ascontiguousarray(tri, dtype=np.int64)
+                    if tri is not None else None
+                ),
+                "tets": (
+                    np.ascontiguousarray(tet, dtype=np.int64)
+                    if tet is not None else None
+                ),
+            }
+
+        rust_objects = [
+            d for d in (_pack_rust_object(name, obj) for name, obj in dyn_objects)
+            if d is not None
+        ]
+
+        result = _rust.scene_build_index_map(rust_objects)
+        map_by_name = dict(result["map_by_name"])
+        concat_count = int(result["concat_count"])
+        rod_vert_start, rod_vert_end = result["rod_vert_range"]
+        shell_vert_start, shell_vert_end = result["shell_vert_range"]
+
+        # Draw-time visibility (Object.invisible), resolved onto the
+        # concatenated dynamic vertex buffer. Nothing downstream of the
+        # viewer reads it: a hidden object is assembled, validated, and
+        # handed to the solver exactly as a drawn one.
+        invisible_vert = np.zeros(concat_count, dtype=bool)
+        for name, obj in dyn_objects:
+            if not obj.visible:
+                invisible_vert[np.asarray(map_by_name[name], dtype=np.int64)] = True
+
+        pbar.update(3)
+        advance("Building scene: indexing rod topology...")
+        advance("Building scene: indexing shell topology...")
+        advance("Building scene: finalizing vertex map...")
+
+        # ----- Build kernel input: dyn_objects -----
+        # For each dynamic object, prepare numpy arrays the kernel reads.
+        # The per-object pin-index concat runs through Rust; the dyn_input
+        # dict is built via a list comprehension (single allocation, no
+        # incremental append). Velocity schedules + collision-window
+        # lookups are dict assignments, not list growth.
+        velocity_schedules: dict[str, Any] = {}
+        angular_velocity_schedules: dict[str, Any] = {}
+        angular_world_velocity_schedules: dict[str, Any] = {}
+        collision_windows: dict[str, Any] = {}
+        pinned_indices_by_name: dict[str, list[int]] = {}
+        # Single source of truth: the cap is defined once as a Rust
+        # constant (ppf_cts_core::datamodel::object::MAX_COLLISION_WINDOWS)
+        # and exported through the PyO3 module so this guard, the solver's
+        # collision-window table builder, and the GPU-side #define cannot
+        # drift apart.
+        MAX_COLLISION_WINDOWS = _rust.MAX_COLLISION_WINDOWS
+        for name, obj in dyn_objects:
+            pinned_indices_by_name[name] = _rust.scene_concat_i64_lists(
+                [list(p.index) for p in obj.pin_list]
+            ).tolist()
+            if obj._velocity_schedule:
+                velocity_schedules[name] = [
+                    (t, list(v)) for t, v in obj._velocity_schedule
+                ]
+            # Principal-axis angular overwrite: carry (pca_index, speed) into
+            # the dyn_param Vec3 slot as [pca_index, speed, 0.0]; the solver
+            # resolves the world axis from the live geometry each firing, so
+            # NO eigendecomposition happens here.
+            if obj._angular_velocity_schedule_pca:
+                angular_velocity_schedules[name] = [
+                    (t, [float(pca_index), float(speed), 0.0])
+                    for t, pca_index, speed in obj._angular_velocity_schedule_pca
+                ]
+            # Fixed world-axis angular: carry the full ω vector (solver space)
+            # into the dyn_param Vec3 slot; the solver applies it directly.
+            if obj._angular_velocity_schedule_world:
+                angular_world_velocity_schedules[name] = [
+                    (t, [float(v[0]), float(v[1]), float(v[2])])
+                    for t, v in obj._angular_velocity_schedule_world
+                ]
+            if obj._collision_windows:
+                if len(obj._collision_windows) > MAX_COLLISION_WINDOWS:
+                    raise ValueError(
+                        f"Object '{self._label(name, obj)}' has "
+                        f"{len(obj._collision_windows)} collision windows "
+                        f"(max {MAX_COLLISION_WINDOWS})"
+                    )
+                collision_windows[name] = obj._collision_windows
+
+        def _pack_dyn_input(name, obj):
+            edge = obj.get("E")
+            tri = obj.get("F")
+            tet = obj.get("T")
+            uv_list = obj.uv_coords
+            uv_arr = None
+            if uv_list is not None and len(uv_list):
+                uv_arr = np.ascontiguousarray(
+                    np.stack([np.asarray(u, dtype=np.float64).reshape(-1) for u in uv_list]),
+                    dtype=np.float64,
+                )
+            stitch_ind = obj.get("Ind")
+            stitch_w = obj.get("W")
+            color_arr = np.asarray(obj.get("color"), dtype=np.float64)
+            n_verts_obj = int(obj.vertex(False).shape[0])
+            if color_arr.ndim == 1 and color_arr.shape == (3,):
+                color_arr = np.broadcast_to(color_arr, (n_verts_obj, 3)).copy()
+            return {
+                "name": name,
+                "obj_type": obj.obj_type,
+                "vertex": np.ascontiguousarray(obj.vertex(False), dtype=np.float64),
+                "color": np.ascontiguousarray(color_arr, dtype=np.float64),
+                "velocity": list(obj.object_velocity),
+                "position": list(obj.position),
+                "edges": (
+                    np.ascontiguousarray(edge, dtype=np.int64)
+                    if edge is not None else None
+                ),
+                "faces": (
+                    np.ascontiguousarray(tri, dtype=np.int64)
+                    if tri is not None else None
+                ),
+                "tets": (
+                    np.ascontiguousarray(tet, dtype=np.int64)
+                    if tet is not None else None
+                ),
+                "uv": uv_arr,
+                "dynamic_color": int(obj.dynamic_color.value),
+                "dynamic_intensity": float(obj.dynamic_intensity),
+                "pinned_indices": pinned_indices_by_name[name],
+                "stitch_ind": (
+                    np.ascontiguousarray(stitch_ind, dtype=np.int64)
+                    if stitch_ind is not None else None
+                ),
+                "stitch_w": (
+                    np.ascontiguousarray(stitch_w, dtype=np.float64)
+                    if stitch_w is not None else None
+                ),
+                "stitch_stiffness": float(obj.param.get("stitch-stiffness")),
+                **_rest_inputs(
+                    getattr(obj, "_stitch_rest_length", None),
+                    0 if stitch_ind is None else len(stitch_ind),
+                    f"object '{name}' stitch",
+                ),
+            }
+
+        dyn_inputs = [_pack_dyn_input(name, obj) for name, obj in dyn_objects]
+
+        # ----- Build kernel input: static_objects -----
+        # List comprehension over the static-only filter; no incremental
+        # .append on the outer list.
+        def _pack_static_input(name, obj):
+            vert = obj.get("V")
+            tri = obj.get("F")
+            if vert is None or tri is None:
+                # Object.update_static keeps an object without vertices or
+                # faces solved, so reaching here is a broken invariant.
+                # Skipping it would remove an obstacle from the scene.
+                raise ValueError(
+                    f"'{self._label(name, obj)}' was classified static but has "
+                    f"no {'vertices' if vert is None else 'faces'}; the "
+                    "collision mesh holds triangles only"
+                )
+            color = obj.get("color")
+            return {
+                "name": name,
+                "vertex_world": np.ascontiguousarray(
+                    obj.apply_transform(vert, False), dtype=np.float64
+                ),
+                "color": [float(color[0]), float(color[1]), float(color[2])],
+                "faces": np.ascontiguousarray(tri, dtype=np.int64),
+                "position": list(obj.position),
+            }
+
+        static_inputs = [
+            _pack_static_input(name, obj)
+            for name, obj in self._object.items()
+            if obj.static
+        ]
+
+        # ----- dmap order: every object (dyn + static) in insertion order -----
+        dmap_order = [
+            (name, [float(x) for x in obj.position])
+            for name, obj in self._object.items()
+        ]
+        dmap = {name: i for i, (name, _) in enumerate(dmap_order)}
+
+        # ----- Cross-stitch validation + repackaging -----
+        # Rust validates every (source, target) pair against the known
+        # name set in one pass; the per-entry numpy reshape stays in
+        # Python because the inputs are heterogeneous arrays.
+        _rust.scene_validate_cross_stitch_names(
+            [(cs["source_name"], cs["target_name"]) for cs in self._cross_stitch],
+            list(map_by_name.keys()),
+        )
+        cross_stitches = [
+            {
+                "source_name": cs["source_name"],
+                "target_name": cs["target_name"],
+                "ind": np.ascontiguousarray(np.asarray(cs["ind"]), dtype=np.int64).reshape(-1, 6),
+                "w": np.ascontiguousarray(np.asarray(cs["w"]), dtype=np.float64).reshape(-1, 6),
+                "stitch_stiffness": float(cs.get("stitch_stiffness", 1.0)),
+                **_rest_inputs(
+                    cs.get("rest_length"),
+                    len(np.asarray(cs["ind"]).reshape(-1, 6)),
+                    f"cross-stitch '{cs['source_name']}' to '{cs['target_name']}'",
+                ),
+            }
+            for cs in self._cross_stitch
+        ]
+
+        # ----- Run the Rust assembly kernel -----
+        pbar.update(1)
+        advance("Building scene: gathering dynamic vertices...")
+        assembled = _rust.scene_build_fixed(
+            dyn_inputs,
+            static_inputs,
+            dmap_order,
+            map_by_name,
+            int(concat_count),
+            cross_stitches,
+        )
+
+        concat_displacement = assembled["concat_displacement"]
+
+        # ----- Lock Translation: one axis and one mode per dmap entry ---
+        # Aligned with concat_displacement (one row per object, dyn +
+        # static, in dmap order); a static object never sets
+        # ``_translation_lock`` or ``_translation_lock_all`` so its row
+        # stays the zero vector in the axis mode (disabled). Written to
+        # bin/translation_lock.bin and bin/translation_lock_mode.bin at
+        # export time.
+        #
+        # An all-axes object contributes a mode of TRANSLATION_LOCK_ALL
+        # over a row left at exactly zero: there is no direction to hold
+        # the center of mass along when it is pinned to a point, and the
+        # solver requires that canonical spelling. So the emptiness test
+        # below cannot be "some object has an axis": that would drop the
+        # whole file for a scene whose only locked objects lock all axes,
+        # and the solver would read it as unlocked with nothing to notice.
+        translation_lock = np.zeros((concat_displacement.shape[0], 3), dtype=np.float32)
+        translation_lock_mode = np.zeros(
+            (concat_displacement.shape[0],), dtype=np.uint32
+        )
+        has_translation_lock = False
+        for name, obj in dyn_objects:
+            axis = getattr(obj, "_translation_lock", None)
+            lock_all = bool(getattr(obj, "_translation_lock_all", False))
+            if lock_all and axis is not None:
+                raise ValueError(
+                    f"object {self._label(name, obj)!r} carries both a Lock "
+                    "Translation axis and "
+                    "Lock All Translations; the two are mutually exclusive "
+                    "spellings of one lock and the last call must clear the other"
+                )
+            if lock_all:
+                translation_lock_mode[dmap[name]] = np.uint32(TRANSLATION_LOCK_ALL)
+                has_translation_lock = True
+            elif axis is not None:
+                translation_lock[dmap[name]] = np.asarray(axis, dtype=np.float32)
+                translation_lock_mode[dmap[name]] = np.uint32(TRANSLATION_LOCK_AXIS)
+                has_translation_lock = True
+
+        # ----- Lock Rotation: one axis and one mode per dmap entry ------
+        # Same alignment, same axis-plus-mode reading and the same
+        # emptiness rule as translation_lock above, and independent of
+        # it: an object may set either family, both, or neither. Written
+        # to bin/rotation_lock.bin and bin/rotation_lock_mode.bin at
+        # export time.
+        rotation_lock = np.zeros((concat_displacement.shape[0], 3), dtype=np.float32)
+        rotation_lock_mode = np.zeros((concat_displacement.shape[0],), dtype=np.uint32)
+        has_rotation_lock = False
+        for name, obj in dyn_objects:
+            axis = getattr(obj, "_rotation_lock", None)
+            lock_all = bool(getattr(obj, "_rotation_lock_all", False))
+            if lock_all and axis is not None:
+                raise ValueError(
+                    f"object {self._label(name, obj)!r} carries both a Lock "
+                    "Rotation axis and "
+                    "Lock All Rotations; the two are mutually exclusive "
+                    "spellings of one lock and the last call must clear the other"
+                )
+            if lock_all:
+                rotation_lock_mode[dmap[name]] = np.uint32(ROTATION_LOCK_ALL)
+                has_rotation_lock = True
+            elif axis is not None:
+                rotation_lock[dmap[name]] = np.asarray(axis, dtype=np.float32)
+                rotation_lock_mode[dmap[name]] = np.uint32(
+                    ROTATION_LOCK_PROHIBIT_AXIS
+                    if getattr(obj, "_rotation_lock_prohibit_axis", False)
+                    else ROTATION_LOCK_ALLOW_ONLY
+                )
+                has_rotation_lock = True
+
+        concat_vert = assembled["concat_vert"]
+        concat_color = assembled["concat_color"]
+        concat_vel = assembled["concat_vel"]
+        concat_vert_dmap = assembled["concat_vert_dmap"]
+        concat_rod = assembled["concat_rod"]
+        concat_tri = assembled["concat_tri"]
+        concat_tet = assembled["concat_tet"]
+        concat_uv_arr = assembled["concat_uv"]
+        concat_dyn_tri_color_arr = assembled["concat_dyn_tri_color"]
+        concat_dyn_tri_intensity_arr = assembled["concat_dyn_tri_intensity"]
+        concat_rod_is_collider_arr = assembled["concat_rod_is_collider"]
+        concat_tri_is_collider_arr = assembled["concat_tri_is_collider"]
+        concat_stitch_ind_arr = assembled["concat_stitch_ind"]
+        concat_stitch_w_arr = assembled["concat_stitch_w"]
+        concat_stitch_stiffness_arr = assembled["concat_stitch_stiffness"]
+        rod_count = int(assembled["rod_count"])
+        shell_count = int(assembled["shell_count"])
+        stats_by_name = assembled["stats_by_name"]
+
+        # ----- Reconstruct UV / dyn-color list-shaped layout for FixedScene -----
+        # FixedScene._uv is consumed only as a length and as the source bytes
+        # for uv.bin export, both of which work on a single (n_tri, 3, 2)
+        # array. Keep concat_uv_arr as one array instead of exploding it into
+        # ~1.8M tiny (3, 2) arrays: that avoids a multi-million-iteration build
+        # loop and, more importantly, lets _uv pickle as a single array in the
+        # build / app-state snapshots rather than a multi-million-element list
+        # (which dominated the serialize phases of the build).
+        concat_uv: np.ndarray = np.ascontiguousarray(
+            concat_uv_arr, dtype=np.float32
+        ).reshape(-1, 3, 2)
+        concat_dyn_tri_color = [
+            EnumColor(int(v)) for v in concat_dyn_tri_color_arr
+        ]
+        concat_dyn_tri_intensity = [
+            float(v) for v in concat_dyn_tri_intensity_arr
+        ]
+
+        pbar.update(5)
+        advance("Building scene: assembling rods...")
+        advance("Building scene: assembling shell triangles...")
+        advance("Building scene: assembling solid surfaces...")
+        advance("Building scene: assembling tetrahedra...")
+        # Name this step for what it actually does at this point: the
+        # assembler has produced stitch data here, while pins are applied
+        # later (decoder ParamDecoder.apply_pin_config), so the old
+        # "collecting pins and stitches" read as busywork on scenes with
+        # neither. Only mention stitches when present; otherwise a neutral
+        # finalize label.
+        advance(
+            "Building scene: collecting stitches..."
+            if len(concat_stitch_ind_arr)
+            else "Building scene: finalizing scene topology..."
+        )
+
+        # Bake initial angular velocities into per-vertex velocities.
+        # The Rust assembler replicates the object-level linear
+        # velocity uniformly across vertices; angular velocity adds
+        # the rotational component ω × (x̄ − c̄), where the centroid
+        # is the object's own vertex centroid (matching the PDRD
+        # per-body rest centroid).
+        for name, obj in dyn_objects:
+            omega = getattr(obj, "_angular_velocity", None)
+            if omega is None or all(o == 0.0 for o in omega):
+                continue
+            indices = list(map_by_name[name])
+            if not indices:
+                continue
+            idx_arr = np.asarray(indices, dtype=np.int64)
+            positions = np.asarray(concat_vert[idx_arr], dtype=np.float64)
+            c_local = positions.mean(axis=0)
+            r = positions - c_local
+            w = np.asarray(omega, dtype=np.float64)
+            # v = ω × r, broadcast across vertices.
+            spin_vel = np.cross(np.broadcast_to(w, r.shape), r)
+            concat_vel[idx_arr] += spin_vel.astype(concat_vel.dtype)
+
+        # ----- Param replication using counts the Rust kernel returned -----
+        # Mirrors `extend_param` from the original loop. Each object's param
+        # values are appended N times where N is its surviving element count
+        # for the relevant element kind.
+        concat_rod_param: dict[str, list] = {}
+        concat_tri_param: dict[str, list] = {}
+        concat_tet_param: dict[str, list] = {}
+        concat_static_param: dict[str, list] = {}
+
+        # Keys carried in obj.param for key-set parity across kinds but
+        # NOT meaningful at per-face granularity. They live on a
+        # per-body table assembled separately; replicating them
+        # per-face would waste space and risks pretending they vary
+        # within a body. `stitch-stiffness` is resolved per object into a
+        # per-stitch-row array (concat_stitch_stiffness) by the assembly
+        # kernel, so it never enters the per-element param arrays.
+        per_body_only_keys = {"stitch-stiffness"}
+
+        # Each object's contact gap limit as one bound per element, applied
+        # below wherever `contact-gap` is expanded onto those elements.
+        gap_limits = self._contact_gap_limits()
+        # name -> (elements lowered, elements, smallest gap left), for the
+        # summary printed once the tables are assembled.
+        gap_lowered: dict[str, tuple[int, int, float]] = {}
+
+        def _limited_gap(name: str, values, count: int) -> list:
+            """One object's per-element contact gaps, held to its limit.
+
+            `values` is the authored gap of each of the object's `count`
+            elements at one keyframe, or at build time.
+            """
+            limit = gap_limits[name]
+            if len(limit.bound) != count:
+                raise ValueError(
+                    f"the contact gap limit of '{self._label(name, self._object[name])}' "
+                    f"measured {len(limit.bound)} {limit.kind}s but the object "
+                    f"contributes {count} to the scene"
+                )
+            authored = np.asarray(values, dtype=np.float64)
+            held = limit.apply(authored)
+            lowered, _, smallest = gap_lowered.get(name, (0, count, np.inf))
+            gap_lowered[name] = (
+                max(lowered, int(np.count_nonzero(held < authored))),
+                count,
+                min(smallest, float(held.min())),
+            )
+            return held.tolist()
+
+        def _extend_param(
+            param: ParamHolder,
+            concat_param: dict[str, list],
+            count: int,
+            obj=None,
+            element_key: str = "F",
+            limited: Optional[str] = None,
+            fill: Optional[dict[str, float]] = None,
+        ):
+            """Replicate one object's material across `count` elements.
+
+            `obj` is the object whose spatial maps are reduced over the
+            element table `element_key` names, which replaces the replicated
+            scalar with one value per element: "F" for triangles, "T" for
+            tetrahedra, "E" for rod segments. `limited` is the object's scene
+            key in the passes whose elements carry its contact gap limit,
+            which are the surface triangles, the rod segments and a static
+            collider's faces. `fill` maps
+            keys the object does not carry to the value each of its elements
+            takes for them; the table's key set is then the object's keys and
+            these together.
+            """
+            items = [
+                (k, v) for k, v in param.items() if k not in per_body_only_keys
+            ]
+            if fill:
+                carried = {k for k, _ in items}
+                assert not carried & fill.keys(), (
+                    f"fill names keys the object carries: {sorted(carried & fill.keys())}"
+                )
+                items = sorted(items + list(fill.items()))
+            param_keys = [k for k, _ in items]
+            if len(concat_param.keys()):
+                assert param_keys == list(concat_param.keys()), (
+                    f"param keys mismatch: {param_keys} vs {list(concat_param.keys())}"
+                )
+            for key, value in items:
+                if key not in concat_param:
+                    concat_param[key] = []
+                mapped = (
+                    obj.element_param_values(key, float(value), 0.0, element_key)
+                    if obj is not None and key in obj.param_spatial
+                    else None
+                )
+                if mapped is not None:
+                    assert len(mapped) == count, (
+                        f"spatial map for '{key}' produced {len(mapped)} "
+                        f"'{element_key}' values but the object contributes "
+                        f"{count} elements"
+                    )
+                if key == "contact-gap" and limited in gap_limits:
+                    concat_param[key].extend(_limited_gap(
+                        limited,
+                        mapped if mapped is not None else np.full(count, float(value)),
+                        count,
+                    ))
+                elif mapped is not None:
+                    concat_param[key].extend(mapped.tolist())
+                else:
+                    concat_param[key].extend([value] * count)
+
+        # A Cosserat rod's segments share the rod table with a plain rod's,
+        # and its key set is the rod set plus the `cosserat-*` keys, so the
+        # strict key parity of `_extend_param` cannot hold across the two. The
+        # rod table takes the union of the rod objects' keys instead, and a
+        # plain rod contributes 0.0 for each `cosserat-*` key it lacks: it has
+        # no orientation energy, and only the edges `cosserat_edge` marks
+        # build frames. Every key still holds one value per rod edge. A rod
+        # missing any other key of the union is a registry mismatch, refused.
+        rod_param_keys = sorted({
+            key
+            for name, obj in dyn_objects
+            if obj.obj_type == "rod" and int(stats_by_name[name]["rod_added"])
+            for key in obj.param.key_list()
+            if key not in per_body_only_keys
+        })
+
+        def _rod_fill(name: str, obj) -> dict[str, float]:
+            """The rod-table keys `obj` lacks, each mapped to 0.0."""
+            carried = set(obj.param.key_list())
+            missing = [key for key in rod_param_keys if key not in carried]
+            foreign = [key for key in missing if not key.startswith("cosserat-")]
+            if foreign:
+                raise ValueError(
+                    f"rod '{self._label(name, obj)}' carries no {foreign}, which "
+                    "another rod of the scene carries; only the cosserat-* keys "
+                    "may differ between the rods of one scene"
+                )
+            return dict.fromkeys(missing, 0.0)
+
+        # Per-rod-edge Cosserat marker, built in the same pass and order as the
+        # rod table, so the two are aligned by construction. The owner of each
+        # edge in that order is checked against `concat_rod` below.
+        cosserat_edge_runs: list[np.ndarray] = []
+        rod_owner_runs: list[np.ndarray] = []
+
+        # Param replication must mirror the Rust kernel's element
+        # layout in `concat_tri`: rods first, then pure shells, then
+        # SOLID surface tris (matching `assemble_dyn_scene`'s order).
+        # `concat_tri_param` is read by the solver as a prefix-aligned
+        # slot for each tri, so any deviation from this order
+        # mis-pairs material parameters with their tris.
+        for name, obj in dyn_objects:
+            stats = stats_by_name[name]
+            rod_added = int(stats["rod_added"])
+            tet_added = int(stats["tet_added"])
+            if obj.obj_type == "rod" and rod_added:
+                _extend_param(
+                    obj.param, concat_rod_param, rod_added, obj,
+                    element_key="E", limited=name, fill=_rod_fill(name, obj),
+                )
+                cosserat_edge_runs.append(
+                    np.full(rod_added, 1 if obj.cosserat else 0, dtype=np.uint8)
+                )
+                rod_owner_runs.append(
+                    np.full(rod_added, dmap[name], dtype=np.int64)
+                )
+            if tet_added:
+                _extend_param(
+                    obj.param, concat_tet_param, tet_added, obj, element_key="T"
+                )
+        # Animated material values replicate across an object's triangles in
+        # the SAME order as the static ones below, because the solver reads
+        # both as prefix-aligned per-triangle slots. Building them in a
+        # separate loop would be a second ordering to keep in step, so they
+        # are extended together.
+        param_anim_times = list(self._param_anim_times)
+        concat_tri_param_anim: dict[str, list[list[float]]] = {}
+
+        def _extend_param_anim(name: str, obj, count: int):
+            """Replicate one object's animated values across `count` triangles.
+
+            An object that animates nothing still has to contribute its CONSTANT
+            value to every frame of a key some other object animates, or the
+            per-triangle arrays would be short and the two objects' triangles
+            would be misaligned. A contact gap limit holds every frame of
+            `contact-gap`, the constant ones included, since the solver reads
+            the schedule in place of the build-time table.
+            """
+            if not param_anim_times:
+                return
+            for key in (
+                concat_tri_param_anim.keys()
+                | obj.param_anim.keys()
+                | set(obj.animated_spatial_keys)
+            ):
+                frames = concat_tri_param_anim.setdefault(
+                    key, [[] for _ in param_anim_times]
+                )
+                values = obj.param_anim.get(key)
+                if values is None:
+                    static = float(obj.param.get(key))
+                    values = [static] * len(param_anim_times)
+                elif len(values) != len(param_anim_times):
+                    raise ValueError(
+                        f"animated '{key}' has {len(values)} values but the "
+                        f"scene has {len(param_anim_times)} keyframe times"
+                    )
+                for f, v in enumerate(values):
+                    # A key can be animated AND mapped: the schedule moves the
+                    # base, the map spreads each frame's base toward its target,
+                    # and the map's own weights can move too.
+                    mapped = (
+                        obj.element_param_values(
+                            key, float(v), param_anim_times[f]
+                        )
+                        if key in obj.param_spatial
+                        else None
+                    )
+                    if key == "contact-gap" and name in gap_limits:
+                        frames[f].extend(_limited_gap(
+                            name,
+                            mapped if mapped is not None else np.full(count, float(v)),
+                            count,
+                        ))
+                    elif mapped is not None:
+                        frames[f].extend(mapped.tolist())
+                    else:
+                        frames[f].extend([v] * count)
+
+        # Every triangle-contributing object has to appear in every animated
+        # key's table, including the ones that animate nothing. Seeding the
+        # keys before the passes run is what makes that true regardless of the
+        # order the objects are visited in: a key first seen on the second
+        # object would otherwise miss the first object's triangles and leave
+        # the per-key array short.
+        if param_anim_times:
+            for name, obj in dyn_objects:
+                if not int(stats_by_name[name]["tri_added"]):
+                    continue
+                for key in obj.param_anim.keys() | set(obj.animated_spatial_keys):
+                    concat_tri_param_anim.setdefault(
+                        key, [[] for _ in param_anim_times]
+                    )
+
+        # Pass A: pure shells.
+        for name, obj in dyn_objects:
+            stats = stats_by_name[name]
+            tri_added = int(stats["tri_added"])
+            tet_added = int(stats["tet_added"])
+            if tri_added and tet_added == 0:
+                _extend_param(
+                    obj.param, concat_tri_param, tri_added, obj, limited=name
+                )
+                _extend_param_anim(name, obj, tri_added)
+        # Pass B: SOLID surface triangles (objects carrying both tri and tet).
+        for name, obj in dyn_objects:
+            stats = stats_by_name[name]
+            tri_added = int(stats["tri_added"])
+            tet_added = int(stats["tet_added"])
+            if tri_added and tet_added:
+                _extend_param(
+                    obj.param, concat_tri_param, tri_added, obj, limited=name
+                )
+                _extend_param_anim(name, obj, tri_added)
+
+        # One line per object whose gap the limit lowered, since the solve
+        # then runs at a gap the object's `contact-gap` does not state.
+        if not quiet:
+            for name, (lowered, count, smallest) in gap_lowered.items():
+                if not lowered:
+                    continue
+                limit = gap_limits[name]
+                print(
+                    f"contact gap limit: '{self._label(name, self._object[name])}' "
+                    f"lowered on {lowered} of {count} {limit.kind}s to "
+                    f"{100.0 * limit.fraction:g}% of the room between mesh "
+                    f"neighbors, smallest gap {smallest:.3e}"
+                )
+
+        # ----- Cosserat rods: per-rod-edge marker and per-vertex roll -----
+        # The marker holds one byte per rod edge, 1 where the edge belongs to a
+        # Cosserat rod. Every rod edge's owner in the order the rod table was
+        # replicated must be the object `concat_rod` holds there, which is what
+        # makes the marker, the rod table and the rod edges one alignment.
+        cosserat_edge = None
+        if rod_count > 0:
+            rod_owner = np.concatenate(rod_owner_runs)
+            rod_arr = np.asarray(concat_rod, dtype=np.int64).reshape(-1, 2)
+            assert len(rod_owner) == rod_count == len(rod_arr), (
+                f"rod table covers {len(rod_owner)} edges, the scene has "
+                f"{rod_count} rod edges and concat_rod holds {len(rod_arr)}"
+            )
+            held_by = np.asarray(concat_vert_dmap, dtype=np.int64)[rod_arr[:, 0]]
+            assert np.array_equal(held_by, rod_owner), (
+                "the rod table is not in concat_rod's edge order"
+            )
+            marker = np.concatenate(cosserat_edge_runs)
+            if marker.any():
+                cosserat_edge = marker
+
+        # The authored roll, scattered from each Cosserat rod's own vertex
+        # order into the dynamic vertices through its index map, which is the
+        # order vert.bin holds them in. A vertex no Cosserat rod authored a
+        # roll for takes zero. None when no object authored one.
+        cosserat_tilt = None
+        for name, obj in dyn_objects:
+            tilt = obj._cosserat_tilt
+            if tilt is None:
+                continue
+            assert obj.cosserat, (
+                f"'{self._label(name, obj)}' carries a tilt but is not a Cosserat rod"
+            )
+            indices = np.asarray(map_by_name[name], dtype=np.int64)
+            if len(tilt) != len(indices):
+                raise ValueError(
+                    f"the tilt of '{self._label(name, obj)}' has {len(tilt)} "
+                    f"entries but the object has {len(indices)} vertices"
+                )
+            if cosserat_tilt is None:
+                cosserat_tilt = np.zeros(concat_count, dtype=np.float32)
+            cosserat_tilt[indices] = tilt
+
+        # ----- SAND (faceless point cloud) scalar params -----
+        # A "points" object has no elements, so the per-element replication
+        # above produces nothing for it. The solver reads grain mass / contact
+        # radius / gap / friction as scalars (one float each) on the "sand-"
+        # channel instead. The grain radius is authored on the standard
+        # contact-offset key, and the contact gap on contact-gap; mass and
+        # friction come from the sand-* keys. Every grain shares one set, so a
+        # single value per file. First SAND object wins (a SAND-only scene is
+        # the supported case; multiple clouds would share these scalars).
+        concat_sand_param: dict[str, list] = {}
+        for name, obj in dyn_objects:
+            if obj.obj_type != "points":
+                continue
+            p = obj.param
+            concat_sand_param = {
+                "particle-mass": [float(p.get("sand-particle-mass"))],
+                "grain-radius": [float(p.get("contact-offset"))],
+                "contact-gap": [float(p.get("contact-gap"))],
+                "friction": [float(p.get("sand-friction"))],
+            }
+            break
+
+        def _closed_surface_from_faces(faces, face_range):
+            start, count = face_range
+            if count == 0:
+                return False
+            edge_counts = {}
+            for face in faces[start : start + count]:
+                for a, b in (
+                    (int(face[0]), int(face[1])),
+                    (int(face[1]), int(face[2])),
+                    (int(face[2]), int(face[0])),
+                ):
+                    edge = (a, b) if a < b else (b, a)
+                    edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            return bool(edge_counts) and all(
+                count == 2 for count in edge_counts.values()
+            )
+
+        def _closed_surface(face_range):
+            return _closed_surface_from_faces(concat_tri, face_range)
+
+        statistics_objects = []
+        rod_cursor = 0
+        shell_face_cursor = 0
+        solid_face_cursor = shell_count
+        tet_cursor = 0
+        for object_index, (name, obj) in enumerate(dyn_objects):
+            stats = stats_by_name[name]
+            rod_added = int(stats["rod_added"])
+            tri_added = int(stats["tri_added"])
+            tet_added = int(stats["tet_added"])
+            face_cursor = solid_face_cursor if tet_added else shell_face_cursor
+            dynamics_type = getattr(obj, "_statistics_type", obj.obj_type.upper())
+            face_range = [face_cursor, tri_added]
+            grain_radius = None
+            if dynamics_type == "SAND" and concat_sand_param:
+                radii = concat_sand_param.get("grain-radius", [])
+                grain_radius = float(radii[0]) if radii else None
+            statistics_objects.append({
+                "object_index": object_index,
+                "object_uuid": getattr(obj, "_statistics_uuid", name),
+                "object_name": getattr(obj, "_statistics_name", name),
+                "dynamics_type": dynamics_type,
+                "static_object": False,
+                "vertex_indices": [
+                    int(index) for index in np.asarray(map_by_name[name]).tolist()
+                ],
+                "rod_range": [rod_cursor, rod_added],
+                "face_range": face_range,
+                "tet_range": [tet_cursor, tet_added],
+                "closed_surface": _closed_surface(face_range),
+                "grain_radius": grain_radius,
+            })
+            rod_cursor += rod_added
+            if tet_added:
+                solid_face_cursor += tri_added
+            else:
+                shell_face_cursor += tri_added
+            tet_cursor += tet_added
+
+        # ----- Pin assembly (Python-side: PinData is a Python dataclass) -----
+        # Flatten every (object, pin) pair into a single list comprehension
+        # so there's no incremental .append on the outer concat list nor
+        # on the inner mapped_ops list. Each comprehension is a single
+        # CPython allocation.
+        def _remap_op(op, map_arr):
+            if isinstance(op, TorqueOperation):
+                # The solver orients the torque axis toward this vertex and
+                # has no reading for a missing one. PinHolder.torque refuses
+                # one, so only an operation built another way (an unpickled
+                # scene, a hand-made TorqueOperation) can arrive without it,
+                # and it is refused here rather than on the GPU.
+                if not 0 <= op.hint_vertex < len(map_arr):
+                    raise ValueError(
+                        f"a torque operation names hint_vertex {op.hint_vertex}, "
+                        f"which is not one of its object's {len(map_arr)} "
+                        "vertices; give PinHolder.torque the vertex its axis "
+                        "points toward"
+                    )
+                return _dc_replace(op, hint_vertex=int(map_arr[op.hint_vertex]))
+            return op
+
+        # Per-vertex STATIC-collider mask. `_is_static_moving` is set by the
+        # decoder's `_setup_pin_shell`, which every collider that reaches the
+        # solved namespace goes through (the animated cases and the promoted
+        # rest-pose one). None when the scene has no such collider, so the
+        # solver keeps its prior behavior and no file is written.
+        _collider_mask = np.zeros(len(concat_vert), dtype=np.uint8)
+        for name, obj in dyn_objects:
+            if getattr(obj, "_is_static_moving", False):
+                _collider_mask[np.asarray(map_by_name[name], dtype=np.int64)] = 1
+        collider_vert_mask = _collider_mask if _collider_mask.any() else None
+
+        # Per-vertex source-object identity, the only thing that tells a
+        # SELF-intersection from an INTER-OBJECT one. It cannot be recovered
+        # downstream: `param_index` is deduplicated across objects, so two
+        # objects sharing a material share one index, and the statistics
+        # object index covers only the objects named in a statistics manifest
+        # (and only when the scene has one). Positions here are the same
+        # concatenated namespace `map_by_name` addresses, so every dynamic
+        # vertex is covered exactly once; the assert below is what keeps a
+        # future object kind from quietly leaving a gap that would then read
+        # as "same object" against everything else in it.
+        _object_index = np.full(len(concat_vert), np.iinfo(np.uint32).max,
+                                dtype=np.uint32)
+        for _oi, (name, _obj) in enumerate(dyn_objects):
+            _object_index[np.asarray(map_by_name[name], dtype=np.int64)] = _oi
+        _ungrouped = int(np.count_nonzero(_object_index == np.iinfo(np.uint32).max))
+        assert _ungrouped == 0, (
+            f"{_ungrouped} of {len(concat_vert)} dynamic vertices belong to no "
+            "object; the self- vs inter-object intersection test needs every "
+            "vertex mapped"
+        )
+        object_vert_index = _object_index
+
+        # The external force field's per-vertex weight, resolved from each
+        # object's `force-field-weight`, and the group-to-vertex map a source
+        # with `groups=` targets. Both are computed whether or not the scene
+        # has a field yet, because a held run can be given one later
+        # (`FixedSession.update_force_field`) and must target it the same way.
+        _weight = np.ones(len(concat_vert), dtype=np.float32)
+        _group_vertices: dict = {}
+        for name, obj in dyn_objects:
+            w = float(obj.param.get("force-field-weight"))
+            if not np.isfinite(w):
+                raise ValueError(
+                    f"object {name!r} has force-field-weight {w}, which is not finite"
+                )
+            _weight[np.asarray(map_by_name[name], dtype=np.int64)] = w
+            label = getattr(obj, "_group_label", None)
+            if label is not None:
+                _group_vertices.setdefault(label, []).extend(map_by_name[name])
+        force_field_context = {
+            "weight": _weight if bool(np.any(_weight != 1.0)) else None,
+            "group_vertices": _group_vertices,
+        }
+        force_field = None
+        if not self.force_field.empty:
+            _fields, _scripts, _mask = _resolve_force_field_targets(
+                self.force_field, _group_vertices, len(concat_vert))
+            force_field = {"fields": _fields, "scripts": _scripts, "mask": _mask}
+
+        # Per-vertex intersection tolerances, resolved from each object's
+        # material. Resolved per OBJECT rather than replicated per element on
+        # purpose: that is the granularity the two params actually have, and
+        # it is the only one defined for a faceless SAND cloud, which has no
+        # element to hang a material on. `_scene_.py` drops both keys from
+        # concat_tet_param further down for the same reason a tet needs none:
+        # a solid is reached only through its surface triangles.
+        _policy = np.zeros(len(concat_vert), dtype=np.uint8)
+        for name, obj in dyn_objects:
+            bits = 0
+            if float(obj.param.get("allow-self-intersection")) != 0.0:
+                bits |= _INTERSECT_ALLOW_SELF
+            if float(obj.param.get("allow-inter-object-intersection")) != 0.0:
+                bits |= _INTERSECT_ALLOW_INTER_OBJECT
+            if float(obj.param.get("allow-inter-group-intersection")) != 0.0:
+                bits |= _INTERSECT_ALLOW_INTER_GROUP
+            if bits:
+                _policy[np.asarray(map_by_name[name], dtype=np.int64)] = bits
+        intersect_policy = _policy if _policy.any() else None
+
+        # Allow Existing Intersections, per vertex, resolved per OBJECT like
+        # the three allowances above. It names no pair by itself: the
+        # scene-build check links the pairs it FINDS intersecting (or closer
+        # than their contact offsets) when either side's object set it, and
+        # those links travel to the solver as bin/start_link.bin. A points
+        # (SAND) object is refused by name: its grains form no element the
+        # check could find, and the grain-grain contact never reads a link,
+        # so the flag would be accepted and do nothing.
+        _allow_existing = np.zeros(len(concat_vert), dtype=bool)
+        for name, obj in dyn_objects:
+            if float(obj.param.get("allow-existing-intersection")) == 0.0:
+                continue
+            if obj.obj_type == "points":
+                raise ValueError(
+                    f"object '{name}' sets 'allow-existing-intersection', which "
+                    "sand does not support: grains overlapping at the start are "
+                    "not exempted from contact. Clear it on this object."
+                )
+            _allow_existing[np.asarray(map_by_name[name], dtype=np.int64)] = True
+        allow_existing_vertices = _allow_existing if _allow_existing.any() else None
+
+        # Per-vertex group identity, read only by the inter-group allowance
+        # and so resolved only for a scene that asks for it. Labels are
+        # numbered from 1 in the order the objects appear; 0 is the default
+        # group every object told nothing shares.
+        group_vert_index = None
+        if intersect_policy is not None and bool(
+            np.any(intersect_policy & _INTERSECT_ALLOW_INTER_GROUP)
+        ):
+            _labels: dict[str, int] = {}
+            group_vert_index = np.zeros(len(concat_vert), dtype=np.uint32)
+            for name, obj in dyn_objects:
+                label = getattr(obj, "_group_label", None)
+                if label is None:
+                    continue
+                gid = _labels.setdefault(label, len(_labels) + 1)
+                group_vert_index[np.asarray(map_by_name[name], dtype=np.int64)] = gid
+
+        concat_pin: list[PinData] = [
+            PinData(
+                index=np.asarray(map_by_name[name], dtype=np.int64)[
+                    np.asarray(p.index, dtype=np.int64)
+                ].tolist(),
+                operations=[_remap_op(op, np.asarray(map_by_name[name])) for op in p.operations],
+                unpin_time=p.unpin_time,
+                pull_strength=p.pull_strength,
+                # Per-vertex pull weights are aligned to p.index; the index
+                # remap above is element-wise (same order), so the array
+                # stays aligned. Carry it so pin-pullw is exported.
+                pull_weights=getattr(p, "pull_weights", None),
+                transition=p.transition,
+                pin_group_id=p.pin_group_id,
+                hide_in_preview=bool(getattr(obj, "_is_static_moving", False)),
+                rest_shape_track=bool(getattr(p, "rest_shape_track", False)),
+                allow_intersection=bool(getattr(p, "allow_intersection", False)),
+            )
+            for name, obj in dyn_objects
+            for p in obj.pin_list
+        ]
+
+        # ----- PDRD per-body table -----
+        # For each PDRD-flagged object, collect its vertex indices and
+        # precompute the rest-shape moments used for best-fit rigid
+        # reconstruction plus mass/inertia data (centroid, Gram inverse,
+        # enclosed volume, per-vertex volumetric mass). Bodies' vertex
+        # sets need not be
+        # contiguous in the global vertex array; the kernel reads
+        # them through a flat index list (`pdrd_vert_list`).
+        pdrd_body_rows: list[float] = []  # PDRD_BODY_ROW_LEN floats per body
+        # Floats per PDRD body row; must match `PDRD_BODY_ROW_LEN` in
+        # crates/ppf-cts-solver/src/data.rs. Layout: vertex_start,
+        # vertex_count, volume, centroid[3], rest_gram_inv[9 row-major],
+        # mass_per_vertex, joint_mode, joint_axis[3], joint_pin[3]
+        # (16 base + 7 joint = 23 floats).
+        PDRD_BODY_ROW_LEN = 23
+        pdrd_body_densities: list[float] = []  # one float per body, used to fill mass_per_vertex after volume is known
+        pdrd_body_centroids: list[np.ndarray] = []  # rest centroid per body (local frame), used in the inertia pass
+        pdrd_body_gram_trace: list[float] = []  # trace(S̄) per body, used to compute I_uniform
+        pdrd_body_labels: list[str] = []  # the name a refusal gives each body
+        pdrd_vert_index = np.zeros(concat_count, dtype=np.uint32)
+        pdrd_vert_list: list[int] = []
+        pdrd_rest_centered_chunks: list[np.ndarray] = []
+        next_body_id = 0
+        for name, obj in dyn_objects:
+            if not getattr(obj, "_is_pdrd", False):
+                continue
+            indices = list(map_by_name[name])
+            if not indices:
+                continue
+            idx_arr = np.asarray(indices, dtype=np.int64)
+            vertex_start = len(pdrd_vert_list)
+            vertex_count = int(len(idx_arr))
+            positions = np.asarray(concat_vert[idx_arr], dtype=np.float64)
+            c_bar = positions.mean(axis=0)
+            y_bar = positions - c_bar
+            gram = y_bar.T @ y_bar
+            try:
+                gram_inv = np.linalg.inv(gram)
+            except np.linalg.LinAlgError as e:
+                raise ValueError(
+                    f"PDRD body {self._label(name, obj)!r}: rest-shape Gram matrix is singular "
+                    "(degenerate body geometry, at least 4 non-coplanar vertices required)"
+                ) from e
+            density = float(obj.param.get("density"))
+            assert density > 0.0, (
+                f"PDRD body {self._label(name, obj)!r}: density must be > 0 (got {density})"
+            )
+
+            body_id = next_body_id + 1  # 1-based; 0 means "not PDRD"
+            next_body_id += 1
+            pdrd_vert_index[idx_arr] = body_id
+            pdrd_vert_list.extend(int(i) for i in idx_arr)
+            pdrd_rest_centered_chunks.append(y_bar.astype(np.float32))
+            pdrd_body_densities.append(density)
+            pdrd_body_centroids.append(c_bar.copy())
+            pdrd_body_gram_trace.append(float(np.trace(gram)))
+            pdrd_body_labels.append(self._label(name, obj))
+            # Row: vertex_start (into pdrd_vert_list, NOT global!),
+            # vertex_count, volume (filled by the divergence-theorem
+            # pass below), centroid (3), gram_inv (9 row-major),
+            # mass_per_vertex (filled below), then the joint block:
+            # joint_mode, joint_axis (3, world axle), joint_pin (3, world
+            # pivot). joint_mode = 0 leaves the body free (no DOF
+            # filtering); a hinge sets the axle to a principal axis of the
+            # rest Gram and pins the centroid.
+            joint_mode = 0.0
+            joint_axis = [0.0, 0.0, 0.0]
+            joint_pin = [0.0, 0.0, 0.0]
+            joint = getattr(obj, "_joint", None)
+            if joint is not None:
+                kind, pca_index = joint
+                if kind == "hinge":
+                    # Principal axes = eigenvectors of the rest Gram
+                    # (computed in placed/world coords, so the axle is a
+                    # fixed world direction at t=0). Order by DESCENDING
+                    # eigenvalue so index 0 = largest extent, 2 = thinnest;
+                    # this convention must match the Blender overlay.
+                    evals, evecs = np.linalg.eigh(gram)
+                    order = np.argsort(evals)[::-1]
+                    axis_vec = np.asarray(
+                        evecs[:, order[pca_index]], dtype=np.float64
+                    )
+                    nrm = float(np.linalg.norm(axis_vec))
+                    if nrm <= 1e-12:
+                        raise ValueError(
+                            f"PDRD body {self._label(name, obj)!r}: degenerate principal axis "
+                            "for hinge (rest shape too symmetric to pick an axle)"
+                        )
+                    axis_vec = axis_vec / nrm
+                    joint_mode = 1.0
+                    joint_axis = [float(a) for a in axis_vec]
+                    joint_pin = [float(c_bar[0]), float(c_bar[1]), float(c_bar[2])]
+            row = [
+                float(vertex_start),
+                float(vertex_count),
+                0.0,  # volume, filled below.
+                float(c_bar[0]), float(c_bar[1]), float(c_bar[2]),
+            ]
+            row.extend(float(v) for v in gram_inv.flatten(order="C"))
+            row.append(0.0)  # mass_per_vertex, filled below.
+            row.append(joint_mode)
+            row.extend(joint_axis)
+            row.extend(joint_pin)
+            assert len(row) == PDRD_BODY_ROW_LEN
+            pdrd_body_rows.extend(row)
+        pdrd_rest_centered = (
+            np.vstack(pdrd_rest_centered_chunks)
+            if pdrd_rest_centered_chunks
+            else np.zeros((0, 3), dtype=np.float32)
+        )
+
+        # Per-body enclosed volume AND volumetric inertia trace, both from
+        # the body's surface triangles (`_pdrd_mass_.enclosed_moments`,
+        # which is also where a surface that bounds no solid is refused).
+        # With c̄ the body's vertex centroid, the second moment
+        # ∫_body ||r − c̄||² dV gives trace(I_solid) = 2ρ · that.
+        #
+        # Per-vertex mass is then scaled so the body's effective
+        # rotational inertia matches the volumetric one:
+        #
+        #   m_per_vertex = (ρV / N) · trace(I_solid) / trace(I_uniform)
+        #
+        # where I_uniform = (ρV/N) · (tr(S̄) I − S̄) is the surface-
+        # shell inertia with uniform per-vertex mass. For symmetric
+        # bodies (cube, sphere) both tensors are isotropic and the
+        # trace ratio is exact per-axis. For asymmetric bodies it's
+        # an approximation that preserves the average rotational
+        # behavior. Gravity-driven translation is unaffected because
+        # IPC applies gravity as per-vertex acceleration; the trade-
+        # off is that effective mass for collision momentum is
+        # reduced by the scale factor (for a cube ≈ 1/3).
+        if next_body_id > 0 and len(concat_tri) > 0:
+            tri_arr = np.asarray(concat_tri, dtype=np.int64)
+            b0 = pdrd_vert_index[tri_arr[:, 0]]
+            b1 = pdrd_vert_index[tri_arr[:, 1]]
+            b2 = pdrd_vert_index[tri_arr[:, 2]]
+            same_nonzero = (b0 != 0) & (b0 == b1) & (b1 == b2)
+            for bid in range(1, next_body_id + 1):
+                label = pdrd_body_labels[bid - 1]
+                body_tri_mask = same_nonzero & (b0 == bid)
+                body_tris = tri_arr[body_tri_mask]
+                if len(body_tris) == 0:
+                    raise ValueError(f"PDRD body {label!r}: no triangles found")
+                vol, second_moment = enclosed_moments(
+                    label, concat_vert, body_tris, pdrd_body_centroids[bid - 1]
+                )
+                density = pdrd_body_densities[bid - 1]
+                trace_I_solid = 2.0 * density * second_moment
+                row_off = (bid - 1) * PDRD_BODY_ROW_LEN
+                vertex_count = int(pdrd_body_rows[row_off + 1])
+                total_mass = density * vol
+                trace_I_uniform = (
+                    2.0 * total_mass / float(vertex_count)
+                    * pdrd_body_gram_trace[bid - 1]
+                )
+                if trace_I_uniform <= 0.0:
+                    raise ValueError(
+                        f"PDRD body {label!r}: degenerate rest configuration "
+                        "(trace of Σ ȳ ȳᵀ is non-positive)"
+                    )
+                scale = trace_I_solid / trace_I_uniform
+                if not (1e-6 < scale < 100.0):
+                    raise ValueError(
+                        f"PDRD body {label!r}: inertia trace ratio {scale:.3e} "
+                        "out of bounds. Its surface is closed and consistently "
+                        "wound, so it may cross itself or be extremely thin."
+                    )
+                mass_per_vertex = (total_mass / float(vertex_count)) * scale
+                pdrd_body_rows[row_off + 2] = vol
+                pdrd_body_rows[row_off + 15] = mass_per_vertex
+
+        # ----- Global pinned-vertex set + rest_vert computation -----
+        global_pinned_vertices: set[int] = set()
+        for pin in concat_pin:
+            global_pinned_vertices.update(pin.index)
+
+        # Which vertices are pinned by a pin that asked for its intersections
+        # to be tolerated (issue #138). A vertex can be covered by more than
+        # one pin and the answer must hold for EVERY one of them: an allowance
+        # says this vertex's placement is not the solver's to resolve, and a
+        # pin that made no such claim contradicts it. Starting from "no pin
+        # has spoken" also leaves an unpinned vertex false, which is what
+        # makes the element rule mean "all N vertices are pinned AND every pin
+        # covering them allows it". Mirrors the same reduction in
+        # `builder::build`, which is what the SOLVER reads; both have to grant
+        # the same set or a scene builds here and aborts there.
+        pin_allow_vertices = np.zeros(concat_count, dtype=bool)
+        _pin_seen = np.zeros(concat_count, dtype=bool)
+        for pin in concat_pin:
+            if not pin.index:
+                continue
+            idx = np.asarray(pin.index, dtype=np.int64)
+            allows = bool(getattr(pin, "allow_intersection", False))
+            fresh = ~_pin_seen[idx]
+            pin_allow_vertices[idx[fresh]] = allows
+            if not allows:
+                pin_allow_vertices[idx[~fresh]] = False
+            _pin_seen[idx] = True
+
+        concat_rest_vert = concat_vert.copy()
+        rest_vert_mask = np.zeros(concat_count, dtype=np.uint8)
+        for name, obj in dyn_objects:
+            indices = map_by_name[name]
+            obj_indices_set = set(np.asarray(indices).tolist())
+            obj_pins = [
+                p for p in concat_pin
+                if set(p.index) & obj_indices_set
+            ]
+            if not obj_pins:
+                continue
+            covered: set[int] = set()
+            all_have_duration = True
+            for p in obj_pins:
+                if p.unpin_time is None:
+                    all_have_duration = False
+                    break
+                covered.update(p.index)
+            if not all_have_duration or not obj_indices_set.issubset(covered):
+                continue
+            for p in obj_pins:
+                positions = concat_rest_vert[p.index].copy()
+                for op in p.operations:
+                    positions = op.apply(positions, p.unpin_time)
+                concat_rest_vert[p.index] = positions
+                rest_vert_mask[p.index] = 1
+        has_rest_vert = bool(rest_vert_mask.any())
+
+        # ----- Bending reference rest angle -----
+        # Each shell object that opted in carries a world-space reference
+        # vertex buffer (set by the decoder), aligned 1:1 with its own
+        # vertices. Scatter it into a full per-vertex array (initialized from
+        # the initial vert, so non-reference objects are unchanged) via the
+        # local->global index map, and mark the participating vertices so the
+        # solver knows which hinges take their rest angle from the reference
+        # instead of the initial pose.
+        concat_bend_rest_vert = concat_vert.copy()
+        bend_rest_vert_mask = np.zeros(concat_count, dtype=np.uint8)
+        for name, obj in dyn_objects:
+            brv = getattr(obj, "_bend_rest_vert", None)
+            if brv is None and getattr(obj, "_bend_rest_vert_anim", None) is not None:
+                # An animated reference with no static one builds with its
+                # first keyframe.
+                brv = obj._bend_rest_vert_anim[0]
+            if brv is None:
+                continue
+            indices = np.asarray(map_by_name[name], dtype=np.int64)
+            if len(brv) != len(indices):
+                raise ValueError(
+                    f"Bending reference for '{name}' has {len(brv)} vertices "
+                    f"but the object has {len(indices)}."
+                )
+            concat_bend_rest_vert[indices] = np.asarray(
+                brv, dtype=concat_bend_rest_vert.dtype
+            )
+            bend_rest_vert_mask[indices] = 1
+        has_bend_rest_vert = bool(bend_rest_vert_mask.any())
+
+        # ----- Time-varying bending reference -----
+        # Objects with an animated bending reference each carry their own
+        # keyframe times. The solver streams one schedule, so it is sampled at
+        # the union of those times: an object is linearly interpolated at a
+        # time between its own keyframes (and holds its end keyframe outside
+        # them), and every other row keeps its static reference above.
+        bend_anim = [
+            (name, obj) for name, obj in dyn_objects
+            if getattr(obj, "_bend_rest_vert_anim", None) is not None
+        ]
+        bend_rest_vert_anim = None
+        bend_rest_vert_times = None
+        if bend_anim:
+            union = np.unique(np.concatenate(
+                [obj._bend_rest_vert_times for _, obj in bend_anim]
+            ))
+            frames = []
+            for t in union:
+                frame = concat_bend_rest_vert.copy()
+                for name, obj in bend_anim:
+                    ts, vs = obj._bend_rest_vert_times, obj._bend_rest_vert_anim
+                    hi = int(np.searchsorted(ts, t, side="left"))
+                    if hi <= 0:
+                        pos = vs[0]
+                    elif hi >= len(ts):
+                        pos = vs[-1]
+                    elif ts[hi] == t:
+                        pos = vs[hi]
+                    else:
+                        a = (t - ts[hi - 1]) / (ts[hi] - ts[hi - 1])
+                        pos = vs[hi - 1] + a * (vs[hi] - vs[hi - 1])
+                    indices = np.asarray(map_by_name[name], dtype=np.int64)
+                    frame[indices] = pos
+                frames.append(frame)
+            bend_rest_vert_anim = np.concatenate(frames, axis=0).astype(np.float64)
+            bend_rest_vert_times = union.astype(np.float64)
+        has_bend_rest_vert_anim = bend_rest_vert_anim is not None
+
+        # ----- Time-varying rest shape (captured full-pin deformation) -----
+        # A pin flagged rest_shape_track is a FULL pin (every vertex captured;
+        # the encoder gates the toggle on that). Its move ops carry the captured
+        # target trajectory for the whole object, so sampling them at the
+        # capture frame boundaries gives a time-varying rest shape the solver
+        # follows (Scene::rest_shape_schedule): the dynamic body's stress-free
+        # shape becomes the captured deformation while the pins guide it and
+        # contact resolves. The base is the post-static rest pose, so a
+        # non-captured object's static (unpin_time) rest stays put every frame.
+        rest0 = concat_rest_vert.copy()
+        track_pins = [p for p in concat_pin if getattr(p, "rest_shape_track", False)]
+        rest_vert_anim = None
+        rest_vert_times = None
+        if track_pins:
+            boundary_times: set[float] = set()
+            for p in track_pins:
+                for op in p.operations:
+                    boundary_times.add(float(op.t_start))
+                    boundary_times.add(float(op.t_end))
+            times_sorted = sorted(boundary_times)
+            if times_sorted:
+                anim_mask = rest_vert_mask.copy()
+                # The encoder flags rest_shape_track only on a FULL pin (every
+                # vertex captured). For such a pin ``p.index`` is the WHOLE
+                # object (surface + harmonic interior) and its operations drive
+                # every one to the captured position, so the rest pose IS the
+                # captured deformation: apply the operations to all pin vertices.
+                # No reconstruction, no free region, no boundary tear.
+                frames = []
+                for t_k in times_sorted:
+                    frame = rest0.copy()
+                    for p in track_pins:
+                        idx = np.asarray(p.index, dtype=np.int64)
+                        if idx.size == 0:
+                            continue
+                        pos = rest0[idx].copy()
+                        for op in p.operations:
+                            pos = op.apply(pos, t_k)
+                        frame[idx] = pos
+                        anim_mask[idx] = 1
+                    frames.append(frame)
+                # Frame-major: (n_frames * n_vert, 3), reshaped solver-side.
+                rest_vert_anim = np.concatenate(frames, axis=0).astype(np.float64)
+                rest_vert_times = np.asarray(times_sorted, dtype=np.float64)
+                # The solver shares one mask between the static rest_vert and
+                # the schedule, so widen it to the union of driven verts.
+                rest_vert_mask = anim_mask
+        has_rest_vert_anim = rest_vert_anim is not None
+
+        # ----- Static side: param replication + transform animations -----
+        pbar.update(1)
+        advance("Building scene: assembling static geometry...")
+        static_vert = assembled["static_vert"]
+        static_tri = assembled["static_tri"]
+        static_color = assembled["static_color"]
+        static_vert_dmap = assembled["static_vert_dmap"]
+        static_per_object = assembled["static_per_object"]
+        static_face_cursor = 0
+        for name, obj in self._object.items():
+            if not obj.static:
+                continue
+            entry = static_per_object.get(name)
+            if entry is None:
+                continue
+            vertex_start = int(entry["offset"])
+            vertex_count = len(obj.get("V"))
+            face_count = int(entry["n_face"])
+            static_face_range = [static_face_cursor, face_count]
+            statistics_objects.append({
+                "object_index": len(statistics_objects),
+                "object_uuid": getattr(obj, "_statistics_uuid", name),
+                "object_name": getattr(obj, "_statistics_name", name),
+                "dynamics_type": "STATIC",
+                "static_object": True,
+                "vertex_indices": list(
+                    range(vertex_start, vertex_start + vertex_count)
+                ),
+                "rod_range": [0, 0],
+                "face_range": static_face_range,
+                "tet_range": [0, 0],
+                "closed_surface": _closed_surface_from_faces(
+                    static_tri, static_face_range
+                ),
+                "grain_radius": None,
+            })
+            static_face_cursor += face_count
+        # Replicate static-side params + collect transform anims. The
+        # param replication still runs as a side effect so we keep the
+        # for-loop, but the (offset, anim) collect drops to a single
+        # comprehension over the resolved entries.
+        for name, obj in self._object.items():
+            if not obj.static:
+                continue
+            entry = static_per_object.get(name)
+            if entry is None:
+                continue
+            _extend_param(
+                obj.param, concat_static_param, int(entry["n_face"]),
+                limited=name,
+            )
+        concat_static_transform_anims: list[tuple[int, TransformAnimation]] = [
+            (int(static_per_object[name]["offset"]), obj._transform_animation)
+            for name, obj in self._object.items()
+            if obj.static
+            and static_per_object.get(name) is not None
+            and obj._transform_animation is not None
+        ]
+
+        # Static-side half of the draw-time visibility mask. The assembler
+        # appends each static object's vertices as one run starting at the
+        # offset it reports, so an object owns [offset, offset + its own
+        # vertex count).
+        invisible_static_vert = np.zeros(len(static_vert), dtype=bool)
+        for name, obj in self._object.items():
+            if obj.static and not obj.visible:
+                entry = static_per_object.get(name)
+                if entry is None:
+                    continue
+                offset = int(entry["offset"])
+                obj_vert = obj.get("V")
+                assert obj_vert is not None
+                invisible_static_vert[offset : offset + len(obj_vert)] = True
+
+        # Re-key velocity schedules / collision windows by displacement idx
+        # now that the dmap ordering is fixed.
+        velocity_schedules_by_dmap = {
+            f"velocity:{dmap[name]}": entries
+            for name, entries in velocity_schedules.items()
+        }
+        angular_velocity_schedules_by_dmap = {
+            f"angular_velocity:{dmap[name]}": entries
+            for name, entries in angular_velocity_schedules.items()
+        }
+        angular_world_velocity_schedules_by_dmap = {
+            f"angular_velocity_world:{dmap[name]}": entries
+            for name, entries in angular_world_velocity_schedules.items()
+        }
+        collision_windows_by_dmap = {
+            f"collision_window:{dmap[name]}": entries
+            for name, entries in collision_windows.items()
+        }
+
+        pbar.update(1)
+        advance("Building scene: finalizing fixed scene...")
+
+        # Param key clearing to enforce per-element-kind scoping. Mirrors
+        # the closing block of the original Python builder.
+        for key in ["model"]:
+            concat_rod_param[key] = []
+            concat_static_param[key] = []
+        for key in ["poiss-rat"]:
+            concat_rod_param[key] = []
+        for key in ["strain-limit"]:
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
+        # shrink-x/shrink-y and the orthotropic bending ratios are all
+        # shell-only: they are read in the UV material frame, which only a
+        # triangle carries. The registry defines them for every object kind so
+        # a solid's surface triangles can join concat_tri_param without a
+        # key-set mismatch, so they have to be dropped here instead. Leaving
+        # them in trips the rod loop's "Unknown rod parameter" panic
+        # (scene.rs) and the tet loop's equivalent.
+        for key in ["shrink-x", "shrink-y", "bend-warp", "bend-weft"]:
+            concat_rod_param[key] = []
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
+        for key in ["shrink"]:
+            concat_rod_param[key] = []
+            concat_tri_param[key] = []
+            concat_static_param[key] = []
+        for key in ["friction", "contact-gap", "contact-offset", "bend",
+                    "bending-damping"]:
+            concat_tet_param[key] = []
+        # The two intersection allowances are per OBJECT, not per element:
+        # they are resolved above into the per-vertex `intersect_policy`
+        # array, which is what the solver and the build-time check both read.
+        # Nothing consumes a per-element copy, and leaving one in would reach
+        # the solver's element param loops and trip their "Unknown face
+        # parameter" panic, so every element kind drops them here. They still
+        # travel to the solver as the resolved policy, and they are still
+        # visible per object in the addon and in the PARAM payload.
+        #
+        # `contact-gap-limit` is per object for the same reason: it is already
+        # resolved into the per-element `contact-gap` values above.
+        for key in ["allow-self-intersection", "allow-inter-object-intersection",
+                    "allow-inter-group-intersection", "allow-existing-intersection",
+                    "force-field-weight", "contact-gap-limit"]:
+            concat_tri_param[key] = []
+            concat_rod_param[key] = []
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
+        for key in ["bend-plasticity", "bend-plasticity-threshold",
+                    "bend-rest-from-geometry"]:
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
+        for key in ["young-mod", "poiss-rat", "bend", "density"]:
+            concat_static_param[key] = []
+        for key in ["length-factor"]:
+            concat_tri_param[key] = []
+            concat_tet_param[key] = []
+            concat_static_param[key] = []
+
+        # Shrink/extend invalidates strain limiting on shells.
+        sx = concat_tri_param.get("shrink-x", [])
+        sy = concat_tri_param.get("shrink-y", [])
+        sl = concat_tri_param.get("strain-limit", [])
+        if sx and sy and sl:
+            conflict = _rust.scene_shell_shrink_strain_limit_conflict(
+                [float(v) for v in sx],
+                [float(v) for v in sy],
+                [float(v) for v in sl],
+            )
+            if conflict is not None:
+                i, x, y, s = conflict
+                raise ValueError(
+                    f"Shell face {i}: shrink (x={x}, y={y}) "
+                    f"conflicts with strain-limit ({s}). "
+                    "Set strain-limit to 0 or keep shrink at 1.0."
+                )
+
+        # Compute static vertices with displacement for intersection check
+        static_vert_for_check = None
+        static_tri_for_check = None
+        if static_vert.shape[0] > 0 and static_tri.shape[0] > 0:
+            static_vert_for_check = (
+                static_vert + concat_displacement[static_vert_dmap]
+            )
+            static_tri_for_check = static_tri
+
+        fixed = FixedScene(
+            self._plot,
+            self.info.name,
+            map_by_name,
+            concat_displacement,
+            (concat_vert_dmap, concat_vert),
+            concat_color,
+            concat_dyn_tri_color,
+            concat_dyn_tri_intensity,
+            concat_vel,
+            concat_uv,
+            concat_rod,
+            concat_tri,
+            concat_tet,
+            concat_rod_param,
+            concat_tri_param,
+            concat_tet_param,
+            self._wall,
+            self._sphere,
+            (rod_vert_start, rod_vert_end),
+            (shell_vert_start, shell_vert_end),
+            rod_count,
+            shell_count,
+            concat_tri_is_collider_arr.astype(bool),
+            concat_rod_is_collider_arr.astype(bool),
+            global_pinned_vertices if global_pinned_vertices else None,
+            static_vert_for_check,
+            static_tri_for_check,
+            self._surface_map_by_name if self._surface_map_by_name else None,
+            concat_rest_vert=concat_rest_vert if has_rest_vert else None,
+            # The mask is shared between the static rest_vert and the
+            # time-varying schedule, so pass it whenever either is present.
+            rest_vert_mask=(
+                rest_vert_mask if (has_rest_vert or has_rest_vert_anim) else None
+            ),
+            rest_vert_anim=rest_vert_anim if has_rest_vert_anim else None,
+            rest_vert_times=rest_vert_times if has_rest_vert_anim else None,
+            tri_param_anim=concat_tri_param_anim or None,
+            param_anim_times=param_anim_times or None,
+            bend_rest_vert=concat_bend_rest_vert if has_bend_rest_vert else None,
+            bend_rest_vert_mask=bend_rest_vert_mask if has_bend_rest_vert else None,
+            bend_rest_vert_anim=bend_rest_vert_anim if has_bend_rest_vert_anim else None,
+            bend_rest_vert_times=bend_rest_vert_times if has_bend_rest_vert_anim else None,
+            collider_vert_mask=collider_vert_mask,
+            object_vert_index=object_vert_index,
+            intersect_policy=intersect_policy,
+            allow_existing_vertices=allow_existing_vertices,
+            group_vert_index=group_vert_index,
+            pin_allow_vertices=(
+                pin_allow_vertices if pin_allow_vertices.any() else None
+            ),
+            force_field=force_field,
+            force_field_context=force_field_context,
+            pdrd_body_rows=pdrd_body_rows if pdrd_body_rows else None,
+            pdrd_vert_index=pdrd_vert_index if next_body_id > 0 else None,
+            pdrd_vert_list=pdrd_vert_list if next_body_id > 0 else None,
+            pdrd_rest_centered=pdrd_rest_centered if next_body_id > 0 else None,
+            cosserat_edge=cosserat_edge,
+            cosserat_tilt=cosserat_tilt,
+            sand_param=concat_sand_param if concat_sand_param else None,
+            invisible_vert=invisible_vert if invisible_vert.any() else None,
+            translation_lock=translation_lock if has_translation_lock else None,
+            translation_lock_mode=(
+                translation_lock_mode if has_translation_lock else None
+            ),
+            rotation_lock=rotation_lock if has_rotation_lock else None,
+            rotation_lock_mode=rotation_lock_mode if has_rotation_lock else None,
+            statistics_objects=statistics_objects,
+            quiet=quiet,
+        )
+
+        # Linear (velocity:) and angular (angular_velocity:) overwrite
+        # schedules share the same dyn_param table (distinct key prefixes); the
+        # solver dispatches on the prefix.
+        merged_velocity_schedules = {
+            **velocity_schedules_by_dmap,
+            **angular_velocity_schedules_by_dmap,
+            **angular_world_velocity_schedules_by_dmap,
+        }
+        if merged_velocity_schedules:
+            fixed._velocity_schedules = merged_velocity_schedules
+        if collision_windows_by_dmap:
+            fixed._collision_windows_data = collision_windows_by_dmap
+
+        if len(concat_pin):
+            fixed.set_pin(concat_pin)
+        # Display pins keep each object's own Blender vertex indices: they are
+        # not simulation vertices, so the concatenated vertex map does not
+        # apply to them, and the addon addresses them by object.
+        display_pin = [
+            {
+                "uuid": name,
+                "blender_index": np.asarray(d["blender_index"], dtype=np.int64),
+                "rest": np.asarray(d["rest"], dtype=np.float64),
+                "dmap": dmap[name],
+                "pin": d["holder"]._data,
+            }
+            for name, obj in dyn_objects
+            for d in getattr(obj, "_display_pins", [])
+        ]
+        if display_pin:
+            fixed.set_display_pin(display_pin)
+
+        if static_vert.shape[0]:
+            fixed.set_static(
+                (static_vert_dmap, static_vert),
+                static_tri,
+                static_color,
+                concat_static_param,
+                concat_static_transform_anims if concat_static_transform_anims else None,
+                invisible_static_vert if invisible_static_vert.any() else None,
+            )
+
+        if concat_stitch_ind_arr.shape[0] and concat_stitch_w_arr.shape[0]:
+            # The rows the assembly carried as "initial" are measured here,
+            # against the built scene's own positions, which is where the
+            # two points of a cross-object stitch first share one frame.
+            rest_mode = np.asarray(assembled["concat_stitch_rest_mode"])
+            rest_length = np.array(
+                assembled["concat_stitch_rest_length"], dtype=np.float64
+            )
+            initial = rest_mode == _STITCH_REST_INITIAL
+            if initial.any():
+                rest_length[initial] = stitch_endpoint_distance(
+                    fixed.vertex(True),
+                    concat_stitch_ind_arr[initial],
+                    concat_stitch_w_arr[initial],
+                )
+            given = rest_mode != _STITCH_REST_DERIVED
+            fixed.set_stitch(
+                concat_stitch_ind_arr,
+                concat_stitch_w_arr,
+                concat_stitch_stiffness_arr,
+                rest_length=rest_length if given.any() else None,
+                rest_length_given=given if given.any() else None,
+            )
+
+        if self._tie:
+            fixed.set_tie(*self._resolve_ties(map_by_name, fixed.vertex(True)))
+
+        fixed._contact_gap_participants = tuple(
+            self._contact_gap_participants(gap_limits)
+        )
+
+        pbar.update(1)
+        advance("Building scene: validating constraints...")
+        pbar.close()
+
+        return fixed

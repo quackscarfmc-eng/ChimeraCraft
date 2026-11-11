@@ -1,0 +1,104 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+SceneVariables {
+    ["pixel_samples"] = 1,
+    ["image_width"] = 512,
+    ["image_height"] = 256,
+    ["lights_visible_in_camera"] = true,
+}
+
+shotCam = Camera("/Scene/rendering/camera") {
+    ["node_xform"] = translate(0, 0, 6),
+}
+
+-------------------------------------------------------
+-- Lights
+
+key = RectLight("key") {
+    ["node_xform"] = rotate(-90, 0, 1, 0) * translate(-50, 10, 0) * rotate(-18, 0, 0, 1) * rotate(-35, 0, 1, 0),
+    ["exposure"] = 13,
+    ["normalized"] = false,
+    ["width"] = 1,
+    ["height"] = 1,
+    ["visible_in_camera"] = 1,
+}
+
+lightSet = LightSet("MyLightSet") {
+    key,
+}
+
+-------------------------------------------------------
+-- Background
+
+checkerMap = CheckerboardMap("checkerMap") {
+    ["color_A"] = Rgb(0.0, 0.0, 0.4),
+    ["color_B"] = Rgb(0.4, 0.0, 0.0),
+    ["num_u_tiles"] = 40,
+    ["num_v_tiles"] = 2,
+}
+
+bgMtl = DwaEmissiveMaterial("bgMtl") {
+    ["emission"] = bind(checkerMap, Rgb(1,1,1)),
+}
+
+bgPlaneGeom = UsdGeometry("bgPlaneGeom") {
+    ["node_xform"] = rotate(90, 1, 0, 0) * scale(5.0, .25, 1) * translate(0, 0, 1),
+    ["stage"] = rats_assets_dir .. "/models/plane.usdc",
+    ["prim_path"] = "/plane",
+}
+
+-------------------------------------------------------
+-- Plane facing away from camera
+planeGeomFacingAway = UsdGeometry("planeGeomFacingAway") {
+    ["node_xform"] = rotate(90, 1, 0, 0) * rotate(225, 0, 1, 0) * translate(-1, 0, 1),
+    ["stage"] = rats_assets_dir .. "/models/plane.usdc",
+    ["prim_path"] = "/plane",
+    ["visible_shadow"] = false,
+}
+
+-------------------------------------------------------
+-- Plane facing camera
+planeGeomFacingFront = UsdGeometry("planeGeomFacingFront") {
+    ["node_xform"] = rotate(90, 1, 0, 0) * rotate(45, 0, 1, 0) * translate(0, 0, 1),
+    ["stage"] = rats_assets_dir .. "/models/plane.usdc",
+    ["prim_path"] = "/plane",
+    ["visible_shadow"] = false,
+}
+
+-------------------------------------------------------
+-- Box with thickness
+boxGeom = BoxGeometry("boxGeom") {
+    ["node_xform"] = scale(1, 1, 0.01) * rotate(45, 0, 1, 0) * translate(1, 0, 1),
+    ["visible_shadow"] = false,
+}
+
+-------------------------------------------------------
+-- Materials
+
+thinGeometryMtl = DwaBaseMaterial("thinGeometryMtl") {
+    ["albedo"] = Rgb(0.3, 0.3, 0.3),
+    ["diffuse_transmission_color"] = Rgb(0.2, 0.5, 0.2),
+    ["thin_geometry"] = true,
+}
+
+thickGeometryMtl = DwaBaseMaterial("thickGeometryMtl") {
+    ["albedo"] = Rgb(0.3, 0.3, 0.3),
+    ["diffuse_transmission_color"] = Rgb(0.2, 0.5, 0.2),
+    ["thin_geometry"] = false,
+}
+
+-------------------------------------------------------
+-- Assignments
+
+GeometrySet("Scene/geometrySet") {
+    bgPlaneGeom,
+    planeGeomFacingAway,
+    planeGeomFacingFront,
+    boxGeom,
+}
+Layer("/Scene/layer"){
+    {bgPlaneGeom, "", bgMtl, lightSet},
+    {planeGeomFacingAway, "", thinGeometryMtl, lightSet},
+    {planeGeomFacingFront, "", thinGeometryMtl, lightSet},
+    {boxGeom, "", thickGeometryMtl, lightSet},
+}

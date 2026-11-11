@@ -1,0 +1,532 @@
+# File: pins.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import json
+
+import gpu  # pyright: ignore
+
+from gpu_extras.batch import batch_for_shader  # pyright: ignore
+from mathutils import Vector  # pyright: ignore
+
+from ...state import decode_vertex_group_identifier, iterate_active_object_groups
+from ....core.utils import get_moving_vertex_indices
+from ....models.groups import get_addon_data
+
+from .primitives import _line_to_tris, _orthonormal_basis
+
+# On-screen point sizes baked into the snap_points data tuples at build time.
+_SNAP_SRC_POINT_SIZE = 7.0
+_SNAP_DST_POINT_SIZE = 5.0
+
+
+def _build_rod_batches(scene, depsgraph):
+    """Build GPU batches for all rod overlays. Returns list of (batch, color)."""
+    batches = []
+    thickness = 0.003
+
+    # Collect triangles grouped by color
+    color_triangles = {}
+
+    for group in iterate_active_object_groups(scene):
+        if group.object_type == "ROD" and group.show_overlay_color:
+            color = tuple(group.color)
+
+            for obj_ref in group.assigned_objects:
+                if not obj_ref.included:
+                    continue
+                from ....core.uuid_registry import resolve_assigned
+                obj = resolve_assigned(obj_ref)
+                if obj and obj.type == "MESH":
+                    eval_obj = obj.evaluated_get(depsgraph)
+                    mesh = eval_obj.data
+                    world_matrix = eval_obj.matrix_world
+
+                    if color not in color_triangles:
+                        color_triangles[color] = []
+                    tris = color_triangles[color]
+
+                    for edge in mesh.edges:
+                        v1 = world_matrix @ mesh.vertices[edge.vertices[0]].co
+                        v2 = world_matrix @ mesh.vertices[edge.vertices[1]].co
+
+                        edge_dir = (v2 - v1).normalized()
+
+                        perp1, perp2 = _orthonormal_basis(edge_dir)
+
+                        offset1 = perp1 * thickness
+                        offset2 = perp2 * thickness
+
+                        p1 = v1 + offset1
+                        p2 = v1 - offset1
+                        p3 = v2 - offset1
+                        p4 = v2 + offset1
+
+                        tris.extend([p1, p2, p3, p1, p3, p4])
+
+                        p5 = v1 + offset2
+                        p6 = v1 - offset2
+                        p7 = v2 - offset2
+                        p8 = v2 + offset2
+
+                        tris.extend([p5, p6, p7, p5, p7, p8])
+
+    for color, tris in color_triangles.items():
+        if tris:
+            batch = batch_for_shader(
+                gpu.shader.from_builtin("UNIFORM_COLOR"), "TRIS", {"pos": tris}
+            )
+            batches.append((batch, color))
+
+    return batches
+
+
+def _pc2_frame_positions(obj, scene):
+    """Read the current frame's vertex positions from the addon's PC2 cache.
+
+    Returns a list of ``Vector`` (one per base-mesh vertex) when the PC2
+    file is present and the current frame falls inside it; otherwise
+    None so the caller falls back to ``obj.data`` rest positions. PC2 is
+    the source of truth for simulation playback (the MESH_CACHE modifier
+    drives it), and reading it directly avoids modifier output that
+    would interpolate vertex-group weights.
+    """
+    import os
+
+    from ....core.pc2 import (
+        get_pc2_path,
+        object_pc2_key,
+        read_pc2_frame,
+        read_pc2_frame_count,
+    )
+
+    pc2 = get_pc2_path(object_pc2_key(obj))
+    if not os.path.exists(pc2):
+        return None
+    from ....core.encoder import resolve_start_frame_or_default
+
+    n_verts = len(obj.data.vertices)
+    n_frames = read_pc2_frame_count(pc2)
+    # Same mapping the MESH_CACHE modifier applies to this cache: PC2 index 0
+    # displays at the solve's starting frame. Reading index ``frame_current - 1``
+    # here instead would draw the pin markers at an unrelated moment of the sim
+    # whenever the solve does not start at frame 1.
+    frame_idx = scene.frame_current - resolve_start_frame_or_default(scene)
+    if n_frames <= 0 or not (0 <= frame_idx < n_frames):
+        return None
+    verts = read_pc2_frame(pc2, frame_idx, n_verts)
+    return [Vector(v) for v in verts]
+
+
+def _evaluated_pin_positions(obj, depsgraph, vert_indices):
+    """Return ``{vert_index: world_co}`` for *vert_indices* sampled from
+    the depsgraph-evaluated mesh of *obj*.
+
+    Used when the object's modifier stack deforms the cloth (Armature,
+    Lattice, Mesh Deform, Hook, shape keys, ...) and no simulation PC2
+    cache is present yet: without this path the pin overlay would
+    render at the rest-pose positions and visibly lag the bone
+    deformation in the viewport.
+
+    Returns ``None`` if the evaluated mesh isn't available; callers
+    fall through to ``obj.data.vertices[i].co``. Limits the iteration
+    to ``vert_indices`` so we never pay the per-redraw cost of walking
+    every vertex when only a small pin group needs sampling.
+    """
+    if depsgraph is None:
+        return None
+    try:
+        eval_obj = obj.evaluated_get(depsgraph)
+    except Exception:
+        return None
+    try:
+        eval_mesh = eval_obj.to_mesh()
+    except Exception:
+        return None
+    try:
+        n_eval = len(eval_mesh.vertices)
+        eval_world = eval_obj.matrix_world
+        out = {}
+        for vi in vert_indices:
+            if 0 <= vi < n_eval:
+                out[vi] = eval_world @ eval_mesh.vertices[vi].co
+        return out
+    finally:
+        try:
+            eval_obj.to_mesh_clear()
+        except Exception:
+            pass
+
+
+def _edit_mode_pin_positions(obj, vg_index):
+    """Return ``{vert_index: world_co}`` for verts in vg ``vg_index`` on
+    a mesh object that is currently in Edit Mode. Reads positions from
+    the live BMesh so vertex drags update the pin overlay in real time
+    instead of staying at the object-mode snapshot. Returns ``None`` if
+    the object isn't in edit mode or its bmesh has no deform layer.
+    """
+    if obj.mode != "EDIT":
+        return None
+    import bmesh
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+    except Exception:
+        return None
+    dl = bm.verts.layers.deform.active
+    if dl is None:
+        return {}
+    world_matrix = obj.matrix_world
+    out = {}
+    for bv in bm.verts:
+        weights = bv[dl]
+        if vg_index in weights and weights[vg_index] > 0.0:
+            out[bv.index] = world_matrix @ bv.co
+    return out
+
+
+def _build_pin_data(scene, depsgraph):
+    """Build pin vertex data. Returns list of (vertex, size, color) tuples."""
+    pin_data = []
+
+    for group in iterate_active_object_groups(scene):
+        if group.object_type != "STATIC":
+            # Frames elapsed since the solve began. A pin duration is a COUNT
+            # of frames measured from simulated time zero (the encoder emits
+            # ``pin_duration / fps`` with no origin), so comparing it against
+            # an absolute Blender frame only lines up when the solve starts at
+            # frame 1. Rebasing here keeps the overlay's release moment on the
+            # solver's.
+            from ....core.encoder import resolve_start_frame_or_default
+            current_frame = scene.frame_current - resolve_start_frame_or_default(scene)
+            # UUIDs of objects that have at least one pin to draw this
+            # frame. Only these objects can contribute a pin dot, so
+            # objects with no matching visible pin are skipped before the
+            # per-object setup below (PC2 read, moving-index scan,
+            # modifier-stack probe) ever runs. Without this gate that
+            # setup executes for every assigned object even in a group
+            # with no pins, which is ~1.8s on a 1.6k-object net.
+            pinned_obj_uuids = {
+                pin_ref.object_uuid
+                for pin_ref in group.pin_vertex_groups
+                if pin_ref.show_overlay
+                and pin_ref.object_uuid
+                and not (
+                    pin_ref.use_pin_duration
+                    and current_frame >= pin_ref.pin_duration
+                )
+            }
+            if not pinned_obj_uuids:
+                continue
+            for obj_ref in group.assigned_objects:
+                if not obj_ref.included:
+                    continue
+                if obj_ref.uuid not in pinned_obj_uuids:
+                    continue
+                from ....core.uuid_registry import resolve_assigned, resolve_pin
+                obj = resolve_assigned(obj_ref)
+                if not obj:
+                    continue
+                _obj_uuid = obj_ref.uuid
+
+                if obj.type == "MESH":
+                    # Pin indices are defined on the base cage, so use
+                    # obj.data (not eval_obj.data) to find which vertices
+                    # belong to the pin's vertex group. The evaluated
+                    # mesh has SUBSURF / other modifiers applied, and
+                    # Blender interpolates vertex-group weights onto
+                    # subdivided verts (edge midpoints, face centers,
+                    # one-ring); iterating it would render pin dots over
+                    # those interpolated locations instead of the actual
+                    # pinned cage verts.
+                    #
+                    # Current world positions come from the PC2 cache
+                    # when present so the overlay follows the simulation;
+                    # fall back to the base-mesh rest pose otherwise.
+                    base_mesh = obj.data
+                    world_matrix = obj.matrix_world
+                    animated_positions = _pc2_frame_positions(obj, scene)
+                    animated_indices = set(get_moving_vertex_indices(obj))
+                    # When the cloth has a deforming modifier (Armature,
+                    # Lattice, Mesh Deform, shape keys, ...) and the
+                    # simulation hasn't produced a PC2 cache for it yet,
+                    # the rest-pose fallback would render pin dots at
+                    # the un-deformed positions while Blender draws the
+                    # mesh bent by the bone. Sample the depsgraph-
+                    # evaluated mesh for the pinned verts so the overlay
+                    # follows the live bone deformation. Bounded by the
+                    # pin's vertex count, not by the whole mesh.
+                    from ....core.utils import has_deforming_modifier_stack
+                    deforms_via_modifiers = (
+                        animated_positions is None
+                        and has_deforming_modifier_stack(obj)
+                    )
+
+                    for pin_ref in group.pin_vertex_groups:
+                        if not pin_ref.show_overlay:
+                            continue
+                        if pin_ref.use_pin_duration and current_frame >= pin_ref.pin_duration:
+                            continue
+                        resolve_pin(pin_ref)
+                        _, pin_vg_name = decode_vertex_group_identifier(
+                            pin_ref.name
+                        )
+                        if pin_ref.object_uuid == _obj_uuid:
+                            vg = obj.vertex_groups.get(pin_vg_name)
+                            if vg:
+                                has_ops = any(
+                                    op.op_type in ("SPIN", "SCALE", "MOVE_BY", "TORQUE")
+                                    for op in pin_ref.operations
+                                )
+                                vg_index = vg.index
+                                # While the user is editing this mesh,
+                                # the live vertex positions live in
+                                # BMesh; ``base_mesh.vertices[i].co``
+                                # still holds the pre-edit snapshot
+                                # until mode exit, so the overlay would
+                                # lag behind a vertex drag. Read live
+                                # positions from BMesh here. PC2-driven
+                                # animated positions are skipped while
+                                # in edit mode because the pin handler
+                                # cannot rewrite the BMesh-owned data
+                                # anyway and the user expects to see
+                                # what they're dragging.
+                                edit_positions = _edit_mode_pin_positions(
+                                    obj, vg_index,
+                                )
+                                if edit_positions is not None:
+                                    for vi, world_co in edit_positions.items():
+                                        if has_ops or vi in animated_indices:
+                                            color = (0.5, 0.5, 1.0, 0.8)
+                                        else:
+                                            color = (1.0, 1.0, 1.0, 0.8)
+                                        pin_data.append((
+                                            world_co,
+                                            group.pin_overlay_size,
+                                            color,
+                                        ))
+                                    continue
+                                # First pass: collect pinned indices off
+                                # the base cage (vertex-group membership
+                                # lives on obj.data, not the eval mesh).
+                                pinned_idx = [
+                                    vert.index
+                                    for vert in base_mesh.vertices
+                                    if any(g.group == vg_index for g in vert.groups)
+                                ]
+                                # If the cloth deforms via modifiers and
+                                # has no PC2 yet, sample those indices
+                                # from the depsgraph; otherwise this is
+                                # None and we keep the rest-pose path.
+                                eval_positions = (
+                                    _evaluated_pin_positions(
+                                        obj, depsgraph, pinned_idx,
+                                    )
+                                    if deforms_via_modifiers else None
+                                )
+                                for vi in pinned_idx:
+                                    if animated_positions is not None:
+                                        world_co = world_matrix @ animated_positions[vi]
+                                    elif eval_positions is not None and vi in eval_positions:
+                                        world_co = eval_positions[vi]
+                                    else:
+                                        world_co = world_matrix @ base_mesh.vertices[vi].co
+                                    if has_ops or vi in animated_indices:
+                                        color = (0.5, 0.5, 1.0, 0.8)
+                                    else:
+                                        color = (1.0, 1.0, 1.0, 0.8)
+                                    pin_data.append((
+                                        world_co,
+                                        group.pin_overlay_size,
+                                        color,
+                                    ))
+
+                elif obj.type == "CURVES":
+                    # Hair Curves: a pin holds points, and a dot sits where
+                    # the viewport shows the point (the frame being played
+                    # back, or the groom before any solve).
+                    from ....core.hair_curves import (
+                        displayed_local_positions,
+                        pin_indices as hair_pin_indices,
+                    )
+                    world_matrix = obj.matrix_world
+                    hair_local = displayed_local_positions(obj)
+                    for pin_ref in group.pin_vertex_groups:
+                        if not pin_ref.show_overlay:
+                            continue
+                        if pin_ref.use_pin_duration and current_frame >= pin_ref.pin_duration:
+                            continue
+                        resolve_pin(pin_ref)
+                        _, pin_vg_name = decode_vertex_group_identifier(
+                            pin_ref.name
+                        )
+                        if pin_ref.object_uuid != _obj_uuid:
+                            continue
+                        moves = pin_ref.has_captured_anim or any(
+                            op.op_type in ("SPIN", "SCALE", "MOVE_BY", "TORQUE")
+                            for op in pin_ref.operations
+                        )
+                        color = (0.5, 0.5, 1.0, 0.8) if moves else (1.0, 1.0, 1.0, 0.8)
+                        for point in hair_pin_indices(obj, pin_vg_name):
+                            if point < len(hair_local):
+                                pin_data.append((
+                                    world_matrix @ Vector(hair_local[point]),
+                                    group.pin_overlay_size,
+                                    color,
+                                ))
+
+                elif obj.type == "CURVE":
+                    world_matrix = obj.matrix_world
+                    for pin_ref in group.pin_vertex_groups:
+                        if not pin_ref.show_overlay:
+                            continue
+                        if pin_ref.use_pin_duration and current_frame >= pin_ref.pin_duration:
+                            continue
+                        resolve_pin(pin_ref)
+                        _, pin_vg_name = decode_vertex_group_identifier(
+                            pin_ref.name
+                        )
+                        if pin_ref.object_uuid == _obj_uuid:
+                            key = f"_pin_{pin_vg_name}"
+                            raw = obj.get(key)
+                            if not raw:
+                                continue
+                            cp_indices = set(json.loads(raw))
+                            has_ops = any(
+                                op.op_type in ("SPIN", "SCALE", "MOVE_BY", "TORQUE")
+                                for op in pin_ref.operations
+                            )
+                            color = (0.5, 0.5, 1.0, 0.8) if has_ops else (1.0, 1.0, 1.0, 0.8)
+                            idx = 0
+                            for spline in obj.data.splines:
+                                if spline.type == "BEZIER":
+                                    for bp in spline.bezier_points:
+                                        if idx in cp_indices:
+                                            pin_data.append((
+                                                world_matrix @ bp.co,
+                                                group.pin_overlay_size,
+                                                color,
+                                            ))
+                                        idx += 1
+                                else:
+                                    for pt in spline.points:
+                                        if idx in cp_indices:
+                                            pin_data.append((
+                                                world_matrix @ Vector((pt.co[0], pt.co[1], pt.co[2])),
+                                                group.pin_overlay_size,
+                                                color,
+                                            ))
+                                        idx += 1
+
+    return pin_data
+
+
+def _overlay_object_points(scene, obj_uuid, depsgraph):
+    from ....core.uuid_registry import get_object_by_uuid
+    obj = get_object_by_uuid(obj_uuid) if obj_uuid else None
+    if obj is None:
+        return None
+    if obj.type == "MESH":
+        # Prefer the simulation PC2 cache (animated output positions).
+        # _pc2_frame_positions returns local-space Vectors or None on a cache
+        # miss / out-of-range frame.
+        positions = _pc2_frame_positions(obj, scene)
+        if positions is not None:
+            return [obj.matrix_world @ p for p in positions]
+        # No PC2: sample the EVALUATED mesh so a modifier-deformed target
+        # (Armature, Lattice, Mesh Deform, shape keys, ...) draws its stitch
+        # endpoints on the DEFORMED surface the snap targeted and the solver
+        # runs on, not the rest/bind pose. For an armature-posed character the
+        # bind pose sits far from the deformed surface, so a rest-pose fallback
+        # makes the stitch lines shoot off to the bind pose. Mirrors
+        # _evaluated_pin_positions; a deform modifier preserves vertex
+        # count/order, so index i still names the same vertex the stitch ``ind``
+        # does. Falls back to obj.data only when the evaluated mesh is
+        # unavailable.
+        if depsgraph is not None:
+            try:
+                eval_obj = obj.evaluated_get(depsgraph)
+                eval_mesh = eval_obj.to_mesh()
+            except Exception:
+                eval_mesh = None
+            if eval_mesh is not None:
+                try:
+                    eval_world = eval_obj.matrix_world
+                    pts = [eval_world @ v.co for v in eval_mesh.vertices]
+                finally:
+                    try:
+                        eval_obj.to_mesh_clear()
+                    except Exception:
+                        pass
+                return pts
+        return [obj.matrix_world @ v.co for v in obj.data.vertices]
+    if obj.type == "CURVE":
+        from ....core.curve_rod import sample_curve
+
+        vert, _, _ = sample_curve(obj, obj.matrix_world)
+        return [Vector(v) for v in vert]
+    return None
+
+
+def _build_snap_batches(scene, depsgraph):
+    state = get_addon_data(scene).state
+    all_tris = []
+    snap_points = []
+    thickness = 0.0018
+
+    for pair in state.merge_pairs:
+        if not pair.show_stitch:
+            continue
+        if not pair.cross_stitch_json:
+            continue
+        try:
+            stitch = json.loads(pair.cross_stitch_json)
+        except json.JSONDecodeError:
+            continue
+
+        source_uuid = stitch.get("source_uuid", "")
+        target_uuid = stitch.get("target_uuid", "")
+        ind = stitch.get("ind", [])
+        w = stitch.get("w", [])
+        if not source_uuid or not target_uuid or not ind or not w:
+            continue
+
+        source_points = _overlay_object_points(scene, source_uuid, depsgraph)
+        target_points = _overlay_object_points(scene, target_uuid, depsgraph)
+        if source_points is None or target_points is None:
+            continue
+
+        for row, weight in zip(ind, w, strict=False):
+            # The source is a single Blender vertex (degenerate
+            # [si, si, si]); target bary is slots 3..5 in the 6-wide layout
+            # and slots 1..3 in the legacy 4-wide layout. Accept both.
+            if len(row) >= 6 and len(weight) >= 6:
+                src_i = int(row[0])
+                target_indices = [int(row[3]), int(row[4]), int(row[5])]
+                wts = (float(weight[3]), float(weight[4]), float(weight[5]))
+            elif len(row) >= 4 and len(weight) >= 4:
+                src_i = int(row[0])
+                target_indices = [int(row[1]), int(row[2]), int(row[3])]
+                wts = (float(weight[1]), float(weight[2]), float(weight[3]))
+            else:
+                continue
+            if src_i < 0 or src_i >= len(source_points):
+                continue
+            if any(idx < 0 or idx >= len(target_points) for idx in target_indices):
+                continue
+
+            source_pos = source_points[src_i]
+            target_pos = (
+                wts[0] * target_points[target_indices[0]]
+                + wts[1] * target_points[target_indices[1]]
+                + wts[2] * target_points[target_indices[2]]
+            )
+            all_tris.extend(_line_to_tris(source_pos, target_pos, thickness))
+            snap_points.append((source_pos, _SNAP_SRC_POINT_SIZE, (1.0, 0.7, 0.2, 1.0)))
+            snap_points.append((target_pos, _SNAP_DST_POINT_SIZE, (1.0, 1.0, 0.2, 1.0)))
+
+    if not all_tris:
+        return [], []
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "TRIS", {"pos": all_tris})
+    return [(batch, (1.0, 0.9, 0.2, 0.95))], snap_points

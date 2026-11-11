@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "attrAmount" :
+        {
+            "default" : "1.0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "attrLumaCoeffs" :
+        {
+            "default" : "Rgb(0.272287f, 0.6740818f, 0.0536895f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "lumacoeffs",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_saturate_color3",
+    "type" : "Map"
+}

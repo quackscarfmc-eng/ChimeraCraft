@@ -1,0 +1,1266 @@
+// File: crates/ppf-cts-core/src/kernels/intersection.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// Host-side self-intersection detection for the scene-build check.
+//
+// The edge-triangle pierce predicate is NOT reimplemented here: it is a
+// single source of truth shared with the GPU contact kernels. The same
+// templated routine in the solver's C++ tree
+// (crates/ppf-cts-solver/src/kernels/contact/intersect_core.hpp) is
+// instantiated for float on the device and for double here, reached via
+// the `extern "C"` shim in crates/ppf-cts-core/cpp/intersect_ffi.cpp
+// (compiled by build.rs). This module owns only the broad phase, the
+// topological skip rules, and the coplanar-overlap fallback:
+//
+//   * `edge_triangle_intersect` (FFI to the shared device predicate).
+//   * `triangles_coplanar_overlap` (2D-projection fallback; host only).
+//   * `_segments_intersect_2d`, `_point_in_triangle_2d`.
+//   * `_find_edge_tri_intersections` (BVH traversal with skip rules).
+//
+// Pipeline:
+//   1. Extract unique mesh edges + edge_to_tri (parents per edge).
+//   2. If rod_edges given, append them with parent = (-1, -1).
+//   3. Build tri-BVH; compute per-edge bboxes.
+//   4. rayon-parallel scan over edges → (edge_idx, tri_idx) hits.
+//   5. Convert (edge, tri) hits to deduplicated, sorted (parent, tri)
+//      pairs. Rod hits emerge as (-1, tri_idx) and append after.
+//
+// Skip rules (preserved from Python source):
+//   * triangle == parent of edge: skipped (sharing topology).
+//   * pairs sharing any vertex: skipped.
+//   * collider × collider: skipped (where edge is "collider" iff
+//     either of its parent triangles is flagged).
+
+use std::collections::BTreeSet;
+
+use rayon::prelude::*;
+
+use super::bvh::{
+    build_tri_bvh, compute_edge_bboxes, extract_edges_with_tri_map, traverse_overlap, Bvh,
+};
+use super::geom_util::{
+    bbox_overlap, cross3, dot3, elements_share_vertex_2_3, elements_share_vertex_3_3, sub3, vert3,
+};
+
+const COPLANAR_EPS: f64 = 1e-10;
+const SEGMENT_2D_EPS_PARAMETER: f64 = 1e-10;
+const SEGMENT_2D_EPS_CROSS: f64 = 1e-14;
+
+// ---------------------------------------------------------------------------
+// Edge-triangle intersection primitive (shared with the GPU).
+
+extern "C" {
+    /// Single source of truth for the edge-triangle pierce test, defined
+    /// in crates/ppf-cts-solver/src/kernels/contact/intersect_core.hpp and
+    /// linked via the host shim compiled by build.rs. The device contact
+    /// kernels call the same routine (instantiated for float); this is the
+    /// double instantiation, so the host build-check runs it in f64. Each
+    /// pointer addresses three contiguous `f64` coordinates.
+    fn isect_edge_triangle_intersect(
+        e0: *const f64,
+        e1: *const f64,
+        v0: *const f64,
+        v1: *const f64,
+        v2: *const f64,
+    ) -> bool;
+}
+
+/// True iff segment `(e0, e1)` strictly crosses triangle `(v0, v1, v2)`.
+/// Coplanar / touching cases return false; those are handled by
+/// `triangles_coplanar_overlap` separately. Thin wrapper over the shared
+/// device predicate (see the `extern "C"` block above).
+#[inline]
+fn edge_triangle_intersect(
+    e0: [f64; 3],
+    e1: [f64; 3],
+    v0: [f64; 3],
+    v1: [f64; 3],
+    v2: [f64; 3],
+) -> bool {
+    // Safety: every pointer addresses a live `[f64; 3]` on this stack
+    // frame; the C routine only reads three doubles from each and does not
+    // retain them.
+    unsafe {
+        isect_edge_triangle_intersect(
+            e0.as_ptr(),
+            e1.as_ptr(),
+            v0.as_ptr(),
+            v1.as_ptr(),
+            v2.as_ptr(),
+        )
+    }
+}
+
+/// 2D segment intersection in the (open-interval) interior. Used
+/// only by the coplanar fallback.
+#[inline]
+fn segments_intersect_2d(
+    p1x: f64,
+    p1y: f64,
+    p2x: f64,
+    p2y: f64,
+    p3x: f64,
+    p3y: f64,
+    p4x: f64,
+    p4y: f64,
+) -> bool {
+    let d1x = p2x - p1x;
+    let d1y = p2y - p1y;
+    let d2x = p4x - p3x;
+    let d2y = p4y - p3y;
+    let cross = d1x * d2y - d1y * d2x;
+    if cross.abs() < SEGMENT_2D_EPS_CROSS {
+        return false;
+    }
+    let t = ((p3x - p1x) * d2y - (p3y - p1y) * d2x) / cross;
+    let u = ((p3x - p1x) * d1y - (p3y - p1y) * d1x) / cross;
+    let eps = SEGMENT_2D_EPS_PARAMETER;
+    eps < t && t < 1.0 - eps && eps < u && u < 1.0 - eps
+}
+
+#[inline]
+fn point_in_triangle_2d(
+    px: f64,
+    py: f64,
+    v0x: f64,
+    v0y: f64,
+    v1x: f64,
+    v1y: f64,
+    v2x: f64,
+    v2y: f64,
+) -> bool {
+    #[inline(always)]
+    fn sign(x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64) -> f64 {
+        (x1 - x3) * (y2 - y3) - (x2 - x3) * (y1 - y3)
+    }
+    let d1 = sign(px, py, v0x, v0y, v1x, v1y);
+    let d2 = sign(px, py, v1x, v1y, v2x, v2y);
+    let d3 = sign(px, py, v2x, v2y, v0x, v0y);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+/// Coplanar-overlap fallback.
+#[inline]
+fn triangles_coplanar_overlap(
+    t0_v: [[f64; 3]; 3],
+    t1_v: [[f64; 3]; 3],
+) -> bool {
+    let e1 = sub3(t0_v[1], t0_v[0]);
+    let e2 = sub3(t0_v[2], t0_v[0]);
+    let n = cross3(e1, e2);
+    let n_len_sq = dot3(n, n);
+    let n_len = n_len_sq.sqrt();
+    if n_len < COPLANAR_EPS {
+        return false;
+    }
+    // Coplanarity check, scale-aware.
+    let d0 = dot3(n, sub3(t1_v[0], t0_v[0])).abs();
+    let d1 = dot3(n, sub3(t1_v[1], t0_v[0])).abs();
+    let d2 = dot3(n, sub3(t1_v[2], t0_v[0])).abs();
+    let thresh = n_len * COPLANAR_EPS * 100.0;
+    if d0 > thresh || d1 > thresh || d2 > thresh {
+        return false;
+    }
+
+    // Project to 2D using the largest normal component as the dropped axis.
+    let an = [n[0].abs(), n[1].abs(), n[2].abs()];
+    let (ax, ay) = if an[0] > an[1] && an[0] > an[2] {
+        (1usize, 2usize)
+    } else if an[1] > an[2] {
+        (0, 2)
+    } else {
+        (0, 1)
+    };
+    let u = [
+        (t0_v[0][ax], t0_v[0][ay]),
+        (t0_v[1][ax], t0_v[1][ay]),
+        (t0_v[2][ax], t0_v[2][ay]),
+    ];
+    let v = [
+        (t1_v[0][ax], t1_v[0][ay]),
+        (t1_v[1][ax], t1_v[1][ay]),
+        (t1_v[2][ax], t1_v[2][ay]),
+    ];
+
+    // 9 edge × edge intersection tests.
+    let t0_edges = [(u[0], u[1]), (u[1], u[2]), (u[2], u[0])];
+    let t1_edges = [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])];
+    for &(a, b) in &t0_edges {
+        for &(c, d) in &t1_edges {
+            if segments_intersect_2d(a.0, a.1, b.0, b.1, c.0, c.1, d.0, d.1) {
+                return true;
+            }
+        }
+    }
+
+    // Vertex containment tests in both directions.
+    for &(vx, vy) in &v {
+        if point_in_triangle_2d(vx, vy, u[0].0, u[0].1, u[1].0, u[1].1, u[2].0, u[2].1) {
+            return true;
+        }
+    }
+    for &(ux, uy) in &u {
+        if point_in_triangle_2d(ux, uy, v[0].0, v[0].1, v[1].0, v[1].1, v[2].0, v[2].1) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Per-edge BVH traversal.
+
+// ---------------------------------------------------------------------------
+// Intersection allowances (issue #138).
+//
+// Three opt-ins let a scene start, and keep running, with intersections it
+// knows about: a per-object "allow self", a per-object "allow inter-object",
+// and a per-pin "allow the intersections of the elements I fully cover". This
+// check and the solver's own `check_intersection` must grant exactly the same
+// set, or a scene that builds here aborts there, or worse, one that is
+// tolerated there is refused here. Both therefore read the same three
+// per-VERTEX facts, and both derive an element's side of the question the same
+// way: identity and material policy from the element's FIRST vertex (a vertex
+// belongs to exactly one object, so every element built on it does too), and
+// the pinned-element bit as the AND over all of its vertices, which is what
+// "all N vertices are pinned by an allowing pin" means.
+
+/// `intersect_policy` bits. Mirrored in `ppf-cts-solver`'s `data.rs` and
+/// `src/kernels/contact/intersect_policy.hpp`, and in `frontend/_scene_.py`,
+/// which writes them.
+pub const INTERSECT_ALLOW_SELF: u8 = 1 << 0;
+pub const INTERSECT_ALLOW_INTER_OBJECT: u8 = 1 << 1;
+pub const INTERSECT_ALLOW_INTER_GROUP: u8 = 1 << 2;
+
+/// `vert_object_id` for a vertex whose source object is unknown, which is what
+/// an appended STATIC collision triangle gets. Never equal to itself, so two
+/// unknowns are not mistaken for one object.
+pub const NO_OBJECT_ID: i32 = -1;
+
+/// `vert_group_id` for a vertex that belongs to no group, which is what an
+/// appended STATIC collision vertex gets. Never equal to itself, so a
+/// collider is another group from every object.
+pub const NO_GROUP_ID: i32 = -1;
+
+/// One element's side of the allowance question.
+pub(crate) struct ElementSide {
+    object_id: i32,
+    group_id: i32,
+    policy: u8,
+    pin_allows: bool,
+}
+
+/// Per-vertex view of the three facts, with every array optional. A caller
+/// that passes none tolerates nothing, so every intersecting pair is reported.
+pub(crate) struct VertexIntersectPolicy<'a> {
+    object_id: Option<&'a [i32]>,
+    /// Absent puts every vertex in one group, which is exact for a scene no
+    /// allowance asks about groups.
+    group_id: Option<&'a [i32]>,
+    policy: Option<&'a [u8]>,
+    pin_allows: Option<&'a [bool]>,
+}
+
+impl<'a> VertexIntersectPolicy<'a> {
+    /// The four per-vertex facts, each optional, in one namespace of vertices.
+    pub(crate) fn new(
+        object_id: Option<&'a [i32]>,
+        group_id: Option<&'a [i32]>,
+        policy: Option<&'a [u8]>,
+        pin_allows: Option<&'a [bool]>,
+    ) -> Self {
+        VertexIntersectPolicy {
+            object_id,
+            group_id,
+            policy,
+            pin_allows,
+        }
+    }
+
+    pub(crate) fn is_inert(&self) -> bool {
+        self.policy.is_none() && self.pin_allows.is_none()
+    }
+
+    pub(crate) fn side_of(&self, element: &[i32]) -> ElementSide {
+        let first = element[0] as usize;
+        ElementSide {
+            object_id: self.object_id.map(|a| a[first]).unwrap_or(NO_OBJECT_ID),
+            group_id: self.group_id.map(|a| a[first]).unwrap_or(0),
+            policy: self.policy.map(|a| a[first]).unwrap_or(0),
+            // An element with no vertices could not be intersecting anything;
+            // `all` over an empty slice would answer true, so require one.
+            pin_allows: self
+                .pin_allows
+                .map(|a| !element.is_empty() && element.iter().all(|&v| a[v as usize]))
+                .unwrap_or(false),
+        }
+    }
+
+    /// Mirror of `isect::intersection_tolerated`, which lives in
+    /// `crates/ppf-cts-solver/src/kernels/contact/intersect_policy.hpp` and which
+    /// the device visitors and the host ABI shim both call. Keep the two in
+    /// step; a divergence is a build that passes one gate and fails the other.
+    pub(crate) fn tolerated(&self, a: &ElementSide, b: &ElementSide) -> bool {
+        if self.is_inert() {
+            return false;
+        }
+        // Either side is enough: a pin that allows intersections covers the
+        // geometry it holds against whatever it meets.
+        if a.pin_allows || b.pin_allows {
+            return true;
+        }
+        let same_object = a.object_id != NO_OBJECT_ID && a.object_id == b.object_id;
+        if same_object {
+            return a.policy & INTERSECT_ALLOW_SELF != 0;
+        }
+        let either = a.policy | b.policy;
+        if either & INTERSECT_ALLOW_INTER_OBJECT != 0 {
+            return true;
+        }
+        let same_group = a.group_id != NO_GROUP_ID && a.group_id == b.group_id;
+        !same_group && either & INTERSECT_ALLOW_INTER_GROUP != 0
+    }
+}
+
+#[inline]
+fn find_edge_tri_intersections(
+    ei: usize,
+    verts: &[f64],
+    edges: &[i32],
+    tris: &[i32],
+    edge_to_tri: &[i32],
+    edge_bb_min: &[[f64; 3]],
+    edge_bb_max: &[[f64; 3]],
+    tri_bvh: &Bvh,
+    is_collider_tri: &[bool],
+    is_collider_rod_edge: bool,
+    tri_body_id: &[i32],
+    policy: &VertexIntersectPolicy<'_>,
+) -> Vec<(i32, i32)> {
+    let edge = [edges[2 * ei], edges[2 * ei + 1]];
+    let e0 = vert3(verts, edge[0]);
+    let e1 = vert3(verts, edge[1]);
+    let bb_min = &edge_bb_min[ei];
+    let bb_max = &edge_bb_max[ei];
+
+    let parent_tri0 = edge_to_tri[2 * ei];
+    let parent_tri1 = edge_to_tri[2 * ei + 1];
+    let has_parent = parent_tri0 >= 0;
+
+    // Parent triangle vertices (only used by the coplanar fallback and
+    // only when has_parent). Init with degenerate values so the
+    // fallback short-circuits if has_parent is false.
+    let parent_tri = if has_parent {
+        [
+            tris[3 * parent_tri0 as usize],
+            tris[3 * parent_tri0 as usize + 1],
+            tris[3 * parent_tri0 as usize + 2],
+        ]
+    } else {
+        [0, 0, 0]
+    };
+    let p_v = if has_parent {
+        [
+            vert3(verts, parent_tri[0]),
+            vert3(verts, parent_tri[1]),
+            vert3(verts, parent_tri[2]),
+        ]
+    } else {
+        [e0, e1, e0]
+    };
+
+    // The edge is "collider" iff either of its parent triangles is. A rod
+    // edge has no parent triangle, so the caller says whether it is one.
+    let edge_is_collider = is_collider_rod_edge
+        || (parent_tri0 >= 0 && is_collider_tri[parent_tri0 as usize])
+        || (parent_tri1 >= 0 && is_collider_tri[parent_tri1 as usize]);
+
+    // The edge's PDRD rigid-body id (0 = not a member of any body). Every
+    // triangle of a body carries the same id, so either parent reports it;
+    // a rod edge (parent < 0) reports 0. Used to skip intra-body pairs.
+    let edge_body_id = if parent_tri0 >= 0 {
+        tri_body_id[parent_tri0 as usize]
+    } else if parent_tri1 >= 0 {
+        tri_body_id[parent_tri1 as usize]
+    } else {
+        0
+    };
+
+    // The edge's side of the intersection allowances (issue #138). Identity
+    // and material policy come from its FIRST vertex and the pinned-element
+    // bit is the AND over both, which is what the device tester does with
+    // `EdgeProp::pin_allow_intersection`; deriving both from vertices is what
+    // keeps this check and the solver's from disagreeing, since a build that
+    // passes here must not abort there and the reverse is a silent tolerance.
+    let edge_side = policy.side_of(&edge);
+
+    let mut out = Vec::new();
+    traverse_overlap(tri_bvh, bb_min, bb_max, |ti| {
+        if ti == parent_tri0 || ti == parent_tri1 {
+            return;
+        }
+        if edge_is_collider && is_collider_tri[ti as usize] {
+            return;
+        }
+        // Skip intra-PDRD-body edge/triangle pairs: a rigid body never
+        // deforms, so an edge piercing a triangle of the SAME body is a
+        // fixed, physically meaningless self-intersection that must be
+        // tolerated even when the body starts self-tangled. Mirrors the
+        // device-side same_pdrd_body filter in
+        // ppf-cts-solver's kernels/contact/pair_filter.kernel.cpp.
+        if edge_body_id != 0 && edge_body_id == tri_body_id[ti as usize] {
+            return;
+        }
+        let tri = [
+            tris[3 * ti as usize],
+            tris[3 * ti as usize + 1],
+            tris[3 * ti as usize + 2],
+        ];
+        if elements_share_vertex_2_3(edge, tri) {
+            return;
+        }
+        if policy.tolerated(&edge_side, &policy.side_of(&tri)) {
+            return;
+        }
+        if !bbox_overlap(
+            bb_min,
+            bb_max,
+            &tri_bvh.elem_bboxes_min[ti as usize],
+            &tri_bvh.elem_bboxes_max[ti as usize],
+        ) {
+            return;
+        }
+
+        let v0 = vert3(verts, tri[0]);
+        let v1 = vert3(verts, tri[1]);
+        let v2 = vert3(verts, tri[2]);
+        let mut intersects = edge_triangle_intersect(e0, e1, v0, v1, v2);
+
+        // Coplanar fallback only when there's a real parent
+        // triangle (i.e., this isn't a rod edge) AND the
+        // parent doesn't already share vertices with the
+        // candidate (those would be filtered topologically
+        // and never count as a real coplanar overlap).
+        if !intersects && has_parent && !elements_share_vertex_3_3(parent_tri, tri) {
+            intersects = triangles_coplanar_overlap(p_v, [v0, v1, v2]);
+        }
+
+        if intersects {
+            out.push((ei as i32, ti));
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+
+pub struct IntersectionInput<'a> {
+    pub verts: &'a [f64],
+    pub tris: &'a [i32],
+    pub is_collider: Option<&'a [bool]>,
+    pub rod_edges: Option<&'a [i32]>,
+    /// Per-ROD-EDGE collider flag, one entry per pair of `rod_edges`: true
+    /// for a segment whose both vertices are pinned, so that its motion is
+    /// prescribed as a collider triangle's is. Such a segment against a
+    /// collider triangle is a pair with nothing free to move, which is not
+    /// a contact pair in the solver (`either_dyn` in
+    /// `kernels/contact/pair_filter.kernel.cpp`) and is skipped here the way
+    /// a fully pinned triangle against a collider triangle is. It is what
+    /// lets a strand held over its first segment grow out of the surface it
+    /// is rooted on. `None` treats every rod edge as free.
+    pub rod_is_collider: Option<&'a [bool]>,
+    /// Optional per-triangle 1-based PDRD rigid-body id (0 = not a member
+    /// of any rigid body). Parallel to `tris`. When two triangles share
+    /// the same nonzero id they belong to the same rigid body, which
+    /// never deforms; an edge of one piercing the other is a fixed,
+    /// physically meaningless self-intersection and is skipped. Mirrors
+    /// the device-side `same_pdrd_body` filter in `ppf-cts-solver`'s
+    /// `kernels/contact/pair_filter.kernel.cpp`. `None`
+    /// disables the rule (every triangle treated as body 0).
+    pub tri_body_id: Option<&'a [i32]>,
+    /// Per-VERTEX source-object identity in the same namespace as `verts`
+    /// (`NO_OBJECT_ID` for a vertex whose object is unknown, which is what an
+    /// appended STATIC collision vertex gets). Together with `vert_policy` it
+    /// drives the self- and inter-object allowances; `None` disables both.
+    pub vert_object_id: Option<&'a [i32]>,
+    /// Per-VERTEX source-group identity (`NO_GROUP_ID` for an appended STATIC
+    /// collision vertex). Read only by the inter-group allowance; `None` puts
+    /// every vertex in one group.
+    pub vert_group_id: Option<&'a [i32]>,
+    /// Per-VERTEX `INTERSECT_ALLOW_*` bits, resolved from each vertex's
+    /// object's material. `None` means no object allows anything.
+    pub vert_policy: Option<&'a [u8]>,
+    /// Per-VERTEX "pinned by a pin that allows its intersections". An element
+    /// is exempt only when every one of its vertices carries this. `None`
+    /// means no pin grants an allowance.
+    pub vert_pin_allow: Option<&'a [bool]>,
+}
+
+/// Every intersecting pair a self-intersection scan found, with each side
+/// named as an element of the input.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SelfIntersections {
+    /// Sorted, deduplicated triangle pairs `(i, j)` with `i < j`.
+    pub tri_tri: Vec<(i32, i32)>,
+    /// `(rod edge, triangle)` hits, the rod edge indexing `rod_edges` pairwise.
+    pub rod_tri: Vec<(usize, i32)>,
+}
+
+/// Check a triangle mesh for self-intersections, optionally including
+/// rod edges. Output is sorted, deduplicated `(i, j)` pairs with `i <
+/// j`. Rod-triangle hits are appended at the end as `(-1, tri_idx)`.
+pub fn check_self_intersection(input: IntersectionInput<'_>) -> Vec<(i32, i32)> {
+    let found = scan_self_intersection(input);
+    let mut out = found.tri_tri;
+    out.extend(found.rod_tri.iter().map(|&(_, ti)| (-1, ti)));
+    out
+}
+
+/// The scan behind [`check_self_intersection`], keeping which rod edge each
+/// rod-triangle hit came from. A caller that only reports needs the triangle;
+/// one that exempts the pair (Allow Existing Intersections) needs both
+/// elements' vertices.
+pub fn scan_self_intersection(input: IntersectionInput<'_>) -> SelfIntersections {
+    let n_tris = input.tris.len() / 3;
+    let n_rod_edges = input.rod_edges.map(|r| r.len() / 2).unwrap_or(0);
+    if n_tris < 2 && n_rod_edges == 0 {
+        return SelfIntersections::default();
+    }
+
+    // Step 1: derive mesh edges + per-edge parents.
+    let (mesh_edges, mesh_e2t) = extract_edges_with_tri_map(input.tris);
+    let n_mesh_edges = mesh_edges.len() / 2;
+
+    // Step 2: append rod edges with parent (-1, -1). When there are
+    // rod edges, consume the mesh-only Vecs by value and extend in
+    // place; this avoids allocating ~2 * n_mesh_edges * size_of::<i32>()
+    // of intermediate state per call (~1MB at 100k mesh edges).
+    let (all_edges, all_e2t): (Vec<i32>, Vec<i32>) = if n_rod_edges > 0 {
+        let mut e = mesh_edges;
+        let mut t = mesh_e2t;
+        e.extend_from_slice(input.rod_edges.unwrap());
+        for _ in 0..n_rod_edges {
+            t.push(-1);
+            t.push(-1);
+        }
+        (e, t)
+    } else {
+        (mesh_edges, mesh_e2t)
+    };
+
+    // Step 3: build tri-BVH; per-edge bboxes only (no edge-BVH needed,
+    // the algorithm scans tri-BVH for each edge).
+    let tri_bvh = build_tri_bvh(input.verts, input.tris);
+    let (edge_bb_min, edge_bb_max) = compute_edge_bboxes(input.verts, &all_edges);
+
+    // Step 4: default is_collider and per-tri PDRD body id.
+    let zero_collider: Vec<bool>;
+    let is_collider = match input.is_collider {
+        Some(s) => s,
+        None => {
+            zero_collider = vec![false; n_tris];
+            &zero_collider
+        }
+    };
+    let zero_body_id: Vec<i32>;
+    let tri_body_id = match input.tri_body_id {
+        Some(s) => s,
+        None => {
+            zero_body_id = vec![0; n_tris];
+            &zero_body_id
+        }
+    };
+
+    let policy = VertexIntersectPolicy {
+        object_id: input.vert_object_id,
+        group_id: input.vert_group_id,
+        policy: input.vert_policy,
+        pin_allows: input.vert_pin_allow,
+    };
+
+    if let Some(rod_is_collider) = input.rod_is_collider {
+        assert_eq!(
+            rod_is_collider.len(),
+            n_rod_edges,
+            "rod_is_collider has {} entries but there are {} rod edges",
+            rod_is_collider.len(),
+            n_rod_edges
+        );
+    }
+
+    // Step 5: per-edge parallel scan into (edge_idx, tri_idx) hits.
+    let n_edges = all_edges.len() / 2;
+    let edge_tri_pairs: Vec<(i32, i32)> = (0..n_edges)
+        .into_par_iter()
+        .flat_map(|ei| {
+            // Rod edges follow the mesh edges in `all_edges`.
+            let is_collider_rod_edge = ei >= n_mesh_edges
+                && input
+                    .rod_is_collider
+                    .is_some_and(|flags| flags[ei - n_mesh_edges]);
+            find_edge_tri_intersections(
+                ei,
+                input.verts,
+                &all_edges,
+                input.tris,
+                &all_e2t,
+                &edge_bb_min,
+                &edge_bb_max,
+                &tri_bvh,
+                is_collider,
+                is_collider_rod_edge,
+                tri_body_id,
+                &policy,
+            )
+        })
+        .collect();
+
+    // Step 6: convert (edge, tri) → (parent, tri); dedup; sort. Rod
+    // hits collected separately and appended after triangle-triangle
+    // pairs.
+    let mut tri_pairs: BTreeSet<(i32, i32)> = BTreeSet::new();
+    let mut rod_pairs: Vec<(usize, i32)> = Vec::new();
+    for (ei, ti) in edge_tri_pairs {
+        let ei_us = ei as usize;
+        if ei_us >= n_mesh_edges {
+            // Rod edge.
+            rod_pairs.push((ei_us - n_mesh_edges, ti));
+        } else {
+            let p0 = all_e2t[2 * ei_us];
+            let p1 = all_e2t[2 * ei_us + 1];
+            if p0 >= 0 && p0 != ti {
+                tri_pairs.insert((p0.min(ti), p0.max(ti)));
+            }
+            if p1 >= 0 && p1 != ti {
+                tri_pairs.insert((p1.min(ti), p1.max(ti)));
+            }
+        }
+    }
+
+    SelfIntersections {
+        tri_tri: tri_pairs.into_iter().collect(),
+        rod_tri: rod_pairs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat3(rows: &[[f64; 3]]) -> Vec<f64> {
+        rows.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+    fn flat3i(rows: &[[i32; 3]]) -> Vec<i32> {
+        rows.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+
+    #[test]
+    fn crossing_triangles_detected() {
+        // Two triangles whose interiors cross.
+        let verts = flat3(&[
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn coplanar_overlapping_triangles_detected() {
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 2.0, 0.0],
+            [1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn coplanar_non_overlapping_skipped() {
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.0],
+            [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.5, 0.5, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn adjacent_triangles_skipped() {
+        // Sharing edge 0-1: must be skipped by the share-vertex filter.
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0], [0.5, -1.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [0, 1, 3]]);
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn near_touching_not_intersecting() {
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0],
+            [0.0, 0.0, 0.01], [1.0, 0.0, 0.01], [0.5, 1.0, 0.01],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn collider_collider_skipped() {
+        let verts = flat3(&[
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        let coll_both = vec![true, true];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: Some(&coll_both),
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert!(r.is_empty(), "collider × collider must be skipped");
+
+        let coll_one = vec![true, false];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: Some(&coll_one),
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r.len(), 1, "mixed collider/dynamic must still report");
+    }
+
+    #[test]
+    fn same_pdrd_body_skipped() {
+        // Two interior-crossing triangles. When both belong to the same
+        // nonzero PDRD body, the pair is a tolerated intra-rigid-body
+        // self-intersection and must be skipped; distinct bodies (or a
+        // body vs. body-0) must still report.
+        let verts = flat3(&[
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+
+        // Same body (id 1 on both): skipped.
+        let same_body = vec![1, 1];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: Some(&same_body),
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert!(r.is_empty(), "same PDRD body must be skipped");
+
+        // Distinct bodies: still reported.
+        let diff_body = vec![1, 2];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: Some(&diff_body),
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r.len(), 1, "distinct PDRD bodies must still report");
+
+        // Body vs. non-PDRD (id 0): still reported.
+        let one_body = vec![1, 0];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: Some(&one_body),
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r.len(), 1, "rigid body vs. non-rigid must still report");
+    }
+
+    #[test]
+    fn rod_edge_detected() {
+        // One triangle in xy-plane; rod edge piercing from below to above.
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0],
+            [0.25, 0.25, -1.0], [0.25, 0.25, 1.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2]]);
+        let rod = vec![3i32, 4];
+        let r = check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: Some(&rod),
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+        assert_eq!(r, vec![(-1, 0)]);
+    }
+
+    /// The `rod_edge_detected` fixture with the collider flags of its two
+    /// elements given: a rod edge piercing the one triangle.
+    fn check_piercing_rod(tri_is_collider: bool, rod_is_collider: Option<bool>) -> Vec<(i32, i32)> {
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0],
+            [0.25, 0.25, -1.0], [0.25, 0.25, 1.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2]]);
+        let rod = vec![3i32, 4];
+        let tri_flags = [tri_is_collider];
+        let rod_flags = rod_is_collider.map(|flag| [flag]);
+        check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: Some(&tri_flags),
+            rod_edges: Some(&rod),
+            rod_is_collider: rod_flags.as_ref().map(|flags| flags.as_slice()),
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        })
+    }
+
+    #[test]
+    fn collider_rod_edge_skipped_against_a_collider_triangle_only() {
+        // Both prescribed: nothing is free to move, so the pair is not one
+        // the solver forms contact for and it is not reported.
+        assert!(
+            check_piercing_rod(true, Some(true)).is_empty(),
+            "a pinned rod segment against a collider triangle must be skipped"
+        );
+        // One side free: the pair is a contact pair and the crossing is a
+        // defect, whichever side is the prescribed one.
+        assert_eq!(check_piercing_rod(false, Some(true)), vec![(-1, 0)]);
+        assert_eq!(check_piercing_rod(true, Some(false)), vec![(-1, 0)]);
+        assert_eq!(check_piercing_rod(false, Some(false)), vec![(-1, 0)]);
+        // No flags given: every rod edge is free.
+        assert_eq!(check_piercing_rod(true, None), vec![(-1, 0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "rod_is_collider has 2 entries but there are 1 rod edges")]
+    fn rod_collider_flags_must_cover_every_rod_edge() {
+        let verts = flat3(&[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1.0, 0.0],
+            [0.25, 0.25, -1.0], [0.25, 0.25, 1.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2]]);
+        let rod = vec![3i32, 4];
+        check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: Some(&rod),
+            rod_is_collider: Some(&[true, true]),
+            tri_body_id: None,
+            vert_object_id: None,
+            vert_group_id: None,
+            vert_policy: None,
+            vert_pin_allow: None,
+        });
+    }
+
+    // ----- Intersection allowances (issue #138) -----
+
+    /// The `crossing_triangles_detected` fixture, run with a given set of
+    /// per-vertex allowance arrays. Triangle 0 is vertices 0, 1, 2 and triangle
+    /// 1 is vertices 3, 4, 5; their interiors cross, so the answer is
+    /// `[(0, 1)]` unless an allowance covers the pair. The single pierce is
+    /// triangle 1's edge (3, 4) through triangle 0, so the two sides of the
+    /// question are that EDGE and that TRIANGLE.
+    fn check_crossing_pair(
+        vert_object_id: Option<&[i32]>,
+        vert_policy: Option<&[u8]>,
+        vert_pin_allow: Option<&[bool]>,
+    ) -> Vec<(i32, i32)> {
+        check_crossing_pair_grouped(vert_object_id, None, vert_policy, vert_pin_allow)
+    }
+
+    fn check_crossing_pair_grouped(
+        vert_object_id: Option<&[i32]>,
+        vert_group_id: Option<&[i32]>,
+        vert_policy: Option<&[u8]>,
+        vert_pin_allow: Option<&[bool]>,
+    ) -> Vec<(i32, i32)> {
+        let verts = flat3(&[
+            [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [0.0, 2.0, 0.0],
+        ]);
+        let tris = flat3i(&[[0, 1, 2], [3, 4, 5]]);
+        check_self_intersection(IntersectionInput {
+            verts: &verts,
+            tris: &tris,
+            is_collider: None,
+            rod_edges: None,
+            rod_is_collider: None,
+            tri_body_id: None,
+            vert_object_id,
+            vert_group_id,
+            vert_policy,
+            vert_pin_allow,
+        })
+    }
+
+    #[test]
+    fn allow_inter_group_intersection_needs_two_groups() {
+        // Two objects, the crossing pair's vertices split 3 and 3.
+        let two_objects = [0, 0, 0, 1, 1, 1];
+        let two_groups = [4, 4, 4, 9, 9, 9];
+        let one_group = [4i32; 6];
+        let on_first = [
+            INTERSECT_ALLOW_INTER_GROUP,
+            INTERSECT_ALLOW_INTER_GROUP,
+            INTERSECT_ALLOW_INTER_GROUP,
+            0,
+            0,
+            0,
+        ];
+        // Different groups, one side flagged: covered, either side.
+        assert!(check_crossing_pair_grouped(
+            Some(&two_objects),
+            Some(&two_groups),
+            Some(&on_first),
+            None
+        )
+        .is_empty());
+        let on_second: Vec<u8> = on_first.iter().rev().copied().collect();
+        assert!(check_crossing_pair_grouped(
+            Some(&two_objects),
+            Some(&two_groups),
+            Some(&on_second),
+            None
+        )
+        .is_empty());
+        // One group: two of its objects still collide, so the pair reports.
+        let both = [INTERSECT_ALLOW_INTER_GROUP; 6];
+        assert_eq!(
+            check_crossing_pair_grouped(
+                Some(&two_objects),
+                Some(&one_group),
+                Some(&both),
+                None
+            ),
+            vec![(0, 1)]
+        );
+        // No group array puts every vertex in one group.
+        assert_eq!(
+            check_crossing_pair_grouped(Some(&two_objects), None, Some(&both), None),
+            vec![(0, 1)]
+        );
+        // Inter-group is not self: one object reports whatever its group.
+        let one_object = [0i32; 6];
+        assert_eq!(
+            check_crossing_pair_grouped(
+                Some(&one_object),
+                Some(&two_groups),
+                Some(&both),
+                None
+            ),
+            vec![(0, 1)]
+        );
+    }
+
+    #[test]
+    fn allowance_control_reports_the_crossing_pair() {
+        // The control for every allowance case below. Each of those asserts
+        // that an allowance SUPPRESSES a report, which says nothing unless the
+        // same fixture with no allowance array produces one.
+        assert_eq!(check_crossing_pair(None, None, None), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn allow_self_intersection_needs_the_self_bit() {
+        // Both triangles on one object: the self allowance covers the pair.
+        let one_object = vec![7i32; 6];
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert!(
+            check_crossing_pair(Some(&one_object), Some(&allow_self), None).is_empty(),
+            "allow-self must cover an intersection within one object"
+        );
+
+        // The other bit is a different permission and must not stand in for it.
+        let allow_inter = vec![INTERSECT_ALLOW_INTER_OBJECT; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&one_object), Some(&allow_inter), None),
+            vec![(0, 1)],
+            "allow-inter-object must not cover a same-object pair"
+        );
+    }
+
+    #[test]
+    fn allow_inter_object_intersection_from_either_side() {
+        let two_objects = vec![0i32, 0, 0, 1, 1, 1];
+
+        // Either side opting in is enough, so assert each side on its own: a
+        // rule that needed both would still pass a test that sets both.
+        let first_only = vec![
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            0,
+            0,
+            0,
+        ];
+        assert!(
+            check_crossing_pair(Some(&two_objects), Some(&first_only), None).is_empty(),
+            "allow-inter-object on object 0 alone must cover the pair"
+        );
+
+        let second_only = vec![
+            0,
+            0,
+            0,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+            INTERSECT_ALLOW_INTER_OBJECT,
+        ];
+        assert!(
+            check_crossing_pair(Some(&two_objects), Some(&second_only), None).is_empty(),
+            "allow-inter-object on object 1 alone must cover the pair"
+        );
+
+        // The other bit is a different permission and must not stand in for it.
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&two_objects), Some(&allow_self), None),
+            vec![(0, 1)],
+            "allow-self must not cover a pair spanning two objects"
+        );
+    }
+
+    #[test]
+    fn pin_allowance_requires_every_vertex_of_an_element() {
+        // Every vertex of triangle 0 pinned by an allowing pin: that element
+        // is exempt, and one exempt side is enough for the pair.
+        let all_of_tri0 = vec![true, true, true, false, false, false];
+        assert!(
+            check_crossing_pair(None, None, Some(&all_of_tri0)).is_empty(),
+            "a fully covered element must be exempt"
+        );
+
+        // Vertex 2 dropped. Triangle 0 is then only partly covered, and the
+        // piercing edge (3, 4) carries no allowance, so the pair reports.
+        let part_of_tri0 = vec![true, true, false, false, false, false];
+        assert_eq!(
+            check_crossing_pair(None, None, Some(&part_of_tri0)),
+            vec![(0, 1)],
+            "a partially covered element must not be exempt"
+        );
+    }
+
+    #[test]
+    fn unknown_object_ids_are_not_one_object() {
+        let unknown = vec![NO_OBJECT_ID; 6];
+
+        // Identity unknown on both sides and no bit set anywhere: reported.
+        let no_bits = vec![0u8; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&unknown), Some(&no_bits), None),
+            vec![(0, 1)],
+            "an unknown identity with no allowance must report"
+        );
+
+        // Two unknown identities are two different objects, not one, so the
+        // self allowance does not reach the pair.
+        let allow_self = vec![INTERSECT_ALLOW_SELF; 6];
+        assert_eq!(
+            check_crossing_pair(Some(&unknown), Some(&allow_self), None),
+            vec![(0, 1)],
+            "two unknown identities must not count as the same object"
+        );
+    }
+
+    // ----- Direct primitive tests -----
+
+    #[test]
+    fn edge_triangle_intersect_pierce_and_above() {
+        // A triangle in the xy-plane. A vertical edge piercing it
+        // through the centroid must intersect.
+        let v0 = [0.0, 0.0, 0.0];
+        let v1 = [1.0, 0.0, 0.0];
+        let v2 = [0.0, 1.0, 0.0];
+        let centroid = [1.0 / 3.0, 1.0 / 3.0, 0.0];
+        let e0 = [centroid[0], centroid[1], -0.5];
+        let e1 = [centroid[0], centroid[1], 0.5];
+        assert!(edge_triangle_intersect(e0, e1, v0, v1, v2));
+        // An edge entirely above the plane must not intersect.
+        let e0 = [centroid[0], centroid[1], 0.1];
+        let e1 = [centroid[0], centroid[1], 0.5];
+        assert!(!edge_triangle_intersect(e0, e1, v0, v1, v2));
+        // An edge that misses the triangle laterally.
+        let e0 = [5.0, 5.0, -1.0];
+        let e1 = [5.0, 5.0, 1.0];
+        assert!(!edge_triangle_intersect(e0, e1, v0, v1, v2));
+    }
+
+    #[test]
+    fn segments_intersect_2d_cross_and_parallel() {
+        // Crossing segments at origin.
+        assert!(segments_intersect_2d(-1.0, 0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 1.0));
+        // Parallel segments never intersect.
+        assert!(!segments_intersect_2d(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0));
+        // Endpoint-touching does NOT count (open interval).
+        assert!(!segments_intersect_2d(0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn point_in_triangle_2d_basic() {
+        assert!(point_in_triangle_2d(0.25, 0.25, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0));
+        assert!(!point_in_triangle_2d(1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn triangles_coplanar_overlap_detects_partial_overlap() {
+        // Two coplanar overlapping triangles (z = 0).
+        let t0 = [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 2.0, 0.0]];
+        let t1 = [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 2.0, 0.0]];
+        assert!(triangles_coplanar_overlap(t0, t1));
+        // Disjoint coplanar triangles ⇒ no overlap.
+        let t1 = [[10.0, 10.0, 0.0], [11.0, 10.0, 0.0], [10.0, 11.0, 0.0]];
+        assert!(!triangles_coplanar_overlap(t0, t1));
+        // Non-coplanar (normal-direction offset of 0.1 ≫ epsilon)
+        // ⇒ helper rejects.
+        let t1 = [[0.5, 0.5, 0.1], [2.5, 0.5, 0.1], [1.5, 2.5, 0.1]];
+        assert!(!triangles_coplanar_overlap(t0, t1));
+    }
+
+    // Property-based tests for `triangles_coplanar_overlap`. We force a
+    // common z = 0 plane so the coplanarity gate doesn't reject the
+    // sample, and reject degenerate (near-collinear) triangles where the
+    // normal length falls below COPLANAR_EPS.
+    proptest::proptest! {
+        #[test]
+        fn prop_triangles_coplanar_overlap_self(
+            ax in -100.0_f64..100.0, ay in -100.0_f64..100.0,
+            bx in -100.0_f64..100.0, by in -100.0_f64..100.0,
+            cx in -100.0_f64..100.0, cy in -100.0_f64..100.0,
+        ) {
+            let t = [[ax, ay, 0.0], [bx, by, 0.0], [cx, cy, 0.0]];
+            // Skip near-degenerate triangles (signed area ~ 0); the
+            // helper rejects those by design and the property is vacuous.
+            let area2 = ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)).abs();
+            proptest::prop_assume!(area2 > 1e-3);
+            proptest::prop_assert!(triangles_coplanar_overlap(t, t));
+        }
+
+        #[test]
+        fn prop_triangles_coplanar_overlap_symmetric(
+            ax in -100.0_f64..100.0, ay in -100.0_f64..100.0,
+            bx in -100.0_f64..100.0, by in -100.0_f64..100.0,
+            cx in -100.0_f64..100.0, cy in -100.0_f64..100.0,
+            dx in -100.0_f64..100.0, dy in -100.0_f64..100.0,
+            ex in -100.0_f64..100.0, ey in -100.0_f64..100.0,
+            fx in -100.0_f64..100.0, fy in -100.0_f64..100.0,
+        ) {
+            let t0 = [[ax, ay, 0.0], [bx, by, 0.0], [cx, cy, 0.0]];
+            let t1 = [[dx, dy, 0.0], [ex, ey, 0.0], [fx, fy, 0.0]];
+            // Reject degenerate triangles for both inputs so the
+            // coplanarity gate accepts both orderings symmetrically.
+            let a0 = ((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)).abs();
+            let a1 = ((ex - dx) * (fy - dy) - (ey - dy) * (fx - dx)).abs();
+            proptest::prop_assume!(a0 > 1e-3 && a1 > 1e-3);
+            proptest::prop_assert_eq!(
+                triangles_coplanar_overlap(t0, t1),
+                triangles_coplanar_overlap(t1, t0),
+            );
+        }
+    }
+}

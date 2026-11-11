@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"indexAttr" : 
+		{
+			"default" : "0",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "index",
+			"type" : "Int"
+		}
+	},
+	"name" : "ND_texcoord_vector3",
+	"type" : "Map"
+}

@@ -1,0 +1,409 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Vec4.isph
+/// @brief
+/// defines a 4 component x, y, z, w vector and its methods
+#pragma once
+
+#include "Constants.isph"
+#include "Math.isph"
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+struct Vec4f
+{
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constructors
+//--------------------------------------------------------------------------------------------------
+
+// Vec4f = {x, y, z, w}
+inline uniform Vec4f Vec4f_ctor(const uniform float x, const uniform float y,
+                                const uniform float z, const uniform float w)
+{
+    uniform Vec4f result;
+    result.x = x;
+    result.y = y;
+    result.z = z;
+    result.w = w;
+    return result;
+}
+
+// Vec4f = {x, y, z, w}
+inline varying Vec4f Vec4f_ctor(const varying float x, const varying float y,
+                                const varying float z, const varying float w)
+{
+    varying Vec4f result;
+    result.x = x;
+    result.y = y;
+    result.z = z;
+    result.w = w;
+    return result;
+}
+
+// Vec4f = {f, f, f, f}
+inline uniform Vec4f Vec4f_ctor(const uniform float f)
+{
+    return Vec4f_ctor(f, f, f, f);
+}
+
+// Vec4f = {f, f, f, f}
+inline varying Vec4f Vec4f_ctor(const varying float f)
+{
+    return Vec4f_ctor(f, f, f, f);
+}
+
+// Vec4f = {a[0], a[1], a[2], a[3]}
+inline uniform Vec4f Vec4f_ctor(const uniform float a[])
+{
+    return Vec4f_ctor(a[0], a[1], a[2], a[3]);
+}
+
+// Vec4f = {a[0], a[1], a[2], a[3]}
+inline varying Vec4f Vec4f_ctor(const varying float a[])
+{
+    return Vec4f_ctor(a[0], a[1], a[2], a[3]);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Arithmetic
+//--------------------------------------------------------------------------------------------------
+
+//  Vec4f = Vec4f + Vec4f
+inline uniform Vec4f operator+(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(v0.x+v1.x, v0.y+v1.y, v0.z+v1.z, v0.w+v1.w);
+}
+
+//  Vec4f = Vec4f + Vec4f
+inline varying Vec4f operator+(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(v0.x+v1.x, v0.y+v1.y, v0.z+v1.z, v0.w+v1.w);
+}
+
+//  Vec4f = Vec4f - Vec4f
+inline uniform Vec4f operator-(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(v0.x-v1.x, v0.y-v1.y, v0.z-v1.z, v0.w-v1.w);
+}
+
+//  Vec4f = Vec4f - Vec4f
+inline varying Vec4f operator-(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(v0.x-v1.x, v0.y-v1.y, v0.z-v1.z, v0.w-v1.w);
+}
+
+// Vec4f = -Vec4f
+// (IPSC doesn't currently support overloading of unary operators, so we define a function to negate a vector)
+inline uniform Vec4f neg(const uniform Vec4f v)
+{
+    return Vec4f_ctor(-v.x, -v.y, -v.z, -v.w);
+}
+
+// Vec4f = -Vec4f
+// (IPSC doesn't currently support overloading of unary operators, so we define a function to negate a vector)
+inline varying Vec4f neg(const varying Vec4f v)
+{
+    return Vec4f_ctor(-v.x, -v.y, -v.z, -v.w);
+}
+
+//  Vec4f = float * Vec4f
+inline uniform Vec4f operator*(const uniform float f, const uniform Vec4f v)
+{
+    return Vec4f_ctor(f*v.x, f*v.y, f*v.z, f*v.w);
+}
+
+//  Vec4f = float * Vec4f
+inline varying Vec4f operator*(const varying float f, const varying Vec4f v)
+{
+    return Vec4f_ctor(f*v.x, f*v.y, f*v.z, f*v.w);
+}
+
+//  Vec4f = Vec4f * float
+inline uniform Vec4f operator*(const uniform Vec4f v, const uniform float f)
+{
+    return f * v;
+}
+
+//  Vec4f = Vec4f * float
+inline varying Vec4f operator*(const varying Vec4f v, const varying float f)
+{
+    return f * v;
+}
+
+//  Vec4f = Vec4f * Vec4f
+inline uniform Vec4f operator*(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(v0.x*v1.x, v0.y*v1.y, v0.z*v1.z, v0.w*v1.w);
+}
+
+//  Vec4f = Vec4f * Vec4f
+inline varying Vec4f operator*(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(v0.x*v1.x, v0.y*v1.y, v0.z*v1.z, v0.w*v1.w);
+}
+
+//  Vec4f = float / Vec4f
+inline uniform Vec4f operator/(const uniform float f, const uniform Vec4f v)
+{
+    return Vec4f_ctor(f/v.x, f/v.y, f/v.z, f/v.w);
+}
+
+//  Vec4f = float / Vec4f
+inline varying Vec4f operator/(const varying float f, const varying Vec4f v)
+{
+    return Vec4f_ctor(f/v.x, f/v.y, f/v.z, f/v.w);
+}
+
+//  Vec4f = Vec4f / float
+inline uniform Vec4f operator/(const uniform Vec4f v, const uniform float f)
+{
+    return Vec4f_ctor(v.x/f, v.y/f, v.z/f, v.w/f);
+}
+
+//  Vec4f = Vec4f / float
+inline varying Vec4f operator/(const varying Vec4f v, const varying float f)
+{
+    return Vec4f_ctor(v.x/f, v.y/f, v.z/f, v.w/f);
+}
+
+//  Vec4f = Vec4f / Vec4f
+inline uniform Vec4f operator/(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(v0.x/v1.x, v0.y/v1.y, v0.z/v1.z, v0.w/v1.w);
+}
+
+//  Vec4f = Vec4f / Vec4f
+inline varying Vec4f operator/(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(v0.x/v1.x, v0.y/v1.y, v0.z/v1.z, v0.w/v1.w);
+}
+
+// Vec4f rcp(Vec4f)
+inline uniform Vec4f rcp(const uniform Vec4f v)
+{
+    return Vec4f_ctor(1.0f/v.x, 1.0f/v.y, 1.0f/v.z, 1.0f/v.w);
+}
+
+// Vec4f rcp(Vec4f)
+inline varying Vec4f rcp(const varying Vec4f v)
+{
+    return Vec4f_ctor(1.0f/v.x, 1.0f/v.y, 1.0f/v.z, 1.0f/v.w);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Equality
+//--------------------------------------------------------------------------------------------------
+
+// bool isEqual(Vec4f, Vec4f, tol)
+inline uniform bool isEqual(const uniform Vec4f v0, const uniform Vec4f v1, const uniform float tol)
+{
+    return isEqual(v0.x, v1.x, tol) && isEqual(v0.y, v1.y, tol) &&
+                  (v0.z, v1.z, tol) && isEqual(v0.w, v1.w, tol);
+}
+
+// bool isEqual(Vec4f, Vec4f, tol)
+inline varying bool isEqual(const varying Vec4f v0, const varying Vec4f v1, const varying float tol)
+{
+    return isEqual(v0.x, v1.x, tol) && isEqual(v0.y, v1.y, tol) &&
+                  (v0.z, v1.z, tol) && isEqual(v0.w, v1.w, tol);
+}
+
+// bool isEqual(Vec4f, Vec4f)
+inline uniform bool isEqual(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return isEqual(v0, v1, sEpsilon);
+}
+
+// bool isEqual(Vec4f, Vec4f)
+inline varying bool isEqual(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return isEqual(v0, v1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Vec4f, Vec4f, tol)
+inline uniform bool isEqualFixedEps(const uniform Vec4f v0, const uniform Vec4f v1, const uniform float tol)
+{
+    return isEqualFixedEps(v0.x, v1.x, tol) && isEqualFixedEps(v0.y, v1.y, tol) &&
+           isEqualFixedEps(v0.z, v1.z, tol) && isEqualFixedEps(v0.w, v1.w, tol);
+}
+
+// bool isEqualFixedEps(Vec4f, Vec4f, tol)
+inline varying bool isEqualFixedEps(const varying Vec4f v0, const varying Vec4f v1, const varying float tol)
+{
+    return isEqualFixedEps(v0.x, v1.x, tol) && isEqualFixedEps(v0.y, v1.y, tol) &&
+           isEqualFixedEps(v0.z, v1.z, tol) && isEqualFixedEps(v0.w, v1.w, tol);
+}
+
+// bool isEqualFixedEps(Vec4f, Vec4f)
+inline uniform bool isEqualFixedEps(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return isEqualFixedEps(v0, v1, sEpsilon);
+}
+
+// bool isEqualFixedEps(Vec4f, Vec4f)
+inline varying bool isEqualFixedEps(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return isEqualFixedEps(v0, v1, sEpsilon);
+}
+
+// bool isZero(Vec4f, tol)
+inline uniform bool isZero(const uniform Vec4f v, const uniform float tol)
+{
+    return isZero(v.x, tol) && isZero(v.y, tol) && isZero(v.z, tol) && isZero(v.w, tol);
+}
+
+// bool isZero(Vec4f, tol)
+inline varying bool isZero(const varying Vec4f v, const varying float tol)
+{
+    return isZero(v.x, tol) && isZero(v.y, tol) && isZero(v.z, tol) && isZero(v.w, tol);
+}
+
+// bool isZero(Vec4f)
+inline uniform bool isZero(const uniform Vec4f v)
+{
+    return isZero(v, sEpsilon);
+}
+
+// bool isZero(Vec4f)
+inline varying bool isZero(const varying Vec4f v)
+{
+    return isZero(v, sEpsilon);
+}
+
+//--------------------------------------------------------------------------------------------------
+// Common vector ops
+//--------------------------------------------------------------------------------------------------
+
+// Vec4f min(Vec4f, Vec4f)
+inline uniform Vec4f min(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(min(v0.x, v1.x), min(v0.y, v1.y), min(v0.z, v1.z), min(v0.w, v1.w));
+}
+
+// Vec4f min(Vec4f, Vec4f)
+inline varying Vec4f min(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(min(v0.x, v1.x), min(v0.y, v1.y), min(v0.z, v1.z), min(v0.w, v1.w));
+}
+
+// Vec4f max(Vec4f, Vec4f)
+inline uniform Vec4f max(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return Vec4f_ctor(max(v0.x, v1.x), max(v0.y, v1.y), max(v0.z, v1.z), max(v0.w, v1.w));
+}
+
+// Vec4f max(Vec4f, Vec4f)
+inline varying Vec4f max(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return Vec4f_ctor(max(v0.x, v1.x), max(v0.y, v1.y), max(v0.z, v1.z), max(v0.w, v1.w));
+}
+
+// Vec4f clamp(Vec4f, Vec4f lo, Vec4f hi)
+inline uniform Vec4f clamp(const uniform Vec4f v, const uniform Vec4f lo, const uniform Vec4f hi)
+{
+    return min(max(v, lo), hi);
+}
+
+// Vec4f clamp(Vec4f, Vec4f lo, Vec4f hi)
+inline varying Vec4f clamp(const varying Vec4f v, const varying Vec4f lo, const varying Vec4f hi)
+{
+    return min(max(v, lo), hi);
+}
+
+// Vec4f abs(Vec4f, Vec4f)
+inline uniform Vec4f abs(const uniform Vec4f v)
+{
+    return Vec4f_ctor(abs(v.x), abs(v.y), abs(v.z), abs(v.w));
+}
+
+// Vec4f abs(Vec4f, Vec4f)
+inline varying Vec4f abs(const varying Vec4f v)
+{
+    return Vec4f_ctor(abs(v.x), abs(v.y), abs(v.z), abs(v.w));
+}
+
+// Vec4f lerp(Vec4f, Vec4f, float)
+inline uniform Vec4f lerp(const uniform Vec4f v0, const uniform Vec4f v1, const uniform float t)
+{
+    return (1.0f - t) * v0 + t * v1;
+}
+
+// Vec4f lerp(Vec4f, Vec4f, float)
+inline varying Vec4f lerp(const varying Vec4f v0, const varying Vec4f v1, const varying float t)
+{
+    return (1.0f - t) * v0 + t * v1;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Length et al
+//--------------------------------------------------------------------------------------------------
+
+// float dot(Vec4f, Vec4f)
+inline uniform float dot(const uniform Vec4f v0, const uniform Vec4f v1)
+{
+    return v0.x*v1.x + v0.y*v1.y + v0.z*v1.z + v0.w*v1.w;
+}
+
+// float dot(Vec4f, Vec4f)
+inline varying float dot(const varying Vec4f v0, const varying Vec4f v1)
+{
+    return v0.x*v1.x + v0.y*v1.y + v0.z*v1.z + v0.w*v1.w;
+}
+
+// float lengthSqr(Vec4f)
+inline uniform float lengthSqr(const uniform Vec4f v)
+{
+    return dot(v, v);
+}
+
+// float lengthSqr(Vec4f)
+inline varying float lengthSqr(const varying Vec4f v)
+{
+    return dot(v, v);
+}
+
+// float length(Vec4f)
+inline uniform float length(const uniform Vec4f v)
+{
+    return sqrt(lengthSqr(v));
+}
+
+// float length(Vec4f)
+inline varying float length(const varying Vec4f v)
+{
+    return sqrt(lengthSqr(v));
+}
+
+// Vec4f normalize(Vec4f)
+inline uniform Vec4f normalize(const uniform Vec4f v)
+{
+    return v * (1.0f / length(v));
+}
+
+// Vec4f normalize(Vec4f)
+inline varying Vec4f normalize(const varying Vec4f v)
+{
+    return v * (1.0f / length(v));
+}
+
+// bool isNormalized(Vec4f)
+inline uniform bool isNormalized(const uniform Vec4f v)
+{
+    return isNormalizedLengthSqr(lengthSqr(v));
+}
+
+// bool isNormalized(Vec4f)
+inline varying bool isNormalized(const varying Vec4f v)
+{
+    return isNormalizedLengthSqr(lengthSqr(v));
+}
+

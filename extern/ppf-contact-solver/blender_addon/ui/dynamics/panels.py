@@ -1,0 +1,2711 @@
+# File: panels.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import os
+
+import bpy  # pyright: ignore
+
+from bpy.types import Panel  # pyright: ignore
+from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_
+
+from ...core.utils import get_category_name
+from ...core.hair_curves import pin_is_weighted as _hair_pin_weighted
+from ...models.groups import (
+    CONTACT_GAP_LIMIT_TYPES,
+    GROUP_TYPE_ICONS,
+    decode_vertex_group_identifier,
+    get_addon_data,
+    group_missing_uv_object,
+    has_addon_data,
+    multigrid_refusal,
+    pair_supports_cross_stitch,
+    withdrawn_shell_model_refusal,
+)
+from ..state import iterate_active_object_groups
+from .utils import get_assigned_by_selection_uuid
+from ...models.material_locks import is_locked, lock_name
+from ...models.material_maps import pin_tracks_rest_shape, wants_anisotropic_bending
+
+
+# Cache `os.path.isfile(bpy.path.abspath(path))` per unique path string.
+# The panel draw consults this up to 3 paths per group per redraw (scene /
+# pin / material profile). We never invalidate — the profile operators
+# write to disk and set the path property, and a miss here only delays the
+# "profile is present" UI state by one redraw which any user-triggered
+# event will flush anyway.
+_profile_path_cache: dict[str, bool] = {}
+
+
+def _profile_path_exists(path: str) -> bool:
+    if not path:
+        return False
+    cached = _profile_path_cache.get(path)
+    if cached is None:
+        cached = os.path.isfile(bpy.path.abspath(path))
+        _profile_path_cache[path] = cached
+    return cached
+
+
+def _draw_velocity_keyframes(
+    param_box, group, actual_index, show_angular=False, label="Velocity Overwrite"
+):
+    """Draw the per-object velocity keyframes UIList.
+
+    ``show_angular`` adds the principal-axis spin controls (solid / shell /
+    PDRD); rods omit them. ``label`` titles the box: PDRD passes a free-launch
+    wording to distinguish this dynamic motion (set a velocity, then physics
+    integrates) from the kinematic prescribed-path pins.
+    """
+    vel_box = param_box.box()
+    row = vel_box.row()
+    row.label(text=label, icon="FORCE_FORCE")
+    assigned = get_assigned_by_selection_uuid(group, "velocity_object_selection")
+    copy_sub = row.row(align=True)
+    copy_sub.enabled = assigned is not None and len(assigned.velocity_keyframes) > 0
+    op = copy_sub.operator("object.copy_velocity_keyframes", text="", icon="COPYDOWN")
+    op.group_index = actual_index
+    op = row.operator("object.paste_velocity_keyframes", text="", icon="PASTEDOWN")
+    op.group_index = actual_index
+    row.prop(group, "preview_velocity", text="", icon="HIDE_OFF" if group.preview_velocity else "HIDE_ON")
+    row.prop(group, "velocity_object_selection", text="")
+
+    if assigned is None:
+        return
+
+    row = vel_box.row()
+    row.template_list(
+        "OBJECT_UL_VelocityKeyframesList", "",
+        assigned, "velocity_keyframes",
+        assigned, "velocity_keyframes_index",
+        rows=2,
+    )
+    col = row.column(align=True)
+    add_op = col.operator("object.add_velocity_keyframe", icon="ADD", text="")
+    add_op.group_index = actual_index
+    rm_op = col.operator("object.remove_velocity_keyframe", icon="REMOVE", text="")
+    rm_op.group_index = actual_index
+
+    if assigned.velocity_keyframes and 0 <= assigned.velocity_keyframes_index < len(assigned.velocity_keyframes):
+        kf = assigned.velocity_keyframes[assigned.velocity_keyframes_index]
+        vel_box.prop(kf, "frame")
+        # Translational overwrite, gated by its own checkbox. Direction /
+        # Speed are HIDDEN (not merely greyed out) while disabled.
+        lin_box = vel_box.box()
+        lin_box.prop(kf, "enable_translational")
+        if kf.enable_translational:
+            lin_sub = lin_box.column()
+            lin_sub.prop(kf, "direction")
+            lin_sub.prop(kf, "speed")
+        # Angular (spin) overwrite, gated by its own checkbox. Solid / shell /
+        # PDRD only; the axis is one of the body's principal axes. Its
+        # fields are likewise hidden while disabled.
+        if show_angular:
+            spin_box = vel_box.box()
+            spin_box.prop(kf, "enable_angular")
+            if kf.enable_angular:
+                spin_sub = spin_box.column()
+                spin_sub.prop(kf, "angular_axis")
+                if kf.angular_axis == "CUSTOM":
+                    spin_sub.prop(kf, "angular_axis_custom")
+                spin_sub.prop(kf, "angular_speed")
+
+
+def _draw_lock_translation(param_box, group, actual_index):
+    """Draw the per-object Lock Translation / Lock Rotation UI.
+
+    One box, one object picker, one eye toggle: the selected object's
+    mass-weighted center of mass can be restricted to a fixed
+    world-space line (Lock Translation) and, independently, its
+    mass-weighted best-fit rigid rotation can be restricted about a
+    fixed world-space axis (Lock Rotation), while deformation stays
+    free in both cases. Lock Rotation itself has two axis modes, toggled
+    by `lock_rotation_prohibit_axis`: unchecked (default) allows rotation
+    about the axis only; checked forbids rotation about the axis and
+    frees the perpendicular rotation plane instead. Either lock can also
+    saturate: `lock_translation_all` pins the center of mass to a point
+    and `lock_rotation_all` forbids rotation about every axis, and in
+    both cases the axis below it stops meaning anything. The lock
+    checkboxes are independent booleans on the same AssignedObject:
+    either, both, or neither of Lock Translation / Lock Rotation may be
+    enabled. Per object (like the PDRD Hinge box above), since one group
+    can hold several bodies, each locked to its own axis or axes: an
+    expandable box with a single object picker shared by both locks
+    rather than one group-wide toggle. Available for every dynamic type
+    (SOLID, SHELL, ROD, PDRD, SAND). The eye toggle previews every
+    enabled lock, translation and rotation alike, for the whole group.
+
+    Two idioms are mixed here on purpose. The enable checkbox HIDES the
+    controls under it, the surrounding convention for a gated control.
+    An all-axes checkbox instead DISABLES the axis controls it makes
+    meaningless, and says in a label why: a control that vanishes the
+    moment you tick a nearby box reads as a bug and sends the user
+    hunting for the setting they just lost, while a grayed-out one with
+    a reason beside it reads as the explanation it is, and shows the
+    axis value that is still stored and comes back when the box is
+    unticked.
+    """
+    lock_box = param_box.box()
+    row = lock_box.row()
+    row.label(text="Lock Translation", icon="LOCKED")
+    row.prop(
+        group,
+        "preview_lock_translation",
+        text="",
+        emboss=False,
+        icon="HIDE_OFF" if group.preview_lock_translation else "HIDE_ON",
+    )
+    row.prop(group, "lock_translation_object_selection", text="")
+    assigned = get_assigned_by_selection_uuid(group, "lock_translation_object_selection")
+    if assigned is None:
+        return
+    lock_box.prop(assigned, "lock_translation_enable")
+    # The axis field is HIDDEN, not merely disabled, unless its own
+    # checkbox is checked.
+    if assigned.lock_translation_enable:
+        lock_box.prop(assigned, "lock_translation_all")
+        axis_col = lock_box.column()
+        axis_col.enabled = not assigned.lock_translation_all
+        axis_col.prop(assigned, "lock_translation_axis")
+        if assigned.lock_translation_all:
+            # A zero axis is the CORRECT state to send for an all-axes
+            # lock, so the zero warning below must not fire here.
+            lock_box.label(
+                text="Axis is ignored while all translations are locked",
+                icon="INFO",
+            )
+        elif tuple(assigned.lock_translation_axis) == (0.0, 0.0, 0.0):
+            lock_box.label(
+                text="Axis is zero; scene build will fail until it is non-zero",
+                icon="ERROR",
+            )
+    lock_box.prop(assigned, "lock_rotation_enable")
+    if assigned.lock_rotation_enable:
+        lock_box.prop(assigned, "lock_rotation_all")
+        rotation_col = lock_box.column()
+        rotation_col.enabled = not assigned.lock_rotation_all
+        rotation_col.prop(assigned, "lock_rotation_prohibit_axis")
+        rotation_col.prop(assigned, "lock_rotation_axis")
+        if assigned.lock_rotation_all:
+            # An all-axes rotation lock names no axis, so neither the
+            # axis nor its whitelist / blacklist mode reaches the solver
+            # and the zero warning below must not fire here either.
+            lock_box.label(
+                text="Axis and its mode are ignored while all rotations are locked",
+                icon="INFO",
+            )
+        elif tuple(assigned.lock_rotation_axis) == (0.0, 0.0, 0.0):
+            lock_box.label(
+                text="Axis is zero; scene build will fail until it is non-zero",
+                icon="ERROR",
+            )
+
+
+def _draw_intersection_allowance(box, group, spec, actual_index):
+    """One allowance: the checkbox, and the objects it reaches.
+
+    While "Apply to All Objects" is on, the allowance covers every object
+    assigned to the group, which is what the checkbox alone has always
+    meant. Off, it covers only the objects in the list, and the list plus
+    its buttons are drawn grayed out rather than hidden while the switch is
+    on, so the narrowing is visibly available instead of appearing only once
+    somebody thinks to turn a switch off.
+
+    The list itself is drawn only while the allowance is enabled: with the
+    allowance off there is nothing for a subset to narrow, and the panel
+    already draws the enable / disable of a feature's own sub-settings that
+    way (strain limiting, inflation, plasticity, soft constraints).
+    """
+    from ...models.intersection_allowances import allowed_object_uuids
+
+    box.prop(group, spec.enable_prop)
+    if not getattr(group, spec.enable_prop):
+        return
+
+    sub = box.box()
+    sub.prop(group, spec.all_objects_prop)
+    applies_to_all = getattr(group, spec.all_objects_prop)
+
+    collection = getattr(group, spec.objects_prop)
+    list_col = sub.column()
+    list_col.enabled = not applies_to_all
+    row = list_col.row()
+    row.template_list(
+        "OBJECT_UL_IntersectionAllowanceObjectsList", spec.key,
+        group, spec.objects_prop,
+        group, spec.index_prop,
+        rows=2,
+    )
+    buttons = row.column(align=True)
+    add_op = buttons.operator(
+        "object.add_intersection_allowance_objects", icon="ADD", text="")
+    add_op.group_index = actual_index
+    add_op.allowance = spec.key
+    remove = buttons.column(align=True)
+    remove.enabled = 0 <= getattr(group, spec.index_prop) < len(collection)
+    rm_op = remove.operator(
+        "object.remove_intersection_allowance_object", icon="REMOVE", text="")
+    rm_op.group_index = actual_index
+    rm_op.allowance = spec.key
+    clear = buttons.column(align=True)
+    clear.enabled = len(collection) > 0
+    clear_op = clear.operator(
+        "object.clear_intersection_allowance_objects", icon="TRASH", text="")
+    clear_op.group_index = actual_index
+    clear_op.allowance = spec.key
+
+    if applies_to_all:
+        return
+
+    # What the group will actually ship, rather than what the list holds. An
+    # entry naming an object the group no longer holds, or one excluded from
+    # the simulation, reaches nothing, and the count is the only place that
+    # difference is visible before a build.
+    reached = len(allowed_object_uuids(group, spec))
+    if reached == 0:
+        list_col.label(
+            text="No objects listed; this allowance covers none",
+            icon="ERROR",
+        )
+    elif reached != len(collection):
+        list_col.label(
+            text=iface_("{count} of {total} entries reach the solver").format(
+                count=reached, total=len(collection)),
+            icon="INFO",
+        )
+
+
+def _draw_intersection_allowances(param_box, group, actual_index):
+    """Allowances that let a run start, and keep going, through an overlap
+    the scene arrives with (issue #138).
+
+    Drawn for EVERY group type, after the type-specific material block: an
+    intersection is a property of a pair of elements, not of a material model,
+    and a STATIC collider is as likely to be shipped self-tangled as a garment
+    is to be fitted through one.
+
+    On a STATIC group the control reaches the solver only when the collider is
+    part of the solved scene, which means animated, soft-constrained, or named
+    as one end of a cross-stitch; each of those decodes to a pin shell whose
+    vertices carry the policy. A collider that is none of them stays a
+    contact-only collision mesh and no box on its group changes any pair. It
+    is drawn anyway rather than hidden, per the panel rule that a conditional
+    control stays visible; deciding which of the three conditions holds would
+    mean inspecting the group's ops and stitches on every redraw.
+
+    Every setting reaches every object the group holds until the user
+    narrows it, and self versus inter-object is decided per OBJECT whichever
+    way it is narrowed. Two objects of one group therefore make an
+    inter-object pair, which neither the self nor the inter-group allowance
+    covers. The second label states that in the one case where the
+    difference decides the outcome: the group holds more than one object and
+    enables one of those two without the inter-object allowance.
+    """
+    from ...models.intersection_allowances import (
+        EXISTING_ALLOWANCE,
+        INTERSECTION_ALLOWANCES,
+        allowance_offered,
+    )
+
+    box = param_box.box()
+    box.label(text="Allow Intersections")
+    for spec in INTERSECTION_ALLOWANCES:
+        if allowance_offered(group, spec):
+            _draw_intersection_allowance(box, group, spec, actual_index)
+    if any(getattr(group, spec.enable_prop)
+           for spec in INTERSECTION_ALLOWANCES
+           if spec is not EXISTING_ALLOWANCE):
+        box.label(
+            text="Allowed pairs pass through, with no contact",
+            icon="INFO",
+        )
+    if allowance_offered(group, EXISTING_ALLOWANCE) and getattr(
+            group, EXISTING_ALLOWANCE.enable_prop):
+        box.label(
+            text="Only pairs tangled at the start pass through",
+            icon="INFO",
+        )
+    if ((group.allow_self_intersection
+            or group.allow_inter_group_intersection)
+            and not group.allow_inter_object_intersection
+            and len(group.assigned_objects) > 1):
+        box.label(
+            text="Two objects in one group are an inter-object pair",
+            icon="INFO",
+        )
+
+
+def _draw_force_field_targets(layout, context, params, source, source_name):
+    """Apply to All Groups, or the list of groups the source is narrowed to.
+
+    A field object with no target entry reaches every group; its checkbox is
+    then an operator that creates the entry, since a draw may not write.
+    """
+    from ...models import force_field_targets as targets
+
+    apply_all, groups, owner, index_attr = targets.source_view(params, source)
+    row = layout.row()
+    if source == targets.SCRIPT:
+        row.prop(params, "force_field_script_all")
+        owner, groups, index_attr = params, params.force_field_script_groups, (
+            "force_field_script_groups_index")
+    elif groups is None:
+        # Drawn like the checkbox it stands in for: left-aligned, no emboss.
+        row.alignment = "LEFT"
+        op = row.operator("scene.force_field_choose_groups",
+                          text="Apply to All Groups", icon="CHECKBOX_HLT", emboss=False)
+        op.source = source_name
+    else:
+        row.prop(owner, "apply_all")
+    if apply_all or groups is None:
+        return
+    list_row = layout.row()
+    list_attr = "force_field_script_groups" if source == targets.SCRIPT else "groups"
+    list_row.template_list("SCENE_UL_ForceFieldGroups", f"ff_{source_name}",
+                           owner, list_attr, owner, index_attr, rows=2)
+    col = list_row.column(align=True)
+    op = col.operator_menu_enum("scene.force_field_add_group", "group", text="", icon="ADD")
+    op.source = source_name
+    op = col.operator("scene.force_field_remove_group", text="", icon="REMOVE")
+    op.source = source_name
+    if len(groups) == 0:
+        layout.label(text="Choose at least one group", icon="ERROR")
+
+
+def _draw_force_field_row(box, context, params, obj):
+    """One field object: its name and Blender's name for its type, whether
+    Transfer would send it and why not, a Fluid Flow's source, and the groups
+    it pushes.
+
+    The status is ``force_field_status``'s, the one MCP and the Python API
+    report. A Fluid Flow's lines come from its source's metadata at the
+    current frame, never from its grid, so a redraw stays cheap.
+    """
+    from ...core import force_field as ff
+    from . import force_field_status as status
+
+    scene = context.scene
+    static = status.static_refusal(obj)
+    fluid = status.fluid_info(obj, scene, params, context.view_layer.depsgraph)
+    problem = static or status.scene_problem(scene, params, obj) or (
+        fluid or {}).get("problem")
+    field_box = box.box()
+    kind = iface_(status.type_name(obj.field.type))
+    field_box.label(text=f"{obj.name}: {kind}", translate=False,
+                    icon="ERROR" if problem else "CHECKMARK")
+    if problem:
+        status.draw_wrapped(field_box, context, problem, depth=2)
+    if fluid is not None:
+        for text, icon in status.fluid_lines(fluid):
+            status.draw_wrapped(field_box, context, text, icon=icon, depth=2)
+    if static is None:
+        _draw_force_field_targets(field_box, context, params, obj, obj.name)
+        # Transfer refuses a field that reaches no simulated object; said
+        # here first.
+        if not ff.pushed_objects(scene, params, obj):
+            status.draw_wrapped(
+                field_box, context,
+                iface_("Pushes no object: assign objects to the groups it reaches"),
+                icon="ERROR", depth=2)
+
+
+def _draw_linear_system_solver(layout, context, params):
+    """The Linear System Solver box: the PCG limits and the preconditioner.
+
+    The Schwarz level count is drawn only under Schwarz, which is the one
+    preconditioner that reads it. Under Multigrid the box says when Transfer
+    will refuse the scene, from the predicate the encoder asks, so the artist
+    reads the refusal where the choice is made.
+    """
+    ls_box = layout.box()
+    ls_row = ls_box.row()
+    ls_row.prop(
+        params,
+        "show_linear_system_solver",
+        icon="TRIA_DOWN" if params.show_linear_system_solver else "TRIA_RIGHT",
+        emboss=False,
+        icon_only=True,
+    )
+    ls_row.label(text="Linear System Solver", icon="SETTINGS")
+    if not params.show_linear_system_solver:
+        return
+    ls_box.prop(params, "cg_max_iter")
+    ls_box.prop(params, "cg_tol")
+    ls_box.prop(params, "precond")
+    if params.precond == "SCHWARZ":
+        ls_box.prop(params, "schwarz_levels")
+    if multigrid_refusal(context.scene, params) is not None:
+        ls_box.label(
+            text="Multigrid does not solve PDRD groups; Transfer will refuse",
+            icon="ERROR",
+        )
+
+
+def _draw_force_fields(layout, context, params):
+    """The scene's force fields: each field object with its status and the
+    groups it pushes, the exact script, and the Visualize overlay.
+
+    The Compile and Check button is drawn ALWAYS and disabled with a status
+    line when it cannot run, from the same predicate the
+    operator polls.
+    """
+    from ...core import force_field as ff
+    from . import force_field_status as status
+    from .force_field_ops import check_unavailable_reason
+    from .overlay_geometry.force_field import preview_errors
+
+    box = layout.box()
+    row = box.row()
+    row.prop(
+        params,
+        "show_force_field",
+        icon="TRIA_DOWN" if params.show_force_field else "TRIA_RIGHT",
+        emboss=False,
+        icon_only=True,
+    )
+    row.label(text="Force Fields", icon="FORCE_TURBULENCE")
+    if not params.show_force_field:
+        return
+
+    box.prop(params, "force_field_collection")
+    objs = ff.field_objects(context.scene, params)
+    if objs:
+        for obj in objs:
+            _draw_force_field_row(box, context, params, obj)
+    else:
+        box.label(text="No force field objects", icon="INFO")
+
+    script_box = box.box()
+    script_box.label(text="Script")
+    row = script_box.row(align=True)
+    row.prop(params, "force_field_script", text="")
+    row.operator("scene.force_field_new_script", text="", icon="ADD")
+    script_box.operator("scene.force_field_builtins", icon="HELP")
+    if params.force_field_script is not None:
+        from ...models.force_field_targets import SCRIPT
+
+        _draw_force_field_targets(script_box, context, params, SCRIPT, SCRIPT)
+    reason = check_unavailable_reason(context)
+    check_row = script_box.row()
+    check_row.enabled = reason == ""
+    check_row.operator("solver.force_field_check", icon="CHECKMARK")
+    text = params.force_field_script
+    if reason:
+        script_box.label(text=reason, icon="INFO")
+    elif text is not None:
+        state = ff.check_state()
+        result = ff.check_result_for(text.as_string())
+        if state["running"]:
+            script_box.label(text="Checking...", icon="TIME")
+        elif result is None:
+            script_box.label(text="Not checked since the last edit", icon="INFO")
+        elif result.get("ok"):
+            status.draw_wrapped(
+                script_box, context,
+                iface_("Force field script OK: {summary}").format(
+                    summary=result.get("summary", "")),
+                icon="CHECKMARK", depth=2)
+        else:
+            line = result.get("line")
+            where = iface_("Line {line}: ").format(line=line) if line else ""
+            status.draw_wrapped(script_box, context, f"{where}{result.get('error', '')}",
+                                icon="ERROR", depth=2)
+
+    viz_box = box.box()
+    viz_box.prop(params, "force_field_visualize")
+    if params.force_field_visualize:
+        viz_box.row().prop(params, "force_field_preview_resolution")
+        pw, ph, pd = params.force_field_preview_resolution
+        viz_box.label(
+            text=iface_("{count} arrows at the current frame, drawing only").format(
+                count=pw * ph * pd),
+            translate=False, icon="INFO")
+        # A field the overlay could not read is left out of the drawing and
+        # named here (each message names its field); the others still draw.
+        for error in preview_errors():
+            status.draw_wrapped(viz_box, context,
+                                iface_("Not drawn: {error}").format(error=error),
+                                icon="ERROR", depth=2)
+
+
+def _material_prop(layout, group, prop_name, text=None):
+    """One material parameter row: the value, a lock, and the animate knob.
+
+    `text` overrides the field label, for the rows whose label depends on
+    another setting (Young's modulus reads Pa or Pa/rho).
+
+    Mirrors Transform > Location. The padlock guards the value against the
+    tools that overwrite a whole group at once (material presets, paste
+    material), and `prop_decorator` is Blender's OWN keyframe control, so a
+    keyframe inserted here behaves exactly as it does anywhere else in Blender
+    and shows the same animated / keyed colouring on the field.
+
+    Only the value is disabled by the lock. The padlock and the decorator stay
+    live, or a locked property could be neither unlocked nor keyed from the
+    panel that locked it.
+    """
+    locked = is_locked(group, prop_name)
+    row = layout.row(align=True)
+    field = row.row(align=True)
+    field.enabled = not locked
+    if text is None:
+        field.prop(group, prop_name)
+    else:
+        field.prop(group, prop_name, text=text)
+    row.prop(
+        group,
+        lock_name(prop_name),
+        text="",
+        emboss=False,
+        icon="LOCKED" if locked else "UNLOCKED",
+    )
+    row.prop_decorator(group, prop_name)
+
+
+def _exact_pin_above(group, pin_idx, pin_item) -> bool:
+    """Whether a pin of the same object that holds exactly is listed above
+    `pin_item`.
+
+    The later pin wins a point two pins share, so such a pin loses its shared
+    points to a pulling pin below it. That is so whether it is plain or
+    carries a motion: a Roots pin captured to follow a moving head is the
+    usual one. Reads no point data, so a draw may ask.
+    """
+    return any(
+        earlier.object_uuid == pin_item.object_uuid and not earlier.use_pull
+        for earlier in list(group.pin_vertex_groups)[:pin_idx]
+    )
+
+
+def _draw_material_maps(param_box, group, actual_index):
+    """Draw the group's spatial material maps.
+
+    Each row is one parameter varied across the surface, or along a rod,
+    blended from this group's own slider toward the row's target and weighted
+    per vertex. A row with no source name is drawn in alert color: an unnamed
+    source cannot be resolved at encode and would abort the transfer, so it is
+    worth showing before the artist presses it.
+
+    A row's own source is the map at the start frame. Its samples name later
+    sources, and the weights between two consecutive samples are their linear
+    interpolation, so a constant hold is two samples naming one source.
+    """
+    box = param_box.box()
+    box.label(text="Spatial Material Maps", icon="GROUP_VERTEX")
+    row = box.row()
+    row.template_list(
+        "OBJECT_UL_MaterialMapsList",
+        "",
+        group,
+        "material_maps",
+        group,
+        "material_maps_index",
+        rows=2,
+    )
+    buttons = row.column(align=True)
+    buttons.operator(
+        "object.ppf_add_material_map", text="", icon="ADD"
+    ).slot = actual_index
+    buttons.operator(
+        "object.ppf_remove_material_map", text="", icon="REMOVE"
+    ).slot = actual_index
+    if group.object_type == "SOLID":
+        box.label(
+            text="Interior values are extended from the painted surface",
+            icon="INFO",
+        )
+    if 0 <= group.material_maps_index < len(group.material_maps):
+        selected = group.material_maps[group.material_maps_index]
+        detail = box.column(align=True)
+        detail.prop(selected, "source_type")
+        detail.prop(selected, "source_name")
+        detail.prop(selected, "target_value")
+        box.separator()
+        box.label(text="The source above is the map at the start frame")
+        sample_row = box.row()
+        sample_row.template_list(
+            "OBJECT_UL_MaterialMapSamplesList",
+            "",
+            selected,
+            "samples",
+            selected,
+            "samples_index",
+            rows=2,
+        )
+        sample_buttons = sample_row.column(align=True)
+        sample_buttons.operator(
+            "object.ppf_add_material_map_sample", text="", icon="ADD"
+        ).slot = actual_index
+        sample_buttons.operator(
+            "object.ppf_remove_material_map_sample", text="", icon="REMOVE"
+        ).slot = actual_index
+        if 0 <= selected.samples_index < len(selected.samples):
+            sample = selected.samples[selected.samples_index]
+            sample_detail = box.column(align=True)
+            sample_detail.prop(sample, "frame")
+            sample_detail.prop(sample, "source_type")
+            sample_detail.prop(sample, "source_name")
+
+
+def _draw_contact_distances(param_box, group):
+    """A group's contact gap and offset, and the limit on the gap.
+
+    A ROD authors absolute distances only, since the box around a strand says
+    nothing about how thick it is. The local gap limit is drawn for the types
+    in CONTACT_GAP_LIMIT_TYPES, every one with a mesh to measure. SAND draws
+    its own box, a gap beside its grain radius.
+    """
+    contact_box = param_box.box()
+    relative = False
+    if group.object_type != "ROD":
+        contact_box.prop(group, "use_group_bounding_box_diagonal")
+        relative = group.use_group_bounding_box_diagonal
+    if relative:
+        _material_prop(contact_box, group, "contact_gap_rat")
+        _material_prop(contact_box, group, "contact_offset_rat")
+    else:
+        _material_prop(contact_box, group, "contact_gap")
+        _material_prop(contact_box, group, "contact_offset")
+    if group.object_type in CONTACT_GAP_LIMIT_TYPES:
+        contact_box.prop(group, "contact_gap_limit_percent")
+
+
+def _draw_collision_windows(param_box, group, actual_index):
+    """Draw the collision active duration windows UI."""
+    cw_box = param_box.box()
+    cw_box.prop(group, "use_collision_windows")
+    if not group.use_collision_windows:
+        return
+
+    row = cw_box.row()
+    row.label(text="Active Windows", icon="TIME")
+    row.prop(group, "collision_window_object_selection", text="")
+
+    assigned = get_assigned_by_selection_uuid(group, "collision_window_object_selection")
+    if assigned is None:
+        return
+
+    row = cw_box.row()
+    row.template_list(
+        "OBJECT_UL_CollisionWindowsList", "",
+        assigned, "collision_windows",
+        assigned, "collision_windows_index",
+        rows=2,
+    )
+    col = row.column(align=True)
+    add_op = col.operator("object.add_collision_window", icon="ADD", text="")
+    add_op.group_index = actual_index
+    rm_op = col.operator("object.remove_collision_window", icon="REMOVE", text="")
+    rm_op.group_index = actual_index
+
+    if assigned.collision_windows and 0 <= assigned.collision_windows_index < len(assigned.collision_windows):
+        entry = assigned.collision_windows[assigned.collision_windows_index]
+        row = cw_box.row(align=True)
+        row.prop(entry, "frame_start")
+        row.prop(entry, "frame_end")
+
+    cw_box.label(text="Invisible colliders always active", icon="INFO")
+    cw_box.label(text="No entries = contact always active", icon="INFO")
+
+
+def _draw_static_ops(pin_box, group, actual_index):
+    """Draw the Transform UI for a STATIC group: the per-object
+    move/spin/scale ops.
+
+    The outer list (assigned_objects) is already shown in the group box
+    above, so this draws the inner ops list plus per-op editor for
+    whichever assigned object is active. Controls stay enabled even if
+    the selected object has Blender fcurves; a warning label explains
+    that fcurves will take precedence at simulate time.
+    """
+    idx = group.assigned_objects_index
+    if idx < 0 or idx >= len(group.assigned_objects):
+        pin_box.label(text="Select an assigned object above", icon="INFO")
+        return
+    assigned = group.assigned_objects[idx]
+
+    from ...core.uuid_registry import get_object_by_uuid
+    from ...core.utils import has_transform_fcurves
+    obj = get_object_by_uuid(assigned.uuid) if assigned.uuid else None
+    has_fcurves = obj is not None and has_transform_fcurves(obj)
+
+    if obj is None:
+        pin_box.label(text="Object unresolved", icon="ERROR")
+    elif has_fcurves:
+        pin_box.label(
+            text="Object has Blender keyframes — these ops will be ignored",
+            icon="ERROR",
+        )
+
+    row = pin_box.row()
+    row.template_list(
+        "OBJECT_UL_StaticOpsList", "",
+        assigned, "static_ops",
+        assigned, "static_ops_index",
+        rows=3,
+    )
+    btn_col = row.column(align=True)
+    add_op = btn_col.operator_menu_enum(
+        "object.add_static_op", "op_type", icon="ADD", text="",
+    )
+    add_op.group_index = actual_index
+    rm_op = btn_col.operator("object.remove_static_op", icon="REMOVE", text="")
+    rm_op.group_index = actual_index
+    up_op = btn_col.operator("object.move_static_op", icon="TRIA_UP", text="")
+    up_op.group_index = actual_index
+    up_op.direction = -1
+    down_op = btn_col.operator("object.move_static_op", icon="TRIA_DOWN", text="")
+    down_op.group_index = actual_index
+    down_op.direction = 1
+
+    # Per-op editor for the active row
+    op_idx = assigned.static_ops_index
+    if 0 <= op_idx < len(assigned.static_ops):
+        op = assigned.static_ops[op_idx]
+        editor = pin_box.box()
+        row = editor.row(align=True)
+        row.prop(op, "frame_start")
+        row.prop(op, "frame_end")
+        editor.prop(op, "transition")
+        if op.op_type == "MOVE_BY":
+            editor.prop(op, "delta")
+        elif op.op_type == "SPIN":
+            editor.prop(op, "spin_axis")
+            editor.prop(op, "spin_angular_velocity")
+            editor.label(text="Center: object origin", icon="OBJECT_ORIGIN")
+        elif op.op_type == "SCALE":
+            editor.prop(op, "scale_factor")
+            editor.label(text="Center: object origin", icon="OBJECT_ORIGIN")
+
+
+def _draw_pdrd_pins(pin_box, group, actual_index, context):
+    """Specialized rigid-body (PDRD) pin UI: one Pins list.
+
+    A PDRD body moves as one rigid transform, so a pin holds the picked
+    vertices fixed (a corner = pivot, an edge = axis, 3+ = fully locked). That
+    hold IS the static anchor; there is no separate anchor type. Optional
+    motion steps (Translate / Rotate) drive the whole body along a prescribed
+    path. A pin with no steps simply holds; adding a step makes it move. The
+    cloth-only controls (Pull, Fix Weight Threshold, Capture Deformation,
+    rest-pose tracking, pin profile, Scale, Torque) are intentionally
+    absent here.
+    """
+    from ...core.uuid_registry import get_object_uuid
+
+    col = pin_box.column()
+    row = col.row()
+    row.prop(group, "pin_vertex_group_items", text="")
+    add = row.operator("object.add_pin_vertex_group", icon="ADD", text="Add")
+    add.group_index = actual_index
+    create = row.operator(
+        "object.create_pin_vertex_group", icon="ADD", text="Create"
+    )
+    create.group_index = actual_index
+
+    remove_enabled = (
+        0 <= group.pin_vertex_groups_index < len(group.pin_vertex_groups)
+    )
+    row = col.row(align=True)
+    sub = row.row(align=True)
+    sub.enabled = remove_enabled
+    rm = sub.operator("object.remove_pin_vertex_group", icon="REMOVE", text="Remove")
+    rm.group_index = actual_index
+    sub = row.row(align=True)
+    sub.enabled = remove_enabled
+    rn = sub.operator(
+        "object.rename_pin_vertex_group", icon="SORTALPHA", text="Rename"
+    )
+    rn.group_index = actual_index
+
+    col.template_list(
+        "OBJECT_UL_PinVertexGroupsList", "",
+        group, "pin_vertex_groups",
+        group, "pin_vertex_groups_index",
+    )
+    row = col.row(align=True)
+    row.prop(group, "pin_overlay_size", text="Size")
+    up = row.operator("object.move_pin_vertex_group", icon="TRIA_UP", text="")
+    up.group_index = actual_index
+    up.direction = -1
+    dn = row.operator("object.move_pin_vertex_group", icon="TRIA_DOWN", text="")
+    dn.group_index = actual_index
+    dn.direction = 1
+
+    pin_idx = group.pin_vertex_groups_index
+    if not (0 <= pin_idx < len(group.pin_vertex_groups)):
+        return
+    pin_item = group.pin_vertex_groups[pin_idx]
+
+    # Edit-mode Select/Deselect while the pin's own object is open in Edit Mode.
+    _pin_obj_uuid = pin_item.object_uuid or ""
+    if (context.mode in ("EDIT_MESH", "EDIT_CURVE")
+            and context.edit_object is not None
+            and _pin_obj_uuid
+            and get_object_uuid(context.edit_object) == _pin_obj_uuid):
+        srow = col.row(align=True)
+        s = srow.operator("object.select_pin_vertices", icon="RESTRICT_SELECT_OFF")
+        s.group_index = actual_index
+        d = srow.operator("object.deselect_pin_vertices", icon="RESTRICT_SELECT_ON")
+        d.group_index = actual_index
+
+    # A pin holds fixed; an optional release frame drops it mid-sim.
+    row = col.row(align=True)
+    row.prop(pin_item, "use_pin_duration", text="Release")
+    sub = row.row()
+    sub.enabled = pin_item.use_pin_duration
+    sub.prop(pin_item, "pin_duration", text="After (frames)")
+    col.label(
+        text="1 vertex = pivot, edge (2) = axis, 3+ = fully locked",
+        icon="INFO",
+    )
+
+    # A PDRD group reaches this block instead of the shared pin block, so the
+    # per-pin intersection allowance is drawn here as well. The encoder treats
+    # a PDRD pin like any other (only STATIC is skipped), so a pin here carries
+    # the flag to the solver the same way.
+    row = col.row(align=True)
+    row.prop(pin_item, "allow_intersection")
+    if pin_item.allow_intersection:
+        col.label(
+            text="Fully pinned faces pass through; "
+                 "partly pinned ones still collide",
+            icon="INFO",
+        )
+
+    # Optional motion steps. No steps -> the pin just holds.
+    col.separator()
+    col.label(text="Motion steps (optional):")
+    col.template_list(
+        "OBJECT_UL_PinOperationsList", "",
+        pin_item, "operations",
+        pin_item, "operations_index",
+        rows=2,
+    )
+    row = col.row(align=True)
+    tr = row.operator("object.add_pin_operation", text="Translate", icon="ADD")
+    tr.group_index = actual_index
+    tr.op_type = "MOVE_BY"
+    ro = row.operator("object.add_pin_operation", text="Rotate", icon="ADD")
+    ro.group_index = actual_index
+    ro.op_type = "SPIN"
+    rmop = row.operator("object.remove_pin_operation", text="Remove", icon="REMOVE")
+    rmop.group_index = actual_index
+    upop = row.operator("object.move_pin_operation", text="", icon="TRIA_UP")
+    upop.group_index = actual_index
+    upop.direction = -1
+    dnop = row.operator("object.move_pin_operation", text="", icon="TRIA_DOWN")
+    dnop.group_index = actual_index
+    dnop.direction = 1
+    if not pin_item.operations:
+        col.label(text="No steps: the pin holds fixed", icon="PINNED")
+
+    op_idx = pin_item.operations_index
+    if 0 <= op_idx < len(pin_item.operations):
+        op = pin_item.operations[op_idx]
+        op_box = col.box()
+        if op.op_type == "MOVE_BY":
+            op_box.label(text="Translate:")
+            op_box.prop(op, "delta")
+            frow = op_box.row(align=True)
+            frow.prop(op, "frame_start")
+            frow.prop(op, "frame_end")
+            op_box.prop(op, "transition")
+        elif op.op_type == "SPIN":
+            op_box.label(text="Rotate:")
+            # Curated center: Centroid or a picked vertex only. Drawn as two
+            # single-value enum toggles so the cloth-oriented Absolute and
+            # Max-Towards modes never appear for a rigid body.
+            crow = op_box.row(align=True)
+            crow.prop_enum(op, "spin_center_mode", "CENTROID")
+            crow.prop_enum(op, "spin_center_mode", "VERTEX")
+            if op.spin_center_mode == "VERTEX":
+                vrow = op_box.row(align=True)
+                vrow.prop(op, "spin_center_vertex")
+                pick = vrow.operator(
+                    "object.pick_vertex_center", icon="EYEDROPPER", text=""
+                )
+                pick.group_index = actual_index
+                pick.target = "spin"
+                op_box.prop(op, "show_vertex_spin")
+            op_box.prop(op, "spin_axis")
+            op_box.prop(op, "spin_angular_velocity")
+            op_box.prop(op, "spin_flip")
+            frow = op_box.row(align=True)
+            frow.prop(op, "frame_start")
+            frow.prop(op, "frame_end")
+            op_box.prop(op, "transition")
+        else:
+            # A non-curated op (e.g. a Scale/Torque step imported from a scene
+            # built in the generic panel). Surface it rather than silently
+            # hiding motion the body actually carries.
+            op_box.label(
+                text=iface_("{op_type}: edit in the generic panel").format(op_type=op.op_type),
+                icon="INFO",
+            )
+
+
+_FTETWILD_FIELDS = (
+    "edge_length_fac",
+    "epsilon",
+    "stop_energy",
+    "num_opt_iter",
+    "optimize",
+    "simplify",
+    "coarsen",
+)
+_TETGEN_FIELDS = (
+    "min_ratio",
+    "max_volume",
+)
+
+
+def _draw_tetrahedralizer(param_box, group, actual_index):
+    """Draw the per-object tetrahedralizer picker and its overrides.
+
+    SOLID groups only. Mirrors the Velocity Overwrite surface: an object
+    dropdown selects which assigned mesh to edit, then a backend popup
+    (fTetWild / TetGen) followed by that backend's per-field overrides,
+    which live on the AssignedObject. With no override flag set, the
+    backend's own default applies.
+    """
+    tet_box = param_box.box()
+    row = tet_box.row()
+    row.label(text="Tetrahedralizer", icon="MESH_ICOSPHERE")
+    row.prop(group, "tet_object_selection", text="")
+
+    assigned = get_assigned_by_selection_uuid(group, "tet_object_selection")
+    if assigned is None:
+        return
+
+    tet_box.prop(assigned, "tet_backend", text="")
+    if assigned.tet_backend == "TETGEN":
+        for field in _TETGEN_FIELDS:
+            sub_row = tet_box.row(align=True)
+            sub_row.prop(assigned, f"tetgen_override_{field}", text="")
+            sub = sub_row.row(align=True)
+            sub.enabled = getattr(assigned, f"tetgen_override_{field}")
+            sub.prop(assigned, f"tetgen_{field}")
+    else:
+        for field in _FTETWILD_FIELDS:
+            sub_row = tet_box.row(align=True)
+            sub_row.prop(assigned, f"ftetwild_override_{field}", text="")
+            sub = sub_row.row(align=True)
+            sub.enabled = getattr(assigned, f"ftetwild_override_{field}")
+            sub.prop(assigned, f"ftetwild_{field}")
+
+
+# Per-mesh cache: mesh.as_pointer() -> (topology_key, has_loose_edge).
+# topology_key is (n_verts, n_edges, n_polys, n_loops); any add/remove/merge
+# that matters to loose-edge detection changes at least one count.
+# Runs inside DYNAMICS_PT_Groups.draw() — redraws fire on every mouse move.
+_stitch_cache: dict[int, tuple[tuple[int, int, int, int], bool]] = {}
+
+
+def _mesh_has_loose_edge(mesh) -> bool:
+    """Return True if `mesh` has any edge not referenced by a polygon loop.
+
+    Result is cached per-mesh and invalidated whenever vertex/edge/poly/loop
+    counts change.
+    """
+    import numpy as np
+    n_verts = len(mesh.vertices)
+    n_edges = len(mesh.edges)
+    n_polys = len(mesh.polygons)
+    n_loops = len(mesh.loops)
+    key = (n_verts, n_edges, n_polys, n_loops)
+    ptr = mesh.as_pointer()
+    cached = _stitch_cache.get(ptr)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    if n_edges == 0:
+        has = False
+    elif n_loops == 0:
+        has = True
+    else:
+        loop_edges = np.empty(n_loops, dtype=np.int32)
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        hits = np.zeros(n_edges, dtype=np.uint8)
+        hits[loop_edges] = 1
+        has = bool(int(hits.sum()) < n_edges)
+
+    _stitch_cache[ptr] = (key, has)
+    return has
+
+
+def _group_has_stitch(group) -> bool:
+    """Check if any assigned object in the group has stitch (loose) edges."""
+    from ...core.uuid_registry import resolve_assigned
+    for obj_ref in group.assigned_objects:
+        if not obj_ref.included:
+            continue
+        obj = resolve_assigned(obj_ref)
+        if not obj or obj.type != "MESH":
+            continue
+        if _mesh_has_loose_edge(obj.data):
+            return True
+    return False
+
+
+def _draw_stitch_stiffness(layout, group):
+    """Draw the per-group stitch stiffness for SOLID and SHELL groups.
+
+    A ROD group has none to draw: its edges are the rod, not stitches.
+
+    The control is always drawn so it stays discoverable; it is disabled
+    with a status label when the group has no loose-edge (intra-object)
+    stitches, rather than hidden. The value drives this group's objects'
+    stitch forces (resolved per stitch in the solver).
+    """
+    has = _group_has_stitch(group)
+    col = layout.column()
+    col.enabled = has
+    _material_prop(col, group, "stitch_stiffness")
+    if not has:
+        layout.label(text="No loose-edge stitches in this group", icon="INFO")
+
+
+def bend_plasticity_applies(group) -> bool:
+    """Whether Bend Plasticity is drawn: not under From Reference Geometry,
+    where the reference owns the rest angle (the encoder's ``gate_open``
+    closes the same gate)."""
+    return group.bend_rest_angle_source != "FROM_REFERENCE"
+
+
+def _draw_shell_bend_rest(layout, group, actual_index):
+    """The Shell group's rest-angle box: the Rest Angle dropdown, then either
+    the per-object reference controls (From Reference Geometry) or Bend
+    Plasticity (every other Rest Angle)."""
+    layout.prop(group, "bend_rest_angle_source")
+    if group.bend_rest_angle_source == "FROM_REFERENCE":
+        _draw_bend_reference(layout, group, actual_index)
+    if bend_plasticity_applies(group):
+        _draw_bend_plasticity(layout, group)
+
+
+def _draw_bend_plasticity(layout, group):
+    """Draw the Bend Plasticity toggle and its two sliders.
+
+    Not drawn under From Reference Geometry, where the reference owns the rest
+    angle; the encoder closes the same gate there (``gate_open``), so a value
+    the hidden toggle still holds never reaches the solver.
+    """
+    layout.prop(group, "enable_bend_plasticity")
+    if group.enable_bend_plasticity:
+        _material_prop(layout, group, "bend_plasticity")
+        _material_prop(layout, group, "bend_plasticity_threshold")
+
+
+def _draw_bend_reference(layout, group, actual_index):
+    """Draw the per-object bending reference controls.
+
+    Shown when the group's Rest Angle is From Reference Geometry. Lays out a
+    pulldown of the group's objects; the selected object gets a Reference
+    Source picker. A Reference Object source draws an eyedropper to pick (and
+    an X to clear) the reference object; a Shape Key source draws a search
+    field over the object's own shape keys; a Shape Key Mix source draws the
+    mix's status. Every object in such a group reads its reference, so an
+    object with none set gets an ERROR line naming what the Transfer will
+    refuse.
+    """
+    from ...core.uuid_registry import get_object_by_uuid
+
+    ref_box = layout.box()
+    ref_box.label(text="Reference (per object):")
+    ref_box.prop(group, "bend_ref_object_selection", text="")
+    assigned = get_assigned_by_selection_uuid(group, "bend_ref_object_selection")
+    if assigned is None:
+        ref_box.label(text="No objects in this group", icon="INFO")
+        return
+
+    ref_box.prop(assigned, "bend_ref_source", text="Source")
+
+    if assigned.bend_ref_source == "SHAPE_KEY":
+        _draw_bend_reference_shape_key(ref_box, assigned)
+    elif assigned.bend_ref_source == "SHAPE_KEY_MIX":
+        _draw_bend_reference_shape_key_mix(ref_box, group, assigned)
+    else:
+        ref_obj = (
+            get_object_by_uuid(assigned.bend_ref_uuid) if assigned.bend_ref_uuid else None
+        )
+        if ref_obj is not None:
+            label, icon = ref_obj.name, "MESH_DATA"
+        elif assigned.bend_ref_uuid:
+            label = iface_("Missing: {name}").format(name=assigned.bend_ref_name or assigned.bend_ref_uuid[:8])
+            icon = "ERROR"
+        else:
+            label, icon = "No reference set: Transfer refuses this object", "ERROR"
+
+        pick_row = ref_box.row(align=True)
+        pick_row.label(text=label, icon=icon)
+        op = pick_row.operator("object.pick_bend_reference", text="", icon="EYEDROPPER")
+        op.group_index = actual_index
+        op.object_uuid = assigned.uuid
+        clr = pick_row.operator("object.clear_bend_reference", text="", icon="X")
+        clr.group_index = actual_index
+        clr.object_uuid = assigned.uuid
+
+
+def _draw_bend_reference_shape_key_mix(layout, group, assigned):
+    """Draw the status of a shape-key-mix reference and return whether the
+    mix can be read.
+
+    Nothing to pick: the mix is the object's own. The status line says
+    whether the mix is animated (the rest angle then follows it) or static,
+    and names the refusal the encoder applies to an animated mix in a Rod
+    group before the artist meets it at Transfer.
+    Read from declarations only (``shape_key_mix_animated``), never by
+    stepping the timeline, since this runs in ``draw``.
+    """
+    from ...core.utils import shape_key_mix_animated, validate_bend_shape_key_mix
+    from ...core.uuid_registry import get_object_by_uuid
+
+    obj = get_object_by_uuid(assigned.uuid) if assigned.uuid else None
+    ok, msg = validate_bend_shape_key_mix(obj)
+    if not ok:
+        layout.label(text=msg, icon="INFO")
+        return False
+    if not shape_key_mix_animated(obj):
+        layout.label(
+            text="Mix is not animated: the rest angle is the current mix",
+            icon="SHAPEKEY_DATA",
+        )
+        return True
+    if group.object_type != "SHELL":
+        layout.label(text="An animated mix needs a Shell group", icon="ERROR")
+        return False
+    layout.label(text="Mix is animated: the rest angle follows it", icon="ACTION")
+    return True
+
+
+def _draw_bend_reference_shape_key(layout, assigned):
+    """Draw the shape-key row of the bending reference controls and return
+    whether the stored shape key resolves on the object.
+
+    The search field is always drawn, disabled while the object has no shape
+    keys; a status line says which precondition is missing, and an ERROR line
+    names an unset key or a stored key that no longer exists (renamed or
+    removed), both of which the encoder refuses.
+    """
+    from ...core.uuid_registry import get_object_by_uuid
+
+    obj = get_object_by_uuid(assigned.uuid) if assigned.uuid else None
+    keys = obj.data.shape_keys if obj is not None and obj.type == "MESH" else None
+
+    row = layout.row(align=True)
+    row.enabled = keys is not None
+    if keys is not None:
+        row.prop_search(
+            assigned, "bend_ref_shape_key", keys, "key_blocks",
+            text="", icon="SHAPEKEY_DATA",
+        )
+    else:
+        row.prop(assigned, "bend_ref_shape_key", text="", icon="SHAPEKEY_DATA")
+
+    name = assigned.bend_ref_shape_key
+    if obj is None or obj.type != "MESH":
+        layout.label(text="Shape-key rest angles need a mesh object", icon="INFO")
+        return False
+    if keys is None:
+        layout.label(text="This object has no shape keys", icon="INFO")
+        return False
+    if not name:
+        layout.label(text="No shape key set: Transfer refuses this object", icon="ERROR")
+        return False
+    if keys.key_blocks.get(name) is None:
+        layout.label(
+            text=iface_("Missing shape key: {name}").format(name=name),
+            icon="ERROR",
+        )
+        return False
+    return True
+
+
+def _draw_damping(layout, group, include_bending):
+    """Draw the per-group Rayleigh damping coefficients.
+
+    Stiffness-proportional damping reuses each element's tangent stiffness:
+    deformation_damping damps stretch/membrane/solid motion, bending_damping
+    (shells and rods only) damps bending. 0 disables a term.
+    """
+    box = layout.box()
+    box.label(text="Rayleigh Damping")
+    _material_prop(box, group, "deformation_damping")
+    if include_bending:
+        _material_prop(box, group, "bending_damping")
+
+
+def get_active_groups_with_indices(scene):
+    """Get active groups with their actual property indices (for object_group_N)."""
+    from ..state import N_MAX_GROUPS
+
+    addon_data = get_addon_data(scene)
+    for i in range(N_MAX_GROUPS):
+        prop_name = f"object_group_{i}"
+        group = getattr(addon_data, prop_name, None)
+        if group and group.active:
+            yield i, group
+
+
+class MAIN_PT_SceneConfiguration(Panel):
+    bl_label = "Scene Configuration"
+    bl_idname = "SSH_PT_ObjectGroupsManager"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = get_category_name()
+
+    @classmethod
+    def poll(cls, context):
+        return has_addon_data(context.scene)
+
+    def draw(self, context):
+        layout = self.layout
+
+        params = get_addon_data(context.scene).state
+
+        # Scene param profile
+        profile_row = layout.row(align=True)
+        if _profile_path_exists(params.scene_profile_path):
+            profile_row.prop(params, "scene_profile_selection", text="Profile")
+            profile_row.operator(
+                "scene.open_scene_profile", text="", icon="FILEBROWSER"
+            )
+            profile_row.operator(
+                "scene.clear_scene_profile", text="", icon="X"
+            )
+            profile_row.operator(
+                "scene.reload_scene_profile", text="", icon="FILE_REFRESH"
+            )
+            profile_row.operator(
+                "scene.save_scene_profile", text="", icon="FILE_TICK"
+            )
+        else:
+            profile_row.operator(
+                "scene.open_scene_profile", text="Open Profile", icon="FILEBROWSER"
+            )
+            profile_row.operator(
+                "scene.save_scene_profile", text="", icon="FILE_TICK"
+            )
+
+        # Always name the rate the solver will actually run at. The FPS field
+        # keeps its last value while the scene override is on, so showing the
+        # field alone would quote a rate that is not in use.
+        fps_box = layout.box()
+        fps_box.prop(params, "use_scene_fps")
+        if params.use_scene_fps:
+            row = fps_box.row()
+            row.label(text="FPS (from Scene):")
+            row.label(text=str(context.scene.render.fps))
+        else:
+            fps_box.prop(params, "frame_rate")
+        # Time Scale re-interprets how much simulated time one frame covers
+        # (0.5 = the animation plays at half speed in solver seconds). Shown
+        # in the same box as the rate so the two time knobs read together;
+        # flag the slow-motion state whenever it is not real time.
+        fps_box.prop(params, "time_scale")
+        if params.time_scale != 1.0:
+            row = fps_box.row()
+            row.label(
+                text=iface_("Animation at {percent}% speed").format(
+                    percent=round(params.time_scale * 100)
+                ),
+                icon="TIME",
+            )
+        # Same reasoning as the FPS box: the Starting Frame field keeps its
+        # last value while the scene override is on, so name the frame the
+        # solve will actually start on rather than the field alone.
+        start_box = layout.box()
+        start_box.prop(params, "use_scene_frame_start")
+        if params.use_scene_frame_start:
+            row = start_box.row()
+            row.label(text="Starting Frame (from Scene):")
+            row.label(text=str(context.scene.frame_start))
+        else:
+            start_box.prop(params, "frame_start")
+        layout.prop(params, "frame_count")
+        layout.prop(params, "step_size")
+        layout.prop(params, "min_newton_steps")
+        layout.prop(params, "air_density")
+        layout.prop(params, "air_friction")
+        layout.prop(params, "world_scaling")
+        layout.prop(params, "gravity_3d")
+        layout.prop(params, "preview_gravity_direction")
+
+        has_shell_type = any(
+            group.object_type == "SHELL"
+            for group in iterate_active_object_groups(context.scene)
+        )
+        row = layout.row()
+        row.enabled = has_shell_type
+        row.prop(params, "inactive_momentum_frames")
+
+        # Save and Checkpoints: collects Save State on Finish, the Auto
+        # Save interval/retention, and the per-frame Save Checkpoints list.
+        save_box = layout.box()
+        row = save_box.row()
+        row.prop(
+            params,
+            "show_save_and_checkpoints",
+            icon="TRIA_DOWN" if params.show_save_and_checkpoints else "TRIA_RIGHT",
+            emboss=False,
+            icon_only=True,
+        )
+        row.label(text="Save and Checkpoints", icon="FILE_TICK")
+        if params.show_save_and_checkpoints:
+            save_box.prop(params, "save_state_on_finish")
+
+            # Auto Save sub-box: the header checkbox enables periodic
+            # auto-saving; the interval and retention fields stay visible
+            # but disabled when it is off so the controls are discoverable.
+            auto_box = save_box.box()
+            row = auto_box.row()
+            row.prop(
+                params,
+                "show_auto_save",
+                icon="TRIA_DOWN" if params.show_auto_save else "TRIA_RIGHT",
+                emboss=False,
+                icon_only=True,
+            )
+            row.prop(params, "auto_save")
+            if params.show_auto_save:
+                col = auto_box.column()
+                col.enabled = params.auto_save
+                col.prop(params, "auto_save_interval")
+                col.prop(params, "keep_states")
+
+            # Save Checkpoints sub-box: an explicit list of frames at which
+            # the solver writes a resumable state, independent of the
+            # auto-save cadence.
+            cp_box = save_box.box()
+            row = cp_box.row()
+            row.prop(
+                params,
+                "show_checkpoints",
+                icon="TRIA_DOWN" if params.show_checkpoints else "TRIA_RIGHT",
+                emboss=False,
+                icon_only=True,
+            )
+            row.label(text="Save Checkpoints", icon="KEYFRAME")
+            if params.show_checkpoints:
+                cp_box.template_list(
+                    "SCENE_UL_SaveCheckpointFrames", "",
+                    params, "save_checkpoint_frames",
+                    params, "save_checkpoint_frames_index",
+                    rows=3,
+                )
+                btn_row = cp_box.row(align=True)
+                btn_row.operator(
+                    "scene.add_save_checkpoint",
+                    text=iface_("Add Frame {frame}").format(frame=context.scene.frame_current),
+                    icon="ADD",
+                )
+                rm_row = btn_row.row()
+                rm_row.enabled = (
+                    0 <= params.save_checkpoint_frames_index
+                    < len(params.save_checkpoint_frames)
+                )
+                rm_row.operator("scene.remove_save_checkpoint", text="Remove", icon="REMOVE")
+
+        wind_box = layout.box()
+        row = wind_box.row()
+        row.prop(
+            params,
+            "show_wind",
+            icon="TRIA_DOWN" if params.show_wind else "TRIA_RIGHT",
+            emboss=False,
+            icon_only=True,
+        )
+        row.label(text="Wind", icon="FORCE_WIND")
+        if params.show_wind:
+            wind_box.prop(params, "wind_direction")
+            wind_box.prop(params, "preview_wind_direction")
+            wind_box.prop(params, "wind_strength")
+
+        _draw_force_fields(layout, context, params)
+
+        # The addon's own scene-parameter keyframe list is gone. Those settings
+        # are keyframed on their own sliders now, the same gesture that drives
+        # a material parameter, so the curves live on the timeline with every
+        # other keyframe instead of in a list only this panel could show. A
+        # saved scene's legacy entries are converted on load
+        # (core/migrate_dyn_params.py); the PropertyGroups stay registered so
+        # that conversion has something to read.
+        # Invisible Colliders (enclosed box)
+        ic_box = layout.box()
+        ic_row = ic_box.row()
+        ic_row.prop(
+            params,
+            "show_invisible_colliders",
+            icon="TRIA_DOWN" if params.show_invisible_colliders else "TRIA_RIGHT",
+            emboss=False,
+            icon_only=True,
+        )
+        ic_row.label(text="Invisible Colliders", icon="GHOST_ENABLED")
+        if params.show_invisible_colliders:
+            ic_box.template_list(
+                "SCENE_UL_InvisibleCollidersList", "",
+                params, "invisible_colliders",
+                params, "invisible_colliders_index",
+                rows=2,
+            )
+            row = ic_box.row(align=True)
+            row.operator_menu_enum(
+                "scene.add_invisible_collider", "collider_type",
+                text="Add", icon="ADD",
+            )
+            rm_row = row.row()
+            rm_row.enabled = 0 <= params.invisible_colliders_index < len(params.invisible_colliders)
+            rm_row.operator("scene.remove_invisible_collider", text="Remove", icon="REMOVE")
+
+            ic_idx = params.invisible_colliders_index
+            if 0 <= ic_idx < len(params.invisible_colliders):
+                ic_item = params.invisible_colliders[ic_idx]
+                prop_box = ic_box.box()
+                prop_box.prop(ic_item, "name", text="Name")
+                if ic_item.collider_type == "WALL":
+                    prop_box.prop(ic_item, "position")
+                    prop_box.prop(ic_item, "normal")
+                else:
+                    prop_box.prop(ic_item, "position")
+                    prop_box.prop(ic_item, "radius")
+                    row = prop_box.row()
+                    row.prop(ic_item, "invert")
+                    row.prop(ic_item, "hemisphere")
+                prop_box.prop(ic_item, "contact_gap")
+                prop_box.prop(ic_item, "friction")
+                prop_box.prop(ic_item, "thickness")
+                prop_box.prop(ic_item, "enable_active_duration")
+                if ic_item.enable_active_duration:
+                    prop_box.prop(ic_item, "active_duration")
+
+                ic_box.separator()
+                ic_box.template_list(
+                    "SCENE_UL_ColliderKeyframesList", "",
+                    ic_item, "keyframes",
+                    ic_item, "keyframes_index",
+                    rows=2,
+                )
+                kf_row = ic_box.row(align=True)
+                kf_row.operator("scene.add_collider_keyframe", text="Add Keyframe", icon="ADD")
+                kf_rm = kf_row.row()
+                kf_rm.enabled = (
+                    0 <= ic_item.keyframes_index < len(ic_item.keyframes)
+                    and ic_item.keyframes_index > 0
+                )
+                kf_rm.operator("scene.remove_collider_keyframe", text="Remove", icon="REMOVE")
+
+                kf_idx = ic_item.keyframes_index
+                if 0 <= kf_idx < len(ic_item.keyframes):
+                    kf = ic_item.keyframes[kf_idx]
+                    kf_box = ic_box.box()
+                    if kf_idx == 0:
+                        kf_box.label(text="Uses base properties above", icon="INFO")
+                    else:
+                        kf_box.prop(kf, "frame")
+                        kf_box.prop(kf, "use_hold")
+                        if not kf.use_hold:
+                            kf_box.prop(kf, "position")
+                            if ic_item.collider_type == "SPHERE":
+                                kf_box.prop(kf, "radius")
+
+        _draw_linear_system_solver(layout, context, params)
+
+        advanced_box = layout.box()
+        row = advanced_box.row()
+        row.prop(
+            params,
+            "show_advanced_parameters",
+            icon="TRIA_DOWN" if params.show_advanced_parameters else "TRIA_RIGHT",
+            emboss=False,
+            icon_only=True,
+        )
+        row.label(text="Advanced Params", icon="PREFERENCES")
+        if params.show_advanced_parameters:
+            advanced_box.prop(params, "contact_nnz")
+            advanced_box.prop(params, "vertex_air_damp")
+            advanced_box.prop(params, "line_search_max_t")
+            advanced_box.prop(params, "constraint_ghat")
+            advanced_box.prop(params, "include_face_mass")
+            advanced_box.prop(params, "friction_mode")
+            advanced_box.prop(params, "disable_contact")
+
+
+class DYNAMICS_PT_Groups(Panel):
+    bl_label = "Dynamics Groups"
+    bl_idname = "DYNAMICS_PT_Groups"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = get_category_name()
+
+    def draw(self, context):
+        layout = self.layout
+
+        row = layout.row()
+        row.operator("object.create_group", icon="PLUS")
+        row.operator("object.delete_all_groups", icon="TRASH")
+
+        for display_index, (actual_index, group) in enumerate(
+            get_active_groups_with_indices(context.scene)
+        ):
+            box = layout.box()
+            # Group header with collapse toggle
+            row = box.row()
+            # Use custom name if provided, otherwise default to "Group N"
+            group_label = (
+                group.name if group.name.strip()
+                else iface_("Group {index}").format(index=display_index + 1)
+            )
+            group_icon = GROUP_TYPE_ICONS.get(group.object_type, {}).get(
+                "header", "OBJECT_DATA"
+            )
+            row.prop(
+                group,
+                "show_group",
+                icon="TRIA_DOWN" if group.show_group else "TRIA_RIGHT",
+                emboss=False,
+                icon_only=True,
+            )
+            row.label(text=group_label, icon=group_icon)
+            op = row.operator("object.duplicate_group", text="", icon="DUPLICATE")
+            op.group_index = actual_index
+
+            if group.show_group:
+                # Group name field and type selection on same row
+                row = box.row(align=True)
+                row.prop(group, "name", text="Name")
+                row.prop(group, "object_type", text="")
+
+                row = box.row(align=True)
+                row.prop(group, "show_overlay_color")
+                if group.show_overlay_color:
+                    row.prop(group, "color", text="")
+                box.template_list(
+                    "OBJECT_UL_AssignedObjectsList",
+                    "",
+                    group,
+                    "assigned_objects",
+                    group,
+                    "assigned_objects_index",
+                )
+                # First row: Add Selected + Remove Object
+                row = box.row()
+                add_op = row.operator(
+                    "object.add_objects_to_group",
+                    icon="ADD",
+                )
+                add_op.group_index = actual_index
+                col = row.column()
+                col.enabled = (
+                    0 <= group.assigned_objects_index < len(group.assigned_objects)
+                )
+                remove_op = col.operator(
+                    "object.remove_object_from_group", icon="REMOVE"
+                )
+                remove_op.group_index = actual_index
+
+                # Second row: Bake Animation + Bake Single Frame
+                row = box.row()
+                has_selection = 0 <= group.assigned_objects_index < len(group.assigned_objects)
+                has_anim = False
+                if has_selection:
+                    from ...core.uuid_registry import resolve_assigned as _resolve
+                    from ...core.pc2 import has_mesh_cache
+                    _sel_obj = _resolve(group.assigned_objects[group.assigned_objects_index])
+                    has_anim = _sel_obj is not None and has_mesh_cache(_sel_obj)
+                from .bake_ops import is_bake_running as _is_bake_running
+                _bake_active = _is_bake_running()
+                col = row.column()
+                col.enabled = has_anim and not _bake_active
+                bake_op = col.operator("object.bake_animation", icon="ACTION")
+                bake_op.group_index = actual_index
+                col = row.column()
+                col.enabled = has_anim and not _bake_active
+                bake_frame_op = col.operator("object.bake_single_frame", icon="KEYFRAME")
+                bake_frame_op.group_index = actual_index
+
+                # Capture Deformation row: only meaningful for STATIC
+                # groups whose selected assigned object deforms via
+                # modifiers (Armature, MeshDeform, Lattice, shape keys,
+                # geometry nodes, drivers). Always renders for STATIC so
+                # the user can see the controls exist; per-button
+                # ``enabled`` flags grey them out when the preconditions
+                # aren't met (no selection, not deforming, no cache, or
+                # a job is already in flight).
+                if group.object_type == "STATIC":
+                    from .static_deform_ops import (
+                        is_capture_running as _is_capture_running,
+                        object_deformation_frame_count as _df_count,
+                        object_has_deformation_cache as _has_df,
+                        object_needs_deformation_capture as _needs_df,
+                        static_capture_hint as _static_capture_hint,
+                    )
+                    from .pin_capture_ops import (
+                        is_pin_capture_running as _is_pin_capture_running,
+                    )
+                    from ...core.uuid_registry import resolve_assigned as _resolve_sd
+                    _sd_obj = (
+                        _resolve_sd(group.assigned_objects[group.assigned_objects_index])
+                        if has_selection
+                        else None
+                    )
+                    _capture_active = _is_capture_running()
+                    _pin_capture_active = _is_pin_capture_running()
+                    _deforms = (
+                        _sd_obj is not None
+                        and _needs_df(_sd_obj, context)
+                    )
+                    _has_cache = _sd_obj is not None and _has_df(_sd_obj)
+                    row = box.row()
+                    col = row.column()
+                    col.enabled = (
+                        _deforms
+                        and not _capture_active
+                        and not _pin_capture_active
+                        and not _bake_active
+                    )
+                    cap_op = col.operator(
+                        "object.capture_static_deformation",
+                        icon="REC",
+                    )
+                    cap_op.group_index = actual_index
+                    col = row.column()
+                    col.enabled = _has_cache and not _capture_active
+                    clr_op = col.operator(
+                        "object.clear_static_deformation",
+                        icon="X",
+                    )
+                    clr_op.group_index = actual_index
+                    if _has_cache:
+                        n = _df_count(_sd_obj)
+                        box.label(
+                            text=iface_("Deform cache: {count} frame(s)").format(count=n),
+                            icon="FILE_CACHE",
+                        )
+                    elif _static_capture_hint(_sd_obj, context) is not None:
+                        # Capture stays available for any motion it can
+                        # record, but only a mesh that changes SHAPE needs one
+                        # to encode; say which case this object is, or a
+                        # greyed-out or optional button reads as broken.
+                        box.label(
+                            text=_static_capture_hint(_sd_obj, context),
+                            icon="INFO",
+                        )
+                    elif not has_selection:
+                        # No object selected — scan the group for any
+                        # assigned mesh that has a deforming modifier
+                        # stack so the user knows the controls are
+                        # waiting on a row click. Cheap declarative
+                        # check (no depsgraph round-trip) since this
+                        # runs on every panel redraw.
+                        from ...core.utils import has_deforming_modifier_stack
+                        any_deforms = any(
+                            has_deforming_modifier_stack(_resolve_sd(a))
+                            for a in group.assigned_objects
+                        )
+                        if any_deforms:
+                            box.label(
+                                text="Deformable object(s) detected; "
+                                     "select one from the list above to enable capture",
+                                icon="INFO",
+                            )
+
+                # SAND: "Convert To Solid Particle Mesh" at the group level,
+                # directly above Delete Group, so it is discoverable without
+                # expanding Material Params. Drawn ALWAYS for SAND groups; the
+                # column is greyed out unless the active object is a convertible
+                # solid mesh, with an INFO label explaining the disabled state.
+                if group.object_type == "SAND":
+                    from .sand_ops import _is_convertible_solid_mesh
+                    _sand_obj = context.active_object
+                    _convertible = _is_convertible_solid_mesh(_sand_obj)
+                    conv_box = box.box()
+                    col = conv_box.column()
+                    col.enabled = _convertible
+                    col.operator(
+                        "ppf.convert_to_particle_mesh",
+                        icon="STICKY_UVS_DISABLE",
+                    )
+                    if not _convertible:
+                        if _sand_obj is None or _sand_obj.type != "MESH" or not _sand_obj.select_get():
+                            conv_box.label(text="Select a solid mesh to convert", icon="INFO")
+                        elif _sand_obj.get("particle_mesh"):
+                            conv_box.label(
+                                text="Active object is already a particle mesh", icon="INFO"
+                            )
+                        else:
+                            conv_box.label(text="Active mesh has no faces to convert", icon="INFO")
+
+                # Third row: Delete Group button
+                row = box.row()
+                delete_op = row.operator("object.delete_group", icon="TRASH")
+                delete_op.group_index = actual_index
+
+                pin_box = box.box()
+                row = pin_box.row()
+                row.prop(
+                    group,
+                    "show_pin",
+                    icon="TRIA_DOWN" if group.show_pin else "TRIA_RIGHT",
+                    emboss=False,
+                    icon_only=True,
+                )
+                if group.object_type == "STATIC":
+                    row.label(text="Transform", icon="DRIVER")
+                elif group.object_type == "PDRD":
+                    row.label(text="Pins & Motion", icon="PINNED")
+                else:
+                    row.label(text="Pins", icon="PINNED")
+                if group.show_pin and group.object_type == "STATIC":
+                    _draw_static_ops(pin_box, group, actual_index)
+                if group.show_pin and group.object_type == "PDRD":
+                    _draw_pdrd_pins(pin_box, group, actual_index, context)
+                if group.show_pin and group.object_type not in ("STATIC", "PDRD"):
+                    col = pin_box.column()
+                    row = col.row()
+                    row.prop(group, "pin_vertex_group_items", text="")
+                    add_pin_op = row.operator(
+                        "object.add_pin_vertex_group",
+                        icon="ADD",
+                        text="Add",
+                    )
+                    add_pin_op.group_index = actual_index
+                    row = col.row()
+                    remove_enabled = (
+                        0
+                        <= group.pin_vertex_groups_index
+                        < len(group.pin_vertex_groups)
+                    )
+                    sub = row.row()
+                    sub.enabled = remove_enabled
+                    remove_pin_op = sub.operator(
+                        "object.remove_pin_vertex_group",
+                        icon="REMOVE",
+                    )
+                    remove_pin_op.group_index = actual_index
+                    sub = row.row()
+                    sub.enabled = remove_enabled
+                    rename_pin_op = sub.operator(
+                        "object.rename_pin_vertex_group",
+                        icon="SORTALPHA",
+                        text="Rename",
+                    )
+                    rename_pin_op.group_index = actual_index
+                    create_pin_op = row.operator(
+                        "object.create_pin_vertex_group",
+                        icon="ADD",
+                        text="Create",
+                    )
+                    create_pin_op.group_index = actual_index
+                    col.template_list(
+                        "OBJECT_UL_PinVertexGroupsList",
+                        "",
+                        group,
+                        "pin_vertex_groups",
+                        group,
+                        "pin_vertex_groups_index",
+                    )
+                    # Size + reorder buttons share one row. Pin order matters:
+                    # lower in the list wins for vertices shared by overlapping
+                    # pins.
+                    row = col.row(align=True)
+                    row.prop(group, "pin_overlay_size", text="Size")
+                    up = row.operator(
+                        "object.move_pin_vertex_group", icon="TRIA_UP", text="")
+                    up.group_index = actual_index
+                    up.direction = -1
+                    down = row.operator(
+                        "object.move_pin_vertex_group", icon="TRIA_DOWN", text="")
+                    down.group_index = actual_index
+                    down.direction = 1
+                    # Resolve selected pin's object UUID for edit-mode gating.
+                    from ...core.uuid_registry import get_object_uuid
+                    _pin_idx = group.pin_vertex_groups_index
+                    _pin_obj_uuid = ""
+                    if 0 <= _pin_idx < len(group.pin_vertex_groups):
+                        _pin_obj_uuid = group.pin_vertex_groups[_pin_idx].object_uuid or ""
+                    _editing_pin_obj = False
+                    if (
+                        context.mode in ("EDIT_MESH", "EDIT_CURVE", "EDIT_CURVES")
+                        and context.edit_object
+                    ):
+                        _editing_pin_obj = (
+                            _pin_obj_uuid != ""
+                            and get_object_uuid(context.edit_object) == _pin_obj_uuid
+                        )
+                    if _editing_pin_obj:
+                        row = col.row(align=True)
+                        sel_op = row.operator("object.select_pin_vertices", icon="RESTRICT_SELECT_OFF")
+                        sel_op.group_index = actual_index
+                        desel_op = row.operator("object.deselect_pin_vertices", icon="RESTRICT_SELECT_ON")
+                        desel_op.group_index = actual_index
+                        row = col.row(align=True)
+                        # Hair Curves points take no keyframes, so a hair
+                        # pin moves through Capture Deformation alone.
+                        row.enabled = context.edit_object.type != "CURVES"
+                        mk_op = row.operator("object.make_pin_keyframe", icon="KEYFRAME")
+                        mk_op.group_index = actual_index
+                        dk_op = row.operator("object.delete_pin_keyframes", icon="KEYFRAME_HLT")
+                        dk_op.group_index = actual_index
+                    pin_idx = group.pin_vertex_groups_index
+                    if 0 <= pin_idx < len(group.pin_vertex_groups):
+                        pin_item = group.pin_vertex_groups[pin_idx]
+
+                        # Capture Deformation row for the selected pin.
+                        # Always drawn (just like the use_pin_duration /
+                        # use_pull rows below) so users discover the
+                        # feature exists; per-button ``enabled`` flags
+                        # gate actual use on the preconditions. Status
+                        # label below reports the live reason for the
+                        # current enabled state.
+                        from .pin_capture_ops import (
+                            is_pin_capture_running as _is_pin_capture_running,
+                            pin_captured_frame_count as _pin_cap_count,
+                            pin_has_captured_anim as _pin_has_cap,
+                            pin_object_supports_capture as _pin_supports_cap,
+                        )
+                        from ...core.uuid_registry import (
+                            resolve_pin as _resolve_pin,
+                        )
+                        try:
+                            _pin_obj = _resolve_pin(pin_item)
+                        except ValueError:
+                            _pin_obj = None
+                        # The predicate names the object types a capture
+                        # reads: a mesh, or Hair Curves.
+                        _pin_can_capture = _pin_supports_cap(_pin_obj)
+                        _pin_is_hair = (
+                            _pin_obj is not None and _pin_obj.type == "CURVES"
+                        )
+                        _pin_has_cache = _pin_has_cap(pin_item)
+                        _pin_capture_active = _is_pin_capture_running()
+                        row = col.row(align=True)
+                        sub = row.column()
+                        sub.enabled = (
+                            _pin_can_capture
+                            and not _pin_capture_active
+                        )
+                        cap_op = sub.operator(
+                            "object.capture_pin_deformation",
+                            icon="REC",
+                        )
+                        cap_op.group_index = actual_index
+                        cap_op.pin_index = pin_idx
+                        sub = row.column()
+                        sub.enabled = (
+                            _pin_has_cache and not _pin_capture_active
+                        )
+                        clr_op = sub.operator(
+                            "object.clear_pin_deformation",
+                            icon="X",
+                        )
+                        clr_op.group_index = actual_index
+                        clr_op.pin_index = pin_idx
+                        if _pin_has_cache:
+                            n = _pin_cap_count(pin_item)
+                            col.label(
+                                text=iface_("Pin cache: {count} frame(s)").format(count=n),
+                                icon="FILE_CACHE",
+                            )
+                        elif _pin_can_capture and _pin_is_hair:
+                            col.label(
+                                text="This hair moves; capture so its pin follows",
+                                icon="INFO",
+                            )
+                        elif _pin_can_capture:
+                            col.label(
+                                text="Deforming modifier detected; capture to encode",
+                                icon="INFO",
+                            )
+                        elif _pin_is_hair:
+                            col.label(
+                                text="Nothing moves this pin's hair object",
+                                icon="INFO",
+                            )
+                        else:
+                            col.label(
+                                text="No deforming modifier on this pin's object",
+                                icon="INFO",
+                            )
+
+                        # Opt-in: track the captured deformation as a
+                        # time-varying rest pose. Drawn for SOLID; editable only
+                        # for a FULL pin (every vertex in the group) with a
+                        # capture. A full pin captures the whole mesh, so the
+                        # rest pose is the captured deformation directly; a
+                        # partial pin cannot (it would tear the unpinned
+                        # boundary). Whether the pin is full is an O(N) vertex
+                        # scan, so it is not recomputed every redraw: the Refresh
+                        # button (re)checks coverage and caches the result on the
+                        # pin (full_pin_checked / full_pin_cached). When off, the
+                        # capture only pulls/fixes the pins and the rest pose
+                        # stays the undeformed shape.
+                        if group.object_type == "SOLID":
+                            _full_checked = getattr(
+                                pin_item, "full_pin_checked", False
+                            )
+                            _is_full_pin = _full_checked and getattr(
+                                pin_item, "full_pin_cached", False
+                            )
+                            _has_cap = getattr(
+                                pin_item, "has_captured_anim", False
+                            )
+                            row = col.row(align=True)
+                            sub = row.column()
+                            # Greyed unless a refreshed full pin with a capture.
+                            # The prop still shows its real stored value (don't
+                            # force it off: the value may be honored once the
+                            # user refreshes coverage).
+                            sub.enabled = _is_full_pin and _has_cap
+                            sub.prop(
+                                pin_item, "track_rest_pose_deformation"
+                            )
+                            refresh_op = row.operator(
+                                "object.refresh_full_pin_state",
+                                text="",
+                                icon="FILE_REFRESH",
+                            )
+                            refresh_op.group_index = actual_index
+                            refresh_op.pin_index = pin_idx
+                            if not _full_checked:
+                                col.label(
+                                    text="Click Refresh to check pin "
+                                    "coverage",
+                                    icon="INFO",
+                                )
+                            elif not _is_full_pin:
+                                col.label(
+                                    text="Pin every vertex to enable "
+                                    "rest-pose tracking",
+                                    icon="INFO",
+                                )
+
+                        # A tracked rest shape and plasticity both rewrite the
+                        # rest shape, so the transfer refuses the pair; say so
+                        # here, from the predicate the encoder asks.
+                        if (
+                            pin_tracks_rest_shape(group, pin_item)
+                            and getattr(group, "enable_plasticity", False)
+                        ):
+                            col.label(
+                                text="Plasticity and rest-pose tracking cannot "
+                                "both be on; Transfer will refuse",
+                                icon="ERROR",
+                            )
+
+                        row = col.row(align=True)
+                        row.prop(pin_item, "use_pin_duration")
+                        sub = row.row()
+                        sub.enabled = pin_item.use_pin_duration
+                        sub.prop(pin_item, "pin_duration")
+                        row = col.row(align=True)
+                        row.prop(pin_item, "use_pull")
+                        sub = row.row()
+                        sub.enabled = pin_item.use_pull
+                        sub.prop(pin_item, "pull_strength")
+                        # A hair pin stored as a float attribute carries a
+                        # weight per point, which scales the pull. Nothing
+                        # else on the row shows that the pin is weighted, and
+                        # the weights do nothing until the pin pulls.
+                        if _pin_is_hair and _hair_pin_weighted(
+                            _pin_obj, decode_vertex_group_identifier(pin_item.name)[1]
+                        ):
+                            col.label(
+                                text="Each point is pulled with Strength x its weight"
+                                if pin_item.use_pull
+                                else "Weighted pin: turn on Pull for the weights to count",
+                                icon="INFO",
+                            )
+                        # The later pin wins a point two pins share, and hair
+                        # gets its Roots pin first. A pull pin added after it
+                        # that reaches the roots would hold them softly, so
+                        # say which way the order cuts while it stands so.
+                        if (
+                            _pin_is_hair and pin_item.use_pull
+                            and _exact_pin_above(group, pin_idx, pin_item)
+                        ):
+                            col.label(
+                                text="Pins above lose shared points to this one: move Roots below",
+                                icon="INFO",
+                            )
+
+                        # Fix weight threshold (SOLID hard pins only). Tet
+                        # verts whose diffused pin weight reaches this become
+                        # hard kinematic fixes; lower-weight verts stay soft.
+                        # SOLID-only (the weight field is a tet diffusion) and
+                        # irrelevant to pull pins, so disabled when Pull is on.
+                        if group.object_type == "SOLID":
+                            row = col.row(align=True)
+                            row.enabled = not pin_item.use_pull
+                            row.prop(pin_item, "fix_weight_threshold")
+
+                        # Per-pin intersection allowance. Drawn for every group
+                        # type and always editable: it applies to both pin modes
+                        # (a fixed pin's placement is prescribed, a pull pin
+                        # holds only as hard as its own force), and whether it
+                        # changes anything depends on which faces the pin covers
+                        # entirely, which is a per-face question the panel cannot
+                        # answer without an O(N) scan on every redraw. The label
+                        # below states that scope when the option is on, so the
+                        # user is not left expecting it to cover a partly pinned
+                        # face.
+                        row = col.row(align=True)
+                        row.prop(pin_item, "allow_intersection")
+                        if pin_item.allow_intersection:
+                            col.label(
+                                text="Fully pinned faces pass through; "
+                                     "partly pinned ones still collide",
+                                icon="INFO",
+                            )
+
+                        # Operations list
+                        col.separator()
+                        ops_row = col.row()
+                        ops_row.label(text="Operations:")
+                        op = ops_row.operator("object.copy_pin_ops", text="", icon="COPYDOWN")
+                        op.group_index = actual_index
+                        op = ops_row.operator("object.paste_pin_ops", text="", icon="PASTEDOWN")
+                        op.group_index = actual_index
+                        # Pin operations profile
+                        pin_prof_row = col.row(align=True)
+                        if _profile_path_exists(group.pin_profile_path):
+                            pin_prof_row.prop(
+                                group, "pin_profile_selection", text="Profile"
+                            )
+                            op = pin_prof_row.operator(
+                                "object.open_pin_profile", text="", icon="FILEBROWSER"
+                            )
+                            op.group_index = actual_index
+                            op = pin_prof_row.operator(
+                                "object.clear_pin_profile", text="", icon="X"
+                            )
+                            op.group_index = actual_index
+                            op = pin_prof_row.operator(
+                                "object.reload_pin_profile", text="", icon="FILE_REFRESH"
+                            )
+                            op.group_index = actual_index
+                            op = pin_prof_row.operator(
+                                "object.save_pin_profile", text="", icon="FILE_TICK"
+                            )
+                            op.group_index = actual_index
+                        else:
+                            op = pin_prof_row.operator(
+                                "object.open_pin_profile",
+                                text="Open Profile",
+                                icon="FILEBROWSER",
+                            )
+                            op.group_index = actual_index
+                            op = pin_prof_row.operator(
+                                "object.save_pin_profile", text="", icon="FILE_TICK"
+                            )
+                            op.group_index = actual_index
+                        col.template_list(
+                            "OBJECT_UL_PinOperationsList", "",
+                            pin_item, "operations",
+                            pin_item, "operations_index",
+                            rows=2,
+                        )
+                        row = col.row(align=True)
+                        add_op = row.operator_menu_enum(
+                            "object.add_pin_operation", "op_type",
+                            text="Add", icon="ADD",
+                        )
+                        add_op.group_index = actual_index
+                        rm_op = row.operator("object.remove_pin_operation", text="Remove", icon="REMOVE")
+                        rm_op.group_index = actual_index
+                        up_op = row.operator("object.move_pin_operation", text="", icon="TRIA_UP")
+                        up_op.group_index = actual_index
+                        up_op.direction = -1
+                        dn_op = row.operator("object.move_pin_operation", text="", icon="TRIA_DOWN")
+                        dn_op.group_index = actual_index
+                        dn_op.direction = 1
+
+                        # Show selected operation properties
+                        op_idx = pin_item.operations_index
+                        if 0 <= op_idx < len(pin_item.operations):
+                            op = pin_item.operations[op_idx]
+                            op_box = col.box()
+                            if op.op_type == "MOVE_BY":
+                                op_box.prop(op, "delta")
+                                row = op_box.row(align=True)
+                                row.prop(op, "frame_start")
+                                row.prop(op, "frame_end")
+                                op_box.prop(op, "transition")
+                            elif op.op_type == "SPIN":
+                                op_box.prop(op, "spin_center_mode")
+                                if op.spin_center_mode == "ABSOLUTE":
+                                    op_box.prop(op, "spin_center")
+                                    pick = op_box.operator(
+                                        "object.pick_center_from_selected",
+                                        icon="EYEDROPPER",
+                                    )
+                                    pick.group_index = actual_index
+                                    pick.target = "spin"
+                                elif op.spin_center_mode == "MAX_TOWARDS":
+                                    op_box.prop(op, "spin_center_direction")
+                                    op_box.prop(op, "show_max_towards_spin")
+                                elif op.spin_center_mode == "VERTEX":
+                                    row = op_box.row(align=True)
+                                    row.prop(op, "spin_center_vertex")
+                                    pick = row.operator(
+                                        "object.pick_vertex_center",
+                                        icon="EYEDROPPER",
+                                        text="",
+                                    )
+                                    pick.group_index = actual_index
+                                    pick.target = "spin"
+                                    op_box.prop(op, "show_vertex_spin")
+                                op_box.label(text="Rotation:")
+                                op_box.prop(op, "spin_axis")
+                                op_box.prop(op, "spin_angular_velocity")
+                                op_box.prop(op, "spin_flip")
+                                row = op_box.row(align=True)
+                                row.prop(op, "frame_start")
+                                row.prop(op, "frame_end")
+                                op_box.prop(op, "transition")
+                            elif op.op_type == "SCALE":
+                                op_box.prop(op, "scale_center_mode")
+                                if op.scale_center_mode == "ABSOLUTE":
+                                    op_box.prop(op, "scale_center")
+                                    pick = op_box.operator(
+                                        "object.pick_center_from_selected",
+                                        icon="EYEDROPPER",
+                                    )
+                                    pick.group_index = actual_index
+                                    pick.target = "scale"
+                                elif op.scale_center_mode == "MAX_TOWARDS":
+                                    op_box.prop(op, "scale_center_direction")
+                                    op_box.prop(op, "show_max_towards_scale")
+                                elif op.scale_center_mode == "VERTEX":
+                                    row = op_box.row(align=True)
+                                    row.prop(op, "scale_center_vertex")
+                                    pick = row.operator(
+                                        "object.pick_vertex_center",
+                                        icon="EYEDROPPER",
+                                        text="",
+                                    )
+                                    pick.group_index = actual_index
+                                    pick.target = "scale"
+                                    op_box.prop(op, "show_vertex_scale")
+                                op_box.label(text="Scaling:")
+                                op_box.prop(op, "scale_factor")
+                                row = op_box.row(align=True)
+                                row.prop(op, "frame_start")
+                                row.prop(op, "frame_end")
+                                op_box.prop(op, "transition")
+                            elif op.op_type == "TORQUE":
+                                op_box.prop(op, "torque_axis_component")
+                                op_box.prop(op, "torque_magnitude")
+                                op_box.prop(op, "torque_flip")
+                                row = op_box.row(align=True)
+                                row.prop(op, "frame_start")
+                                row.prop(op, "frame_end")
+
+                info_box = box.box()
+                row = info_box.row()
+                row.prop(
+                    group,
+                    "show_stats",
+                    icon="TRIA_DOWN" if group.show_stats else "TRIA_RIGHT",
+                    emboss=False,
+                    icon_only=True,
+                )
+                row.label(text="Stats", icon="INFO")
+                if group.show_stats:
+                    from ...core.uuid_registry import get_object_by_uuid
+                    col = info_box.column()
+                    for obj in group.assigned_objects:
+                        if not obj.included:
+                            continue
+                        obj_data = get_object_by_uuid(obj.uuid) if obj.uuid else None
+                        if obj_data and obj_data.type == "MESH":
+                            row = col.row()
+                            row.label(text=obj_data.name)
+                            row.label(text=iface_("#Vert: {count}").format(count=len(obj_data.data.vertices)))
+                            row.label(text=iface_("#Face: {count}").format(count=len(obj_data.data.polygons)))
+
+                param_box = box.box()
+                row = param_box.row()
+                row.prop(
+                    group,
+                    "show_parameters",
+                    icon="TRIA_DOWN" if group.show_parameters else "TRIA_RIGHT",
+                    emboss=False,
+                    icon_only=True,
+                )
+                row.label(text="Material Params", icon="MATERIAL")
+                op = row.operator("object.copy_material_params", text="", icon="COPYDOWN")
+                op.group_index = actual_index
+                op = row.operator("object.paste_material_params", text="", icon="PASTEDOWN")
+                op.group_index = actual_index
+                # Bundled material presets, filtered by this group's Type.
+                # Shown only for types that have presets (SHELL/SOLID); other
+                # types (PDRD/Rod/Static) omit the row.
+                from ...core import material_presets
+                if material_presets.has_presets_for(group.object_type):
+                    preset_row = param_box.row(align=True)
+                    preset_row.prop(
+                        group, "material_preset_selection",
+                        text="Preset", icon="PRESET",
+                    )
+                # Material param profile
+                mat_profile_row = param_box.row(align=True)
+                if _profile_path_exists(group.material_profile_path):
+                    mat_profile_row.prop(
+                        group, "material_profile_selection", text="Profile"
+                    )
+                    op = mat_profile_row.operator(
+                        "object.open_material_profile", text="", icon="FILEBROWSER"
+                    )
+                    op.group_index = actual_index
+                    op = mat_profile_row.operator(
+                        "object.clear_material_profile", text="", icon="X"
+                    )
+                    op.group_index = actual_index
+                    op = mat_profile_row.operator(
+                        "object.reload_material_profile", text="", icon="FILE_REFRESH"
+                    )
+                    op.group_index = actual_index
+                    op = mat_profile_row.operator(
+                        "object.save_material_profile", text="", icon="FILE_TICK"
+                    )
+                    op.group_index = actual_index
+                else:
+                    op = mat_profile_row.operator(
+                        "object.open_material_profile",
+                        text="Open Profile",
+                        icon="FILEBROWSER",
+                    )
+                    op.group_index = actual_index
+                    op = mat_profile_row.operator(
+                        "object.save_material_profile", text="", icon="FILE_TICK"
+                    )
+                    op.group_index = actual_index
+                if group.show_parameters:
+                    if group.object_type == "SOLID":
+                        param_box.prop(group, "solid_model")
+                        _material_prop(param_box, group, "solid_density")
+                        ym_box = param_box.box()
+                        _material_prop(
+                            ym_box, group, "solid_young_modulus",
+                            text="Young's Modulus (Pa)"
+                            if not group.young_mod_density_normalized
+                            else "Young's Modulus (Pa/ρ)",
+                        )
+                        ym_box.prop(group, "young_mod_density_normalized")
+                        _material_prop(param_box, group, "solid_poisson_ratio")
+                        _material_prop(param_box, group, "shrink")
+                        _material_prop(param_box, group, "friction")
+
+                        _draw_contact_distances(param_box, group)
+                        _draw_collision_windows(param_box, group, actual_index)
+                        _draw_material_maps(param_box, group, actual_index)
+                        plast_box = param_box.box()
+                        plast_box.prop(group, "enable_plasticity")
+                        if group.enable_plasticity:
+                            _material_prop(plast_box, group, "plasticity")
+                            _material_prop(plast_box, group, "plasticity_threshold")
+                        _draw_velocity_keyframes(param_box, group, actual_index, show_angular=True)
+                        _draw_lock_translation(param_box, group, actual_index)
+                        _draw_tetrahedralizer(param_box, group, actual_index)
+                        _draw_damping(param_box, group, include_bending=False)
+                        _draw_stitch_stiffness(param_box, group)
+                    elif group.object_type == "SHELL":
+                        param_box.prop(group, "shell_model")
+                        # A .blend or profile can still load a model the
+                        # picker withdrew, which draws as a blank row; say
+                        # what the transfer will do, from the predicate the
+                        # encoder asks.
+                        if withdrawn_shell_model_refusal(group) is not None:
+                            param_box.label(
+                                text="Stable NeoHookean is not offered for "
+                                "shells; Transfer will refuse",
+                                icon="ERROR",
+                            )
+                        _material_prop(param_box, group, "shell_density")
+                        ym_box = param_box.box()
+                        _material_prop(
+                            ym_box, group, "shell_young_modulus",
+                            text="Young's Modulus (Pa)"
+                            if not group.young_mod_density_normalized
+                            else "Young's Modulus (Pa/ρ)",
+                        )
+                        ym_box.prop(group, "young_mod_density_normalized")
+                        _material_prop(param_box, group, "shell_poisson_ratio")
+                        _material_prop(param_box, group, "friction")
+
+                        _draw_contact_distances(param_box, group)
+                        _draw_collision_windows(param_box, group, actual_index)
+                        _material_prop(param_box, group, "bend")
+                        aniso_col = param_box.column(align=True)
+                        _material_prop(aniso_col, group, "bend_warp")
+                        _material_prop(aniso_col, group, "bend_weft")
+                        if wants_anisotropic_bending(group):
+                            missing_uv = group_missing_uv_object(group)
+                            if missing_uv is not None:
+                                param_box.label(
+                                    text=f"{missing_uv.name} has no UV map",
+                                    icon="ERROR",
+                                )
+                        row = param_box.row(align=True)
+                        _material_prop(row, group, "shrink_x")
+                        _material_prop(row, group, "shrink_y")
+                        sl_box = param_box.box()
+                        sl_box.prop(group, "enable_strain_limit")
+                        if group.enable_strain_limit:
+                            if group.shrink_x != 1.0 or group.shrink_y != 1.0:
+                                sl_box.label(
+                                    text="Shrink/extend disables strain limiting",
+                                    icon="ERROR",
+                                )
+                            _material_prop(sl_box, group, "strain_limit_percent")
+                        inf_box = param_box.box()
+                        inf_box.prop(group, "enable_inflate")
+                        if group.enable_inflate:
+                            _material_prop(inf_box, group, "inflate_pressure")
+                        _draw_material_maps(param_box, group, actual_index)
+                        plast_box = param_box.box()
+                        plast_box.prop(group, "enable_plasticity")
+                        if group.enable_plasticity:
+                            _material_prop(plast_box, group, "plasticity")
+                            _material_prop(plast_box, group, "plasticity_threshold")
+                        _draw_shell_bend_rest(param_box.box(), group, actual_index)
+                        _draw_velocity_keyframes(param_box, group, actual_index, show_angular=True)
+                        _draw_lock_translation(param_box, group, actual_index)
+                        _draw_damping(param_box, group, include_bending=True)
+                        _draw_stitch_stiffness(param_box, group)
+                    elif group.object_type == "ROD":
+                        # Rod model is always ARAP, no need to show selection
+                        _material_prop(param_box, group, "rod_density")
+                        ym_box = param_box.box()
+                        _material_prop(
+                            ym_box, group, "rod_young_modulus",
+                            text="Young's Modulus (Pa)"
+                            if not group.young_mod_density_normalized
+                            else "Young's Modulus (Pa/ρ)",
+                        )
+                        ym_box.prop(group, "young_mod_density_normalized")
+                        _material_prop(param_box, group, "friction")
+                        _material_prop(param_box, group, "length_factor")
+
+                        _draw_contact_distances(param_box, group)
+                        _draw_collision_windows(param_box, group, actual_index)
+                        _draw_material_maps(param_box, group, actual_index)
+                        bend_box = param_box.box()
+                        bend_box.label(text="Bend")
+                        _material_prop(bend_box, group, "bend")
+                        bend_box.prop(group, "bend_rest_angle_source")
+                        if group.bend_rest_angle_source == "FROM_REFERENCE":
+                            _draw_bend_reference(bend_box, group, actual_index)
+                        sl_box = param_box.box()
+                        sl_box.prop(group, "enable_strain_limit")
+                        if group.enable_strain_limit:
+                            _material_prop(sl_box, group, "strain_limit_percent")
+                        if bend_plasticity_applies(group):
+                            _draw_bend_plasticity(param_box.box(), group)
+                        _draw_velocity_keyframes(param_box, group, actual_index)
+                        _draw_lock_translation(param_box, group, actual_index)
+                        _draw_damping(param_box, group, include_bending=True)
+                    elif group.object_type == "PDRD":
+                        # PDRD bodies move exactly rigidly via a single
+                        # best-fit rigid transform shared by the whole
+                        # body. No internal elastic terms, no plasticity,
+                        # no bending.
+                        _material_prop(param_box, group, "pdrd_density")
+                        _material_prop(param_box, group, "friction")
+
+                        # Hinge is per object: expandable box with an object
+                        # pulldown (like Velocity Overwrite) to focus a body
+                        # and edit its axle. A PDRD group can hold several
+                        # bodies (a gear train), each pinned on its own axle.
+                        hinge_box = param_box.box()
+                        hdr = hinge_box.row()
+                        hdr.prop(
+                            group,
+                            "show_pdrd_hinge",
+                            icon="TRIA_DOWN" if group.show_pdrd_hinge else "TRIA_RIGHT",
+                            emboss=False,
+                            icon_only=True,
+                        )
+                        hdr.label(text="Hinge", icon="DRIVER_ROTATIONAL_DIFFERENCE")
+                        if group.show_pdrd_hinge:
+                            hinge_box.prop(group, "pdrd_hinge_visualize")
+                            hinge_box.prop(group, "pdrd_hinge_object_selection", text="")
+                            hinge_assigned = get_assigned_by_selection_uuid(
+                                group, "pdrd_hinge_object_selection"
+                            )
+                            if hinge_assigned is not None:
+                                hinge_box.prop(hinge_assigned, "pdrd_hinge_enable")
+                                sub = hinge_box.row()
+                                sub.enabled = hinge_assigned.pdrd_hinge_enable
+                                sub.prop(hinge_assigned, "pdrd_hinge_axis")
+
+                        _draw_contact_distances(param_box, group)
+                        _draw_collision_windows(param_box, group, actual_index)
+                        _draw_velocity_keyframes(
+                            param_box, group, actual_index, show_angular=True,
+                            label="Velocity (free launch)",
+                        )
+                        _draw_lock_translation(param_box, group, actual_index)
+                    elif group.object_type == "SAND":
+                        # SAND bodies are a faceless cloud of loose vertices
+                        # (grain centers). The grains share one radius and a
+                        # per-particle mass, plus an inter-grain friction.
+                        # The grain radius is chosen at Convert time and the
+                        # non-overlapping seed spacing is derived from it, so it
+                        # is shown read-only here: editing it after seeding could
+                        # push grains inside each other's contact skin.
+                        from ...models.groups import (
+                            sand_radius_conflict,
+                            sand_radius_source_object,
+                        )
+
+                        # Draw the locked grain radius as a read-only (disabled)
+                        # field, mirroring the editable Particle Mass field
+                        # below, rather than a plain label. Prefer the stamped
+                        # value on the first converted object so the field shows
+                        # the true locked radius; fall back to the group property
+                        # before any object is converted.
+                        radius_obj = sand_radius_source_object(group)
+                        radius_row = param_box.row()
+                        radius_row.enabled = False
+                        if radius_obj is not None:
+                            radius_row.prop(
+                                radius_obj,
+                                '["grain_radius"]',
+                                text="Grain Radius (m)",
+                            )
+                        else:
+                            radius_row.prop(group, "sand_grain_radius")
+                        param_box.label(
+                            text="Grain radius is locked at convert", icon="INFO"
+                        )
+                        # The group is solved at one radius, so the transfer
+                        # refuses grains converted at several; say so here,
+                        # from the predicate the encoder asks.
+                        if sand_radius_conflict(group) is not None:
+                            param_box.label(
+                                text="Grains were converted at different "
+                                "radii; Transfer will refuse",
+                                icon="ERROR",
+                            )
+                        _material_prop(param_box, group, "sand_particle_mass")
+                        _material_prop(param_box, group, "sand_friction")
+                        # The grain radius doubles as the contact offset (the
+                        # grain's physical skin); the contact gap is the extra
+                        # barrier activation distance on top.
+                        contact_box = param_box.box()
+                        _material_prop(contact_box, group, "contact_gap")
+                        contact_box.label(
+                            text="Grain radius is the contact offset", icon="INFO"
+                        )
+                        _draw_lock_translation(param_box, group, actual_index)
+                        # The "Convert To Solid Particle Mesh" button lives at the
+                        # group level (above Delete Group), not here, so it stays
+                        # visible without expanding this section.
+                    else:  # STATIC
+                        _material_prop(param_box, group, "friction")
+
+                        soft_box = param_box.box()
+                        soft_box.prop(group, "enable_soft_constraint")
+                        if group.enable_soft_constraint:
+                            soft_box.prop(group, "soft_constraint_stiffness")
+
+                        _draw_contact_distances(param_box, group)
+
+                    # Outside the type chain on purpose: both tolerances apply
+                    # to every group type.
+                    _draw_intersection_allowances(param_box, group, actual_index)
+
+                    # The scene's force fields reach every simulated type; a
+                    # STATIC collider follows its authored motion and ignores
+                    # them, so it has no weight to set.
+                    if group.object_type != "STATIC":
+                        ff_row = param_box.row()
+                        ff_row.prop(group, "force_field_weight", icon="FORCE_FORCE")
+
+                    # The map list is drawn by the SOLID, SHELL and ROD
+                    # branches above. A group whose type was changed
+                    # afterwards keeps its rows, and they still reach the
+                    # encoder, so they are drawn here too rather than
+                    # becoming unreachable state.
+                    if group.object_type not in ("SOLID", "SHELL", "ROD") and len(
+                        group.material_maps
+                    ):
+                        _draw_material_maps(param_box, group, actual_index)
+
+
+class SNAPMERGE_PT_SnapAndMerge(Panel):
+    bl_label = "Snap and Merge"
+    bl_idname = "SNAPMERGE_PT_SnapAndMerge"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = get_category_name()
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return has_addon_data(context.scene)
+
+    def draw(self, context):
+        layout = self.layout
+
+        # Snap to Vertices box
+        snap_box = layout.box()
+        snap_box.label(text="Snap To Nearby Vertices")
+
+        # Object A dropdown
+        col = snap_box.column(align=True)
+        col.label(text="Object A (moves):")
+        row = col.row(align=True)
+        row.prop(get_addon_data(context.scene).state, "snap_object_a", text="")
+        op = row.operator("object.pick_snap_object", text="", icon="EYEDROPPER")
+        op.target = "A"
+
+        # Object B dropdown
+        col.label(text="Object B (target):")
+        row = col.row(align=True)
+        row.prop(get_addon_data(context.scene).state, "snap_object_b", text="")
+        op = row.operator("object.pick_snap_object", text="", icon="EYEDROPPER")
+        op.target = "B"
+
+        # Snap button
+        row = snap_box.row()
+        row.operator("object.snap_to_vertices", icon="SNAP_ON")
+
+        # Merge pairs and explicit snap-authored stitch anchors
+        state = get_addon_data(context.scene).state
+        if len(state.merge_pairs) > 0:
+            merge_box = layout.box()
+            merge_box.label(text="Merge Pairs")
+
+            merge_box.template_list(
+                "OBJECT_UL_MergePairsList",
+                "",
+                state,
+                "merge_pairs",
+                state,
+                "merge_pairs_index",
+            )
+
+            row = merge_box.row()
+            row.enabled = 0 <= state.merge_pairs_index < len(state.merge_pairs)
+            row.operator("object.resnap_merge_pair", icon="FILE_REFRESH")
+            row = merge_box.row()
+            row.enabled = 0 <= state.merge_pairs_index < len(state.merge_pairs)
+            row.operator("object.remove_merge_pair", icon="REMOVE")
+
+            # Every supported pair is a soft, mass-scaled stitch now, so the
+            # stitch stiffness applies to all of them (shell-shell, rod-rod,
+            # rod-shell, and the solid-involved pairs alike), not just when a
+            # solid is involved.
+            idx = state.merge_pairs_index
+            if 0 <= idx < len(state.merge_pairs):
+                pair = state.merge_pairs[idx]
+                type_a = type_b = ""
+                for group in iterate_active_object_groups(context.scene):
+                    for assigned in group.assigned_objects:
+                        if pair.object_a_uuid and assigned.uuid == pair.object_a_uuid:
+                            type_a = group.object_type
+                        elif pair.object_b_uuid and assigned.uuid == pair.object_b_uuid:
+                            type_b = group.object_type
+                if pair_supports_cross_stitch(type_a, type_b):
+                    merge_box.prop(pair, "stitch_stiffness")
+                # Why this pair's stitch cannot reach the solver, from the
+                # function the Transfer check and the encoder refuse with.
+                from ...mesh_ops.merge_ops import merge_pair_problem
+                problem = merge_pair_problem(context.scene, pair)
+                if problem is not None:
+                    merge_box.label(text=problem, icon="ERROR")
+
+        # Global (not per-pair): post-snap exact join applied on fetch.
+        # Drawn outside the Merge Pairs box because it governs every stitch.
+        layout.prop(state, "post_snap_exactly")
+
+
+class UTILITY_PT_UtilityTools(Panel):
+    bl_label = "Mesh Repair"
+    bl_idname = "UTILITY_PT_UtilityTools"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = get_category_name()
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return has_addon_data(context.scene)
+
+    def draw(self, context):
+        from ...mesh_ops.cleaning_ops import draw_mesh_cleaning
+        from ...mesh_ops.intersection_ops import draw_intersection_correction
+        from ...mesh_ops.shell_intersection_ops import (
+            draw_shell_intersection_correction,
+        )
+
+        layout = self.layout
+
+        draw_mesh_cleaning(layout, context)
+
+        tri_box = layout.box()
+        tri_box.label(text="Symmetric Triangulate")
+        tri_box.label(
+            text="Poke each quad into a 4-triangle fan (mirror-symmetric)."
+        )
+        n_mesh = sum(1 for o in context.selected_objects if o.type == "MESH")
+        col = tri_box.column()
+        col.enabled = context.mode == "OBJECT" and n_mesh > 0
+        col.operator(
+            "object.symmetric_triangulate",
+            text="Symmetric Triangulate Selected",
+            icon="MOD_TRIANGULATE",
+        )
+        if context.mode != "OBJECT":
+            tri_box.label(text="Switch to Object Mode", icon="INFO")
+        elif n_mesh == 0:
+            tri_box.label(text="Select one or more mesh objects", icon="INFO")
+        else:
+            tri_box.label(text=iface_("{count} mesh object(s) selected").format(count=n_mesh), icon="CHECKMARK")
+
+        draw_intersection_correction(layout, context)
+        draw_shell_intersection_correction(layout, context)
+
+
+class VISUALIZATION_PT_Visualization(Panel):
+    bl_label = "Visualization"
+    bl_idname = "VISUALIZATION_PT_Visualization"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = get_category_name()
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 100
+
+    @classmethod
+    def poll(cls, context):
+        return has_addon_data(context.scene)
+
+    def draw(self, context):
+        layout = self.layout
+        state = get_addon_data(context.scene).state
+        layout.prop(state, "hide_pins")
+        layout.prop(state, "hide_arrows")
+        layout.prop(state, "hide_overlay_colors")
+        layout.prop(state, "hide_snaps")
+        layout.prop(state, "hide_pin_operations")
+
+
+classes = (
+    MAIN_PT_SceneConfiguration,
+    DYNAMICS_PT_Groups,
+    SNAPMERGE_PT_SnapAndMerge,
+    UTILITY_PT_UtilityTools,
+    VISUALIZATION_PT_Visualization,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

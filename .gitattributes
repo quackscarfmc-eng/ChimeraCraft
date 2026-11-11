@@ -1,0 +1,5 @@
+scripts/modules/_bpy_internal/assets/remote_library/*_openapi.py linguist-generated=true
+# Standalone repository: all binary assets are stored as regular Git blobs.
+# (The upstream 5.3.0 tree tracked them via Git-LFS, but this repository keeps
+# them as plain blobs. The one exception below is excluded entirely — see README.)
+extern/moonray/moonray/moonray/lib/rendering/pbr/sampler/pmj02_best_candidate_4096.bin -text

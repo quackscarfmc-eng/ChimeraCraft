@@ -1,0 +1,1134 @@
+# File: object_group.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import uuid
+
+import bpy  # pyright: ignore
+from bpy.props import (  # pyright: ignore
+    BoolProperty,
+    CollectionProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    StringProperty,
+)
+from bpy.types import PropertyGroup  # pyright: ignore
+from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_  # pyright: ignore
+
+from ..models.enum_props import EnumProperty, dynamic_enum_items
+from ..models.groups import OBJECT_GROUP_DEFAULTS, get_object_type, get_vertex_group_items
+from ..models.material_locks import LOCKABLE_MATERIAL_PROPS, lock_name
+from .state_types import (
+    NOT_ANIMATABLE,
+    AssignedObject,
+    IntersectionAllowanceObject,
+    MaterialMapItem,
+    PinVertexGroupItem,
+)
+
+
+def _build_assigned_object_enum_items(group) -> list:
+    """Build EnumProperty items for the included assigned objects of a group.
+
+    Returns a list of ``(uuid, label, "")`` tuples (label is the live object
+    name when resolvable, else the stored name or a uuid prefix), with a single
+    ``NONE`` fallback when no objects are assigned. The object-selection
+    callbacks share this body; each is wrapped with @dynamic_enum_items so the
+    returned strings outlive the callback return.
+    """
+    from ..core.uuid_registry import get_object_by_uuid
+
+    items = []
+    for assigned in group.assigned_objects:
+        if assigned.included and assigned.uuid:
+            obj = get_object_by_uuid(assigned.uuid)
+            label = obj.name if obj else (assigned.name or assigned.uuid[:8])
+            items.append((assigned.uuid, label, ""))
+    if not items:
+        items.append(("NONE", iface_("None"), tip_("No objects assigned")))
+    return items
+
+
+def _invalidate_overlay_from_group(self=None, ctx=None):
+    """Bump overlay version so velocity/group-scoped batches rebuild.
+
+    Signature matches Blender PropertyGroup `update=` callbacks, so the
+    function can be passed directly without a wrapper lambda.
+    """
+    from ..models.groups import invalidate_overlays
+    invalidate_overlays()
+
+
+@dynamic_enum_items
+def _get_material_profile_items(self, context):
+    """Dynamic callback for material_profile_selection EnumProperty."""
+    from ..core.profile import get_profile_names
+
+    path = self.material_profile_path
+    if not path:
+        return [("NONE", iface_("(No Profile)"), "")]
+    names = get_profile_names(bpy.path.abspath(path))
+    if not names:
+        return [("NONE", iface_("(No Profile)"), "")]
+    return [(n, n, tip_("Material profile: {name}").format(name=n)) for n in names]
+
+
+def _on_material_profile_selected(self, context):
+    """Update callback when user picks a material param profile."""
+    from ..core.profile import apply_material_profile, load_profiles
+    from ..core.utils import redraw_all_areas
+
+    if self.material_profile_selection == "NONE":
+        return
+
+    abs_path = bpy.path.abspath(self.material_profile_path)
+    profiles = load_profiles(abs_path)
+    profile = profiles.get(self.material_profile_selection)
+    if profile is None:
+        return
+    apply_material_profile(profile, self)
+    from ..models.groups import invalidate_overlays
+    invalidate_overlays()
+    redraw_all_areas(context)
+
+
+@dynamic_enum_items
+def _get_material_preset_items(self, context):
+    """Dynamic callback for the material_preset_selection EnumProperty.
+
+    Lists only presets whose ``object_type`` matches the group's current Type,
+    so a SHELL group sees only fabric presets and a SOLID group only soft-solid
+    presets; a PDRD group has no presets, so its list is just the NONE entry
+    (decision D2).
+    """
+    from ..core.material_presets import get_preset_items
+
+    return get_preset_items(self.object_type)
+
+
+def _on_material_preset_selected(self, context):
+    """Update callback when the user picks a bundled material preset.
+
+    Applies the preset's parameters, then resets the picker back to ``NONE`` so
+    the same preset can be re-applied and the dropdown does not show a sticky
+    selection. Setting the value here re-enters this callback, but the ``NONE``
+    guard returns immediately, so there is no recursion.
+    """
+    from ..core.material_presets import apply_material_preset
+    from ..core.utils import redraw_all_areas
+    from ..models.groups import invalidate_overlays
+
+    if self.material_preset_selection == "NONE":
+        return
+    apply_material_preset(self.material_preset_selection, self)
+    self.material_preset_selection = "NONE"
+    invalidate_overlays()
+    redraw_all_areas(context)
+
+
+@dynamic_enum_items
+def _get_pin_profile_items(self, context):
+    """Dynamic callback for pin_profile_selection EnumProperty."""
+    from ..core.profile import get_profile_names
+
+    path = self.pin_profile_path
+    if not path:
+        return [("NONE", iface_("(No Profile)"), "")]
+    names = get_profile_names(bpy.path.abspath(path))
+    if not names:
+        return [("NONE", iface_("(No Profile)"), "")]
+    return [(n, n, tip_("Pin profile: {name}").format(name=n)) for n in names]
+
+
+def _on_pin_profile_selected(self, context):
+    """Update callback when user picks a pin profile.
+
+    Pin profile files store per-pin operation sets (saved by
+    ``SavePinProfile``), NOT the bulk ``{pins: ...}`` format.
+    Apply to the currently selected pin item via
+    ``apply_pin_operations``, matching ``ReloadPinProfile``.
+    """
+    from ..core.profile import apply_pin_operations, load_profiles
+    from ..core.utils import redraw_all_areas
+    from ..models.groups import invalidate_overlays
+
+    if self.pin_profile_selection == "NONE":
+        return
+
+    abs_path = bpy.path.abspath(self.pin_profile_path)
+    profiles = load_profiles(abs_path)
+    profile = profiles.get(self.pin_profile_selection)
+    if profile is None:
+        return
+    # Apply to the currently selected pin item (not bulk apply).
+    idx = self.pin_vertex_groups_index
+    if idx < 0 or idx >= len(self.pin_vertex_groups):
+        return
+    apply_pin_operations(profile, self.pin_vertex_groups[idx])
+    invalidate_overlays()
+    redraw_all_areas(context)
+
+
+class ObjectGroup(PropertyGroup):
+    name: StringProperty(default="", description="Group name", options=NOT_ANIMATABLE)  # pyright: ignore
+    material_profile_path: StringProperty(
+        name="Material Profile",
+        subtype="FILE_PATH",
+        default="",
+        description="Path to a TOML material parameter profile file",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    material_profile_selection: EnumProperty(
+        name="Material Profile",
+        items=_get_material_profile_items,
+        update=_on_material_profile_selected,
+        description="Select a material parameter profile",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    material_preset_selection: EnumProperty(
+        name="Material Preset",
+        items=_get_material_preset_items,
+        update=_on_material_preset_selected,
+        description="Apply a bundled, physically-grounded material preset "
+        "(filtered by this group's Type; applying it never changes the Type)",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+    pin_profile_path: StringProperty(
+        name="Pin Profile",
+        subtype="FILE_PATH",
+        default="",
+        description="Path to a TOML pin configuration profile file",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    pin_profile_selection: EnumProperty(
+        name="Pin Profile",
+        items=_get_pin_profile_items,
+        update=_on_pin_profile_selected,
+        description="Select a pin configuration profile",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    assigned_objects: CollectionProperty(type=AssignedObject, options=NOT_ANIMATABLE)  # pyright: ignore
+    assigned_objects_index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore  # Selected item in assigned objects list
+    index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore  # Display index for UI
+    uuid: StringProperty(default="", options=NOT_ANIMATABLE)  # pyright: ignore  # Unique identifier
+    pin_vertex_groups: CollectionProperty(type=PinVertexGroupItem, options=NOT_ANIMATABLE)  # pyright: ignore
+    # Spatial material maps: each varies one parameter across the surface from
+    # this group's own slider toward a target, weighted per vertex. Empty for a
+    # group whose materials are uniform, which is every group by default.
+    material_maps: CollectionProperty(type=MaterialMapItem, options=NOT_ANIMATABLE)  # pyright: ignore
+    material_maps_index: IntProperty(default=-1, options={"HIDDEN"})  # pyright: ignore
+    pin_vertex_groups_index: IntProperty(default=-1, options=NOT_ANIMATABLE)  # pyright: ignore
+
+    @dynamic_enum_items
+    def _get_velocity_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    velocity_object_selection: EnumProperty(
+        name="Object",
+        items=_get_velocity_object_items,
+        description="Select object for velocity keyframes",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+    preview_velocity: BoolProperty(
+        name="Preview Direction",
+        default=False,
+        description="Show velocity directions in viewport for all objects in this group",
+        update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+    use_collision_windows: BoolProperty(
+        name="Collision Active Duration Windows",
+        default=False,
+        description="Restrict collision detection to specific time windows per object",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    @dynamic_enum_items
+    def _get_collision_window_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    collision_window_object_selection: EnumProperty(
+        name="Object",
+        items=_get_collision_window_object_items,
+        description="Select object for collision window editing",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+
+    @dynamic_enum_items
+    def _get_tet_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    tet_object_selection: EnumProperty(
+        name="Object",
+        items=_get_tet_object_items,
+        description="Select object whose tetrahedralizer settings to edit",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+
+    def ensure_uuid(self):
+        """Ensure this group has a UUID assigned."""
+        if not self.uuid:
+            self.uuid = str(uuid.uuid4())
+        return self.uuid
+
+    def reset_to_defaults(self):
+        """Reset all parameters to their PropertyGroup defaults.
+
+        This method uses the centralized OBJECT_GROUP_DEFAULTS dictionary
+        to ensure single source of truth for all default values.
+        """
+        # Reset all properties using the centralized defaults
+        for property_name, default_value in OBJECT_GROUP_DEFAULTS.items():
+            if hasattr(self, property_name):
+                try:
+                    setattr(self, property_name, default_value)
+                except Exception:
+                    # Some properties might be read-only or have constraints
+                    continue
+
+        # Set color based on default object type
+        self.color = get_object_type(OBJECT_GROUP_DEFAULTS["object_type"])
+
+        # Clear collections, identity and guard flags. A group SLOT is recycled
+        # by `create_group`, so anything left behind reappears on the next group
+        # made in that slot: a collection naming vertex groups that belong to
+        # some other object, a uuid that makes a retired handle resolve to an
+        # unrelated live group, or a padlock that silently drops its parameter
+        # from the next preset applied.
+        #
+        # Every assigned object's membership ends here, and a merge pair ends
+        # with its object's membership, so the pairs naming them go too.
+        from .dynamics.utils import cleanup_merge_pairs_for_object
+        for assigned in self.assigned_objects:
+            if assigned.uuid:
+                cleanup_merge_pairs_for_object(self.id_data, assigned.uuid)
+        self.assigned_objects.clear()
+        self.pin_vertex_groups.clear()
+        self.material_maps.clear()
+        self.material_maps_index = 0
+        # Every allowance subset names objects by uuid, so a slot recycled by
+        # `create_group` would otherwise start life narrowing a brand new
+        # allowance to objects of whichever group last held this slot.
+        self.allow_self_intersection_objects.clear()
+        self.allow_self_intersection_objects_index = -1
+        self.allow_inter_object_intersection_objects.clear()
+        self.allow_inter_object_intersection_objects_index = -1
+        self.allow_inter_group_intersection_objects.clear()
+        self.allow_inter_group_intersection_objects_index = -1
+        self.allow_existing_intersection_objects.clear()
+        self.allow_existing_intersection_objects_index = -1
+        # A force field source narrowed to this group names it by uuid, so the
+        # reference goes with the group rather than outliving it.
+        from ..models.force_field_targets import drop_group
+        drop_group(self.id_data, self.uuid)
+        self.uuid = ""
+        from ..models.material_locks import LOCKABLE_MATERIAL_PROPS, lock_name
+        for locked_prop in LOCKABLE_MATERIAL_PROPS:
+            try:
+                setattr(self, lock_name(locked_prop), False)
+            except AttributeError:
+                # A lock whose property this type does not carry.
+                continue
+
+    def update_object_type(self, _):
+        self.color = get_object_type(self.object_type)
+        # Ensure rod_model is always ARAP for ROD objects
+        if self.object_type == "ROD":
+            self.rod_model = "ARAP"
+            self.use_group_bounding_box_diagonal = False
+            self.contact_gap = 0.001
+            self.contact_offset = 0.005
+            self.bend = 1.0
+        from .dynamics.overlay import apply_object_overlays
+        apply_object_overlays()
+
+    def update_overlay_color(self, _):
+        """Update object colors when overlay color setting changes"""
+        # Import here to avoid circular imports
+        from .dynamics.overlay import apply_object_overlays
+
+        apply_object_overlays()
+
+    def _invalidate_overlay(self, context):
+        from .dynamics.overlay import apply_object_overlays
+        apply_object_overlays()
+
+    object_type: EnumProperty(  # pyright: ignore
+        name="Type",
+        items=[
+            ("SOLID", "Solid", "Solid object"),
+            ("SHELL", "Shell", "Shell object"),
+            ("ROD", "Rod", "Rod object"),
+            ("STATIC", "Static", "Static object"),
+            ("PDRD", "PDRD", "Painless Differentiable Rotation Dynamics: exactly-rigid body whose surface mesh moves as a single best-fit rigid transform (no tetrahedralization)"),
+            ("SAND", "Sand", "Granular / sand body"),
+        ],
+        default=OBJECT_GROUP_DEFAULTS["object_type"],
+        update=update_object_type,
+        options=NOT_ANIMATABLE,
+    )
+    color: FloatVectorProperty(  # pyright: ignore
+        name="Color",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=get_object_type("SOLID"),
+        description="Color for the group",
+        update=update_overlay_color,
+        options=NOT_ANIMATABLE,
+    )
+    solid_model: EnumProperty(  # pyright: ignore
+        name="Model",
+        items=[
+            ("STABLE_NEOHOOKEAN", "Stable NeoHookean", "Stable NeoHookean model"),
+            ("ARAP", "ARAP", "As-Rigid-As-Possible model"),
+        ],
+        default=OBJECT_GROUP_DEFAULTS["solid_model"],
+        options=NOT_ANIMATABLE,
+    )
+    shell_model: EnumProperty(  # pyright: ignore
+        name="Model",
+        # Blender stores ``EnumProperty`` values as the integer ``number``
+        # field. Explicit numbers below freeze each identifier to its slot
+        # so older ``.blend`` files keep loading as the same identifier
+        # even though ``STABLE_NEOHOOKEAN`` is no longer a valid choice
+        # for shell groups. The empty visible name suppresses the entry
+        # from the dropdown, and the encoder refuses a SHELL group still
+        # holding it (``models.groups.withdrawn_shell_model_refusal``), so
+        # slot 0 stays reserved for it and is never given to another item.
+        items=[
+            ("STABLE_NEOHOOKEAN", "", "", "NONE", 0),
+            ("ARAP", "ARAP", "As-Rigid-As-Possible model", "NONE", 1),
+            ("BARAFF_WITKIN", "Baraff-Witkin", "Baraff-Witkin model", "NONE", 2),
+        ],
+        default=OBJECT_GROUP_DEFAULTS["shell_model"],
+        options=NOT_ANIMATABLE,
+    )
+    rod_model: EnumProperty(  # pyright: ignore
+        name="Model",
+        items=[
+            ("ARAP", "ARAP", "As-Rigid-As-Possible model"),
+        ],
+        default=OBJECT_GROUP_DEFAULTS["rod_model"],
+        options=NOT_ANIMATABLE,
+    )
+    rod_density: FloatProperty(
+        name="Density (kg/m)",
+        default=OBJECT_GROUP_DEFAULTS["rod_density"],
+        min=0.01,
+        max=10000,
+        precision=2,
+        description="Linear density of the rod material",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    shell_density: FloatProperty(
+        name="Density (kg/m\u00b2)",
+        default=OBJECT_GROUP_DEFAULTS["shell_density"],
+        min=0.01,
+        max=10000,
+        precision=2,
+        description="Area density of the shell material",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    solid_density: FloatProperty(
+        name="Density (kg/m\u00b3)",
+        default=OBJECT_GROUP_DEFAULTS["solid_density"],
+        min=0.01,
+        max=10000,
+        precision=2,
+        description="Volume density of the solid material",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    pdrd_density: FloatProperty(
+        name="Density (kg/m³)",
+        default=OBJECT_GROUP_DEFAULTS["pdrd_density"],
+        min=0.01,
+        max=10000,
+        precision=2,
+        description="Volume density of the PDRD body; mass is the density times the enclosed volume of the surface mesh",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    sand_grain_radius: FloatProperty(
+        name="Grain Radius (m)",
+        default=OBJECT_GROUP_DEFAULTS["sand_grain_radius"],
+        min=1e-4,
+        precision=4,
+        description="Per-grain radius of the granular (sand) particles",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    sand_particle_mass: FloatProperty(
+        name="Particle Mass (g)",
+        default=OBJECT_GROUP_DEFAULTS["sand_particle_mass"],
+        min=1e-6,
+        max=1e6,
+        precision=4,
+        description="Mass of a single sand particle, in grams (sent to the solver in kilograms)",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    sand_friction: FloatProperty(
+        name="Friction",
+        default=OBJECT_GROUP_DEFAULTS["sand_friction"],
+        min=0.0,
+        precision=2,
+        description="Inter-grain friction coefficient of the granular (sand) body",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    enable_soft_constraint: BoolProperty(
+        name="Apply Soft Constraints",
+        default=OBJECT_GROUP_DEFAULTS["enable_soft_constraint"],
+        description="Hold this collider with springs instead of pinning it "
+        "exactly, so contact can push it off its animated path",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    # Strictly positive: a pull weight of zero is what classifies a pin as a
+    # hard fix, so a zero here would silently reinstate the exact constraint
+    # this checkbox exists to remove. The encoder rejects it rather than
+    # relying on this minimum, which the MCP and profile paths bypass.
+    soft_constraint_stiffness: FloatProperty(
+        name="Stiffness",
+        default=OBJECT_GROUP_DEFAULTS["soft_constraint_stiffness"],
+        min=1e-6,
+        soft_min=0.001,
+        soft_max=1000.0,
+        precision=4,
+        description="Spring stiffness holding each collider vertex to its "
+        "animated position. Lower yields more to contact; raise it toward an "
+        "exact pin",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+    @dynamic_enum_items
+    def _get_pdrd_hinge_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    pdrd_hinge_object_selection: EnumProperty(
+        name="Object",
+        items=_get_pdrd_hinge_object_items,
+        description="Select which PDRD body's hinge to edit",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+    pdrd_hinge_visualize: BoolProperty(
+        name="Visualize",
+        default=OBJECT_GROUP_DEFAULTS["pdrd_hinge_visualize"],
+        description="Draw the hinge axle gizmo in the viewport for hinged bodies in this group",
+        update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+    @dynamic_enum_items
+    def _get_lock_translation_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    lock_translation_object_selection: EnumProperty(
+        name="Object",
+        items=_get_lock_translation_object_items,
+        description="Select which object's Lock Translation / Lock Rotation to edit",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+    preview_lock_translation: BoolProperty(
+        name="Preview Axis",
+        default=OBJECT_GROUP_DEFAULTS["preview_lock_translation"],
+        description=(
+            "Show Lock Translation and Lock Rotation axes in the viewport "
+            "for enabled objects in this group"
+        ),
+        update=_invalidate_overlay_from_group,
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+    @dynamic_enum_items
+    def _get_bend_ref_object_items(self, context):
+        return _build_assigned_object_enum_items(self)
+
+    bend_ref_object_selection: EnumProperty(
+        name="Object",
+        items=_get_bend_ref_object_items,
+        description="Select which object's reference rest angle to edit",
+        options={"SKIP_SAVE"},
+    )  # pyright: ignore
+    rod_young_modulus: FloatProperty(
+        name="Young's Modulus (Pa/\u03c1)",
+        default=OBJECT_GROUP_DEFAULTS["rod_young_modulus"],
+        min=0.01,
+        soft_max=10000000.0,
+        max=1000000000.0,
+        precision=2,
+        description="Young's modulus for the rod material",
+    )  # pyright: ignore
+    shell_young_modulus: FloatProperty(
+        name="Young's Modulus (Pa/\u03c1)",
+        default=OBJECT_GROUP_DEFAULTS["shell_young_modulus"],
+        min=0.01,
+        soft_max=10000000.0,
+        max=1000000000.0,
+        precision=2,
+        description="Young's modulus for the shell material",
+    )  # pyright: ignore
+    solid_young_modulus: FloatProperty(
+        name="Young's Modulus (Pa/\u03c1)",
+        default=OBJECT_GROUP_DEFAULTS["solid_young_modulus"],
+        min=0.01,
+        soft_max=10000000.0,
+        max=1000000000.0,
+        precision=2,
+        description="Young's modulus for the solid material",
+    )  # pyright: ignore
+    young_mod_density_normalized: BoolProperty(
+        name="Density-Normalized (Pa/\u03c1)",
+        default=OBJECT_GROUP_DEFAULTS["young_mod_density_normalized"],
+        description=(
+            "Sets what the Young's Modulus field above means. When enabled "
+            "(default) it is a density-normalized value in Pa/\u03c1, the solver's "
+            "native convention: changing a body's density alone leaves its "
+            "motion unchanged. Keep it on to match existing scenes. Disable it "
+            "to enter a true Young's modulus in pascals (for example a value "
+            "from a material reference table); the addon then divides it by "
+            "this group's density before sending it to the solver, so a denser "
+            "body of the same material is correspondingly stiffer to move"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    shell_poisson_ratio: FloatProperty(
+        name="Poisson's Ratio",
+        default=OBJECT_GROUP_DEFAULTS["shell_poisson_ratio"],
+        min=0.0,
+        max=0.4999,
+        precision=4,
+        description="Poisson's ratio for the shell material",
+    )  # pyright: ignore
+    solid_poisson_ratio: FloatProperty(
+        name="Poisson's Ratio",
+        default=OBJECT_GROUP_DEFAULTS["solid_poisson_ratio"],
+        min=0.0,
+        max=0.4999,
+        precision=4,
+        description="Poisson's ratio for the solid material",
+    )  # pyright: ignore
+    friction: FloatProperty(
+        name="Friction",
+        default=OBJECT_GROUP_DEFAULTS["friction"],
+        min=0.0,
+        max=1.0,
+        precision=2,
+        description="Friction coefficient",
+    )  # pyright: ignore
+    contact_gap: FloatProperty(
+        name="Contact Gap",
+        default=OBJECT_GROUP_DEFAULTS["contact_gap"],
+        min=0.001,
+        max=0.01,
+        precision=3,
+        description="Contact gap (scaled by World Scale before use)",
+    )  # pyright: ignore
+    use_group_bounding_box_diagonal: BoolProperty(
+        name="Use Object Bounding Box Diagonal",
+        default=OBJECT_GROUP_DEFAULTS["use_group_bounding_box_diagonal"],
+        description=(
+            "Size the contact gap and offset of each object from its own "
+            "bounding box diagonal"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    contact_gap_rat: FloatProperty(
+        name="Contact Gap Ratio",
+        default=OBJECT_GROUP_DEFAULTS["contact_gap_rat"],
+        min=1e-5,
+        max=1.0,
+        precision=5,
+        description="Contact gap as ratio of each object's own bounding box diagonal",
+    )  # pyright: ignore
+    # Stored and displayed as a percentage, like `strain_limit_percent`. The
+    # encoder converts to the wire fraction (value / 100) at the solver
+    # boundary. Read once per transfer, so it offers no keyframe. The rule it
+    # sets follows Gomez-Nogales et al., "Unlocking Thickness Modeling for
+    # Codimensional Contact Simulation" (arXiv:2510.10256).
+    contact_gap_limit_percent: FloatProperty(
+        name="Local Gap Limit",
+        default=OBJECT_GROUP_DEFAULTS["contact_gap_limit_percent"],
+        min=1.0,
+        max=50.0,
+        precision=1,
+        subtype="PERCENTAGE",
+        description=(
+            "Caps the contact gap at this percentage of the room between mesh "
+            "neighbors: the smallest triangle height or rod segment length "
+            "nearby, less twice the contact offset. A wider gap makes "
+            "neighboring vertices push each other apart, which swells a fine "
+            "mesh and stiffens it against bending"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    contact_offset: FloatProperty(
+        name="Contact Offset",
+        default=OBJECT_GROUP_DEFAULTS["contact_offset"],
+        min=0.0,
+        max=0.03,
+        precision=3,
+        description="Contact offset (scaled by World Scale before use)",
+    )  # pyright: ignore
+    contact_offset_rat: FloatProperty(
+        name="Contact Offset Ratio",
+        default=OBJECT_GROUP_DEFAULTS["contact_offset_rat"],
+        min=0.0,
+        max=1.0,
+        precision=5,
+        description="Contact offset as ratio of each object's own bounding box diagonal",
+    )  # pyright: ignore
+    enable_strain_limit: BoolProperty(
+        name="Enable Strain Limit",
+        default=OBJECT_GROUP_DEFAULTS["enable_strain_limit"],
+        description="Enable strain limit for the shell material",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    # Stored and displayed as a percentage (1% allows 1% stretch). The encoder
+    # converts to the wire fraction (value / 100) at the solver boundary. Named
+    # distinctly from the old fractional `strain_limit` so pre-existing .blend
+    # files fall back to the default here instead of reading a misscaled value.
+    strain_limit_percent: FloatProperty(
+        name="Strain Limit",
+        default=OBJECT_GROUP_DEFAULTS["strain_limit_percent"],
+        min=0.0,
+        max=100.0,
+        precision=2,
+        subtype="PERCENTAGE",
+        description="Maximum stretch beyond rest length, as a percentage "
+        "(1% allows 1% stretch)",
+    )  # pyright: ignore
+    force_field_weight: FloatProperty(
+        name="Force Field Weight",
+        default=OBJECT_GROUP_DEFAULTS["force_field_weight"],
+        min=0.0,
+        soft_max=2.0,
+        precision=3,
+        description=(
+            "Scale on the scene's force fields for this group's objects: 1 applies "
+            "them as authored, 0 leaves the group unaffected"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    enable_inflate: BoolProperty(
+        name="Inflate",
+        default=OBJECT_GROUP_DEFAULTS["enable_inflate"],
+        description="Enable inflation pressure for the shell surface",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    inflate_pressure: FloatProperty(
+        name="Pressure (Pa)",
+        default=OBJECT_GROUP_DEFAULTS["inflate_pressure"],
+        min=0.0,
+        soft_max=100.0,
+        precision=3,
+        description="Inflation pressure applied uniformly along face normals (Pa)",
+    )  # pyright: ignore
+    enable_plasticity: BoolProperty(
+        name="Plasticity",
+        default=OBJECT_GROUP_DEFAULTS["enable_plasticity"],
+        description="Enable plasticity (permanent deformation)",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    plasticity: FloatProperty(
+        name="Theta",
+        default=OBJECT_GROUP_DEFAULTS["plasticity"],
+        min=0.0,
+        soft_max=10.0,
+        precision=2,
+        description="Plasticity rate constant (0=elastic, 1=63%/s, 5=99%/s)",
+    )  # pyright: ignore
+    plasticity_threshold: FloatProperty(
+        name="Threshold",
+        default=OBJECT_GROUP_DEFAULTS["plasticity_threshold"],
+        min=0.0,
+        soft_max=1.0,
+        precision=3,
+        description="Dead zone around S=1. Plasticity only activates when |S-1| > threshold",
+    )  # pyright: ignore
+    enable_bend_plasticity: BoolProperty(
+        name="Bend Plasticity",
+        default=OBJECT_GROUP_DEFAULTS["enable_bend_plasticity"],
+        description="Enable bending plasticity (hinge / rod-joint rest angle drifts)",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    bend_plasticity: FloatProperty(
+        name="Bend Theta",
+        default=OBJECT_GROUP_DEFAULTS["bend_plasticity"],
+        min=0.0,
+        soft_max=10.0,
+        precision=2,
+        description="Bending plasticity rate constant (0=elastic, higher=faster creep)",
+    )  # pyright: ignore
+    bend_plasticity_threshold: FloatProperty(
+        name="Bend Threshold",
+        default=OBJECT_GROUP_DEFAULTS["bend_plasticity_threshold"],
+        min=0.0,
+        soft_max=3.14159,
+        precision=3,
+        subtype="ANGLE",
+        unit="ROTATION",
+        description="Dead zone around rest angle. Plasticity activates when |θ-θ_rest| > threshold",
+    )  # pyright: ignore
+    bend_rest_angle_source: EnumProperty(
+        name="Rest Angle",
+        # Explicit numbers: FLAT and FROM_GEOMETRY were saved as 0 and 1 when
+        # this list auto-numbered, so they keep those numbers.
+        # FROM_REFERENCE replaced the retired `bend_rest_from_reference`
+        # checkbox (`core.migrate_renames.migrate_bend_rest_reference` carries
+        # a saved checkbox onto it).
+        items=[
+            ("FLAT", "Flat / Straight",
+             "Start from flat (shell hinge θ₀=0) or straight (rod θ₀=π)",
+             "NONE", 0),
+            ("FROM_GEOMETRY", "From Initial Geometry",
+             "Use the angle of the initial pose as rest", "NONE", 1),
+            ("FROM_REFERENCE", "From Reference Geometry",
+             "Each object takes its rest angle from its own reference: another "
+             "object (a topological copy whose vertices were moved), one of its "
+             "shape keys, or its shape-key mix (animated with it). Every object "
+             "in the group must have one. Bend Plasticity does not apply",
+             "NONE", 2),
+        ],
+        default=OBJECT_GROUP_DEFAULTS.get("bend_rest_angle_source", "FLAT"),
+        description="How the initial bending rest angle is populated",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    bend: FloatProperty(
+        name="Bend Stiffness",
+        default=OBJECT_GROUP_DEFAULTS["bend"],
+        min=0.0,
+        soft_max=100.0,
+        precision=2,
+        description="Bending stiffness for the shell material",
+    )  # pyright: ignore
+    deformation_damping: FloatProperty(
+        name="Deformation Damping",
+        default=OBJECT_GROUP_DEFAULTS["deformation_damping"],
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+        description=(
+            "Stiffness-proportional Rayleigh damping for stretch/membrane/solid "
+            "deformation (seconds). Damps high-frequency deformation; 0 disables it"
+        ),
+    )  # pyright: ignore
+    bending_damping: FloatProperty(
+        name="Bending Damping",
+        default=OBJECT_GROUP_DEFAULTS["bending_damping"],
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+        description=(
+            "Stiffness-proportional Rayleigh damping for shell and rod bending "
+            "(seconds), usually smaller than deformation damping; 0 disables it"
+        ),
+    )  # pyright: ignore
+    allow_self_intersection: BoolProperty(
+        name="Allow Self-Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_self_intersection"],
+        description=(
+            "Let an object pass through itself. Its parts get no contact "
+            "with each other and an overlap is never reported, so a folding "
+            "cloth crosses its own layers. It covers each object assigned to "
+            "this group on its own, so two of them meeting is an inter-object "
+            "overlap, which this does not allow"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    # Which of the group's objects the allowance above reaches. The allowance
+    # is per OBJECT all the way down (the frontend resolves it into one policy
+    # byte per vertex from the object's own material), so narrowing it to a
+    # subset costs nothing downstream and is the honest granularity: a scene
+    # usually arrives with ONE garment tangled, and flagging the whole group
+    # buys silence about the others as well.
+    #
+    # The default is True so a group that never opens this list behaves
+    # exactly as it did before the list existed, which is also what a `.blend`
+    # saved before it reads back.
+    allow_self_intersection_all_objects: BoolProperty(
+        name="Apply to All Objects",
+        default=OBJECT_GROUP_DEFAULTS["allow_self_intersection_all_objects"],
+        description=(
+            "Give every object assigned to this group the self-intersection "
+            "allowance. Turn it off to name the objects individually, and "
+            "only the objects in the list below are allowed to overlap "
+            "themselves"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_self_intersection_objects: CollectionProperty(
+        type=IntersectionAllowanceObject, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    allow_self_intersection_objects_index: IntProperty(
+        default=-1, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    allow_inter_object_intersection: BoolProperty(
+        name="Allow Inter-Object Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_inter_object_intersection"],
+        description=(
+            "Let an object pass through every other object, including other "
+            "objects in this group and static colliders, but not the "
+            "invisible walls and spheres. Such pairs get no contact and are "
+            "never reported. Only one of the two sides has to enable it, so "
+            "setting it on a garment also lets it pass through the body it is "
+            "fitted to"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_inter_object_intersection_all_objects: BoolProperty(
+        name="Apply to All Objects",
+        default=OBJECT_GROUP_DEFAULTS[
+            "allow_inter_object_intersection_all_objects"
+        ],
+        description=(
+            "Give every object assigned to this group the inter-object "
+            "allowance. Turn it off to name the objects individually, and "
+            "only the objects in the list below pass through other objects"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_inter_object_intersection_objects: CollectionProperty(
+        type=IntersectionAllowanceObject, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    allow_inter_object_intersection_objects_index: IntProperty(
+        default=-1, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    # The narrower sibling of the allowance above: it covers only a pair whose
+    # two objects are assigned to DIFFERENT groups, so the objects of one
+    # group keep colliding with each other while they pass through the rest
+    # of the scene. A group holds one type, so a STATIC collider never shares
+    # a group with a dynamic object and is always part of that rest. Which of
+    # this group's objects carry it is per object, exactly like the other two.
+    allow_inter_group_intersection: BoolProperty(
+        name="Allow Inter-Group Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_inter_group_intersection"],
+        description=(
+            "Let an object pass through every object assigned to a different "
+            "group, including static colliders, but not the invisible walls "
+            "and spheres. Objects in this same group still collide with each "
+            "other. Such pairs get no contact and are never reported. Only "
+            "one of the two sides has to enable it"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_inter_group_intersection_all_objects: BoolProperty(
+        name="Apply to All Objects",
+        default=OBJECT_GROUP_DEFAULTS[
+            "allow_inter_group_intersection_all_objects"
+        ],
+        description=(
+            "Give every object assigned to this group the inter-group "
+            "allowance. Turn it off to name the objects individually, and "
+            "only the objects in the list below pass through objects of "
+            "other groups"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_inter_group_intersection_objects: CollectionProperty(
+        type=IntersectionAllowanceObject, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    allow_inter_group_intersection_objects_index: IntProperty(
+        default=-1, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    # Not a pair rule but a starting-state one: the pairs this group's objects
+    # START the simulation intersecting with are exempted from contact for the
+    # whole run, and every other pair keeps full contact. For a garment posed
+    # by a rig, whose fold (an armpit) crosses itself or the body at the start
+    # frame. Per object like the other three, and either side is enough.
+    allow_existing_intersection: BoolProperty(
+        name="Allow Existing Intersections",
+        default=OBJECT_GROUP_DEFAULTS["allow_existing_intersection"],
+        description=(
+            "Start from a pose that already intersects. The places where an "
+            "object crosses itself or another object at the start frame, or "
+            "sits closer than the contact offset, pass through each other for "
+            "the whole simulation instead of stopping the build. Everywhere "
+            "else keeps full contact, and a new intersection still stops the "
+            "run. It does not untangle anything. Only one of the two sides has "
+            "to enable it"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_existing_intersection_all_objects: BoolProperty(
+        name="Apply to All Objects",
+        default=OBJECT_GROUP_DEFAULTS[
+            "allow_existing_intersection_all_objects"
+        ],
+        description=(
+            "Give every object assigned to this group the existing-"
+            "intersection allowance. Turn it off to name the objects "
+            "individually, and only the objects in the list below may start "
+            "intersecting"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    allow_existing_intersection_objects: CollectionProperty(
+        type=IntersectionAllowanceObject, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    allow_existing_intersection_objects_index: IntProperty(
+        default=-1, options=NOT_ANIMATABLE
+    )  # pyright: ignore
+    bend_warp: FloatProperty(
+        name="Bending Stiffness (Warp)",
+        default=OBJECT_GROUP_DEFAULTS["bend_warp"],
+        min=0.0,
+        # Same units as Bending Stiffness, but the useful range runs far higher
+        # than that slider's soft cap suggests: bending resists gravity as
+        # B / (rho g L^3), so a sheet several times the calibration specimen
+        # needs orders of magnitude more. A 5-unit sheet needs about 1e6 before
+        # the two directions visibly part. Soft, so any value can still be typed.
+        soft_max=1.0e7,
+        precision=2,
+        description=(
+            "Extra bending stiffness for the warp (UV X) fibers, added on top "
+            "of Bending Stiffness. 0 keeps bending the same in every "
+            "direction. Needs a UV map"
+        ),
+    )  # pyright: ignore
+    bend_weft: FloatProperty(
+        name="Bending Stiffness (Weft)",
+        default=OBJECT_GROUP_DEFAULTS["bend_weft"],
+        min=0.0,
+        # Same units as Bending Stiffness, but the useful range runs far higher
+        # than that slider's soft cap suggests: bending resists gravity as
+        # B / (rho g L^3), so a sheet several times the calibration specimen
+        # needs orders of magnitude more. A 5-unit sheet needs about 1e6 before
+        # the two directions visibly part. Soft, so any value can still be typed.
+        soft_max=1.0e7,
+        precision=2,
+        description=(
+            "Extra bending stiffness for the weft (UV Y) fibers, added on top "
+            "of Bending Stiffness. 0 keeps bending the same in every "
+            "direction. Needs a UV map"
+        ),
+    )  # pyright: ignore
+    shrink_x: FloatProperty(
+        name="Shrink X",
+        default=OBJECT_GROUP_DEFAULTS["shrink_x"],
+        min=0.1,
+        soft_max=2.0,
+        precision=2,
+        description="Scale factor along the UV X direction; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    shrink_y: FloatProperty(
+        name="Shrink Y",
+        default=OBJECT_GROUP_DEFAULTS["shrink_y"],
+        min=0.1,
+        soft_max=2.0,
+        precision=2,
+        description="Scale factor along the UV Y direction; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    shrink: FloatProperty(
+        name="Shrink",
+        default=OBJECT_GROUP_DEFAULTS["shrink"],
+        min=0.1,
+        soft_max=2.0,
+        precision=2,
+        description="Uniform scale factor for solid material; <1 shrinks, >1 extends",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    length_factor: FloatProperty(
+        name="Shrink",
+        default=OBJECT_GROUP_DEFAULTS["length_factor"],
+        min=0.1,
+        soft_max=2.0,
+        precision=2,
+        description=(
+            "Rest-length scale for rod edges; <1 shrinks the rod, "
+            ">1 extends it. Maps to the solver's 'length-factor' "
+            "rod parameter"
+        ),
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+    # The tetrahedralizer backend picker and its overrides moved to a
+    # per-object surface on AssignedObject (see state_types.py); the group
+    # only keeps tet_object_selection above to choose which object to edit,
+    # mirroring Velocity Overwrite.
+
+    stitch_stiffness: FloatProperty(
+        name="Stitch Stiffness",
+        default=OBJECT_GROUP_DEFAULTS["stitch_stiffness"],
+        min=0.0,
+        soft_max=10000.0,
+        precision=2,
+        description="Stiffness factor for stitch constraints",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    show_parameters: BoolProperty(
+        name="Material Params",
+        default=OBJECT_GROUP_DEFAULTS["show_parameters"],
+        description="Toggle visibility of group parameters",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    active: BoolProperty(
+        name="Active",
+        default=OBJECT_GROUP_DEFAULTS["active"],
+        description="Indicates if the group is active",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    show_overlay_color: BoolProperty(  # pyright: ignore
+        name="Overlay Color",
+        default=OBJECT_GROUP_DEFAULTS["show_overlay_color"],
+        description="Toggle visibility of overlay color",
+        update=update_overlay_color,
+        options=NOT_ANIMATABLE,
+    )
+    show_stats: BoolProperty(
+        name="Stats",
+        default=OBJECT_GROUP_DEFAULTS["show_stats"],
+        description="Toggle visibility of object information",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    show_pin: BoolProperty(
+        name="Pins",
+        default=OBJECT_GROUP_DEFAULTS["show_pin"],
+        description="Toggle visibility of pinned vertex group",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    show_pdrd_hinge: BoolProperty(
+        name="Hinge",
+        default=OBJECT_GROUP_DEFAULTS["show_pdrd_hinge"],
+        description="Expand the per-object PDRD hinge controls",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    pin_overlay_size: FloatProperty(
+        name="Pin Size",
+        default=OBJECT_GROUP_DEFAULTS["pin_overlay_size"],
+        min=4.0,
+        max=32.0,
+        description="Size of pin overlay circles",
+        update=_invalidate_overlay,
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    show_group: BoolProperty(
+        name="Show Group",
+        default=OBJECT_GROUP_DEFAULTS["show_group"],
+        description="Toggle visibility of group contents",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+    pin_vertex_group_items: EnumProperty(
+        name="Vertex Groups",
+        items=get_vertex_group_items,
+        description="Select a vertex group to pin",
+        options=NOT_ANIMATABLE,
+    )  # pyright: ignore
+
+# One lock per animatable material property, generated rather than written out
+# 32 times. Blender reads these off the class annotations at registration, so
+# they must be added before register() runs, which is what module scope gives.
+#
+# The lock guards against a TOOL overwriting the value (presets, copy-paste
+# material), following Blender's own lock_location. It does not mute an
+# F-curve: a locked Transform channel still animates, and so does this one.
+for _lockable in LOCKABLE_MATERIAL_PROPS:
+    ObjectGroup.__annotations__[lock_name(_lockable)] = BoolProperty(
+        name="Lock",
+        default=False,
+        description=(
+            "Protect this value from material presets and from pasting "
+            "material parameters. Keyframes still apply"
+        ),
+        options=NOT_ANIMATABLE,
+    )

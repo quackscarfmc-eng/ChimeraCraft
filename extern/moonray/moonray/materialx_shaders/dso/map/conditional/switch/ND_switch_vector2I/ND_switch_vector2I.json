@@ -1,0 +1,55 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "in1Attr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in1",
+            "type" : "Vec2f"
+        },
+        "in2Attr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in2",
+            "type" : "Vec2f"
+        },
+        "in3Attr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in3",
+            "type" : "Vec2f"
+        },
+        "in4Attr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in4",
+            "type" : "Vec2f"
+        },
+        "in5Attr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in5",
+            "type" : "Vec2f"
+        },
+        "whichAttr" : 
+        {
+            "default" : "0",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "which",
+            "type" : "Int"
+        }
+    },
+    "name" : "ND_switch_vector2I",
+    "type" : "Map"
+}

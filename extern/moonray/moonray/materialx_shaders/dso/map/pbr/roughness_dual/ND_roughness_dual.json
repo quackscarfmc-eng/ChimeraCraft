@@ -1,0 +1,20 @@
+{
+	"attributes" : 
+	{
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"roughnessAttr" : 
+		{
+			"default" : "Vec2f(0.0f, 0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "roughness",
+			"type" : "Vec2f"
+		}
+	},
+	"name" : "ND_roughness_dual",
+	"type" : "Map"
+}

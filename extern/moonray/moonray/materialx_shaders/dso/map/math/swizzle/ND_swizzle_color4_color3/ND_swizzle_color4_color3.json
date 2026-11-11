@@ -1,0 +1,27 @@
+{
+	"attributes" : 
+	{
+		"channelsAttr" : 
+		{
+			"default" : "\"rrr\"",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "channels",
+			"type" : "String"
+		},
+		"disableAttr" : 
+		{
+			"default" : 0,
+			"name" : "disable",
+			"type" : "Bool"
+		},
+		"inAttr" : 
+		{
+			"default" : "Rgba(0.0f, 0.0f, 0.0f,0.0f)",
+			"flags" : "FLAGS_BINDABLE",
+			"name" : "in",
+			"type" : "Rgba"
+		}
+	},
+	"name" : "ND_swizzle_color4_color3",
+	"type" : "Map"
+}

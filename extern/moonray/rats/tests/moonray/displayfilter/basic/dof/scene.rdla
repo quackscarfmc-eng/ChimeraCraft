@@ -1,0 +1,23 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+local ro = RenderOutput("/output/beauty") {}
+local depthRO = RenderOutput("/output/depth") {}
+
+--------------------------------------
+-- DofDisplayFilter
+--------------------------------------
+
+local dofFilter = DofDisplayFilter("/Filter/dof") {
+    ["input"] = ro,
+    ["depth"] = depthRO,
+    ["focal_length"] = 24,
+    ["focus_distance"] = 19,
+    ["use_camera_attributes"] = false,
+}
+
+RenderOutput("/Output/dof") {
+    ["file_name"] = "dof.exr",
+    ["result"] = "display filter",
+    ["display_filter"] = dofFilter,
+    ["channel_name"] = "dof"
+}

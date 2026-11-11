@@ -1,0 +1,862 @@
+// File: crates/ppf-cts-py/src/decoder_py.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// PyO3 wrappers for the pure-compute kernels backing
+// `frontend/_decoder_.py`. The Python decoder still owns pickle / CBOR
+// dispatch and the dataclass / scene / pin assembly: only the
+// numpy-heavy inner loops live here.
+
+use std::path::{Path, PathBuf};
+
+use ndarray::Array2;
+use numpy::{
+    IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyUntypedArrayMethods,
+};
+use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
+
+use ppf_cts_core::datamodel::decoder as dec;
+
+use crate::utils_py::require_n_by_k;
+
+/// Apply a 4x4 transform to local-space vertices and return
+/// world-space `(N, 3)` `float32` vertices.
+///
+/// Wraps `dec::apply_transform_4x4`. Mirrors
+/// `SceneDecoder._apply_transform`.
+#[pyfunction]
+#[pyo3(signature = (local_vert, transform))]
+pub fn apply_transform_4x4<'py>(
+    py: Python<'py>,
+    local_vert: PyReadonlyArray2<'py, f64>,
+    transform: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let n = require_n_by_k::<_, 3>(&local_vert, "local_vert")?;
+    let ts = transform.shape();
+    if ts.len() != 2 || ts[0] != 4 || ts[1] != 4 {
+        return Err(PyValueError::new_err(format!(
+            "transform must have shape (4, 4), got {ts:?}"
+        )));
+    }
+    let v = local_vert
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("local_vert must be C-contiguous"))?;
+    let m = transform
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("transform must be C-contiguous"))?;
+
+    let out_flat = py.detach(|| dec::apply_transform_4x4(v, m));
+    debug_assert_eq!(out_flat.len(), n * 3);
+    let arr = Array2::<f32>::from_shape_vec((n, 3), out_flat)
+        .map_err(|e| PyValueError::new_err(format!("reshape failed: {e}")))?;
+    Ok(arr.into_pyarray(py))
+}
+
+/// Format a build-plan job list into the human-readable status string.
+///
+/// `jobs` is a list of `dict` each containing at least `"name": str`
+/// and `"cached": bool`. Wraps `dec::summarize_tetra_jobs`.
+#[pyfunction]
+#[pyo3(signature = (jobs))]
+pub fn summarize_tetra_jobs(jobs: &Bound<'_, PyList>) -> PyResult<String> {
+    let mut names: Vec<String> = Vec::with_capacity(jobs.len());
+    let mut cached: Vec<bool> = Vec::with_capacity(jobs.len());
+    for job in jobs.iter() {
+        let d = job
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each job must be a dict"))?;
+        let name_val = d
+            .get_item("name")?
+            .ok_or_else(|| PyValueError::new_err("job missing 'name' key"))?;
+        let cached_val = d
+            .get_item("cached")?
+            .ok_or_else(|| PyValueError::new_err("job missing 'cached' key"))?;
+        names.push(name_val.extract::<String>()?);
+        cached.push(cached_val.extract::<bool>()?);
+    }
+    let job_views: Vec<dec::TetraJob<'_>> = names
+        .iter()
+        .zip(cached.iter())
+        .map(|(n, c)| dec::TetraJob {
+            name: n.as_str(),
+            cached: *c,
+        })
+        .collect();
+    Ok(dec::summarize_tetra_jobs(&job_views))
+}
+
+/// Project anchor points onto the closest triangle of one mesh and emit
+/// the per-anchor triangle + barycentric weights.
+///
+/// Inputs:
+/// - `target_face`: `(F, 3)` int64 triangle indices.
+/// - `target_pos`: `(P, 3)` float64 vertex positions (world space).
+/// - `anchors`: `(K, 3)` float64 anchor positions.
+///
+/// Returns `(tri, bary)`: `(M, 3)` int64 triangle ids and `(M, 3)`
+/// float32 barycentric weights, where `M <= K` (anchors that fall on a
+/// fully degenerate mesh are dropped). This is the per-side primitive;
+/// the 6-slot stitch row (source slots `[0..2]`, target slots `[3..5]`)
+/// is assembled by the caller.
+#[pyfunction]
+#[pyo3(signature = (target_face, target_pos, anchors))]
+pub fn barycentric_project_anchors<'py>(
+    py: Python<'py>,
+    target_face: PyReadonlyArray2<'py, i64>,
+    target_pos: PyReadonlyArray2<'py, f64>,
+    anchors: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Bound<'py, PyArray2<i64>>, Bound<'py, PyArray2<f32>>)> {
+    let _f = require_n_by_k::<_, 3>(&target_face, "target_face")?;
+    let _p = require_n_by_k::<_, 3>(&target_pos, "target_pos")?;
+    let _a = require_n_by_k::<_, 3>(&anchors, "anchors")?;
+
+    let face = target_face
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("target_face must be C-contiguous"))?;
+    let pos = target_pos
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("target_pos must be C-contiguous"))?;
+    let an = anchors
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("anchors must be C-contiguous"))?;
+
+    let rows = py.detach(|| dec::barycentric_project_anchors(face, pos, an));
+    let m = rows.tri.len();
+    let mut tri_flat = Vec::with_capacity(m * 3);
+    let mut bary_flat = Vec::with_capacity(m * 3);
+    for r in &rows.tri {
+        tri_flat.extend_from_slice(r);
+    }
+    for r in &rows.bary {
+        bary_flat.extend_from_slice(r);
+    }
+    let tri_arr = Array2::<i64>::from_shape_vec((m, 3), tri_flat)
+        .map_err(|e| PyValueError::new_err(format!("tri reshape failed: {e}")))?;
+    let bary_arr = Array2::<f32>::from_shape_vec((m, 3), bary_flat)
+        .map_err(|e| PyValueError::new_err(format!("bary reshape failed: {e}")))?;
+    Ok((tri_arr.into_pyarray(py), bary_arr.into_pyarray(py)))
+}
+
+/// Compute the per-Blender-vertex closest simulation surface vertex
+/// from a frame mapping. Mirrors the loop at lines 1349-1372 of
+/// `_decoder_.py`.
+///
+/// Inputs:
+/// - `tri_indices`: `(M,)` int64 triangle id per Blender vertex.
+/// - `coefs`: `(M, 3)` float64 frame coefficients.
+/// - `faces`: `(NF, 3)` int64 simulation surface triangles.
+/// - `verts`: `(NV, 3)` float64 simulation surface positions.
+///
+/// Returns a Python list of int (length `M`).
+#[pyfunction]
+#[pyo3(signature = (tri_indices, coefs, faces, verts))]
+pub fn solid_orig_to_sim<'py>(
+    py: Python<'py>,
+    tri_indices: PyReadonlyArray1<'py, i64>,
+    coefs: PyReadonlyArray2<'py, f64>,
+    faces: PyReadonlyArray2<'py, i64>,
+    verts: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Vec<i64>> {
+    let m = tri_indices.shape()[0];
+    let cs = coefs.shape();
+    if cs.len() != 2 || cs[0] != m || cs[1] != 3 {
+        return Err(PyValueError::new_err(format!(
+            "coefs must have shape (M, 3) matching tri_indices length {m}, got {cs:?}"
+        )));
+    }
+    let _ = require_n_by_k::<_, 3>(&faces, "faces")?;
+    let _ = require_n_by_k::<_, 3>(&verts, "verts")?;
+
+    let ti = tri_indices
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("tri_indices must be C-contiguous"))?;
+    let cf = coefs
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("coefs must be C-contiguous"))?;
+    let fc = faces
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("faces must be C-contiguous"))?;
+    let vt = verts
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("verts must be C-contiguous"))?;
+
+    Ok(py.detach(|| dec::solid_orig_to_sim(ti, cf, fc, vt)))
+}
+
+// ---------------------------------------------------------------------
+// `BlenderApp` path resolution + validation wrappers.
+// ---------------------------------------------------------------------
+
+fn home_path_buf() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Resolve `BlenderApp.__init__`'s on-disk layout. Returns a dict with
+/// `"data_dirpath"`, `"root"`, `"cache_root"`, all string paths.
+/// Mirrors the path math at the top of `BlenderApp.__init__`.
+#[pyfunction]
+#[pyo3(signature = (frontend_file, name))]
+pub fn blender_app_paths<'py>(
+    py: Python<'py>,
+    frontend_file: &str,
+    name: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let home = home_path_buf();
+    let p = dec::blender_app_paths(Path::new(frontend_file), name, home.as_deref());
+    let d = PyDict::new(py);
+    d.set_item("data_dirpath", p.data_dirpath.to_string_lossy().into_owned())?;
+    d.set_item("root", p.root.to_string_lossy().into_owned())?;
+    d.set_item("cache_root", p.cache_root.to_string_lossy().into_owned())?;
+    Ok(d)
+}
+
+/// Resolve the `app_state.pickle` final + tmp path pair used in
+/// `BlenderApp._persist_app_state`.
+#[pyfunction]
+#[pyo3(signature = (root))]
+pub fn app_state_persist_paths<'py>(py: Python<'py>, root: &str) -> PyResult<Bound<'py, PyDict>> {
+    let p = dec::app_state_persist_paths(Path::new(root));
+    let d = PyDict::new(py);
+    d.set_item("final_path", p.final_path.to_string_lossy().into_owned())?;
+    d.set_item("tmp_path", p.tmp_path.to_string_lossy().into_owned())?;
+    Ok(d)
+}
+
+/// Assert a file path ends in `.pickle`. Raises `ValueError` with
+/// the same string the Python source's `assert` raised.
+#[pyfunction]
+#[pyo3(signature = (filepath))]
+pub fn validate_pickle_extension(filepath: &str) -> PyResult<()> {
+    dec::validate_pickle_extension(filepath).map_err(crate::errors::into_py_err)
+}
+
+/// Confirm the loaded `param.pickle` carries the two required top-level
+/// keys (`group`, `scene`). Raises `ValueError` on missing keys.
+#[pyfunction]
+#[pyo3(signature = (has_group, has_scene))]
+pub fn validate_param_top_keys(has_group: bool, has_scene: bool) -> PyResult<()> {
+    dec::validate_param_top_keys(has_group, has_scene)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject pin op-type combinations the simulator can't represent.
+/// Raises `ValueError` if `op_types` contains both `"torque"` and any
+/// of `{"spin", "scale", "move_by"}`.
+#[pyfunction]
+#[pyo3(signature = (op_types, pin_name))]
+pub fn validate_pin_op_types(op_types: Vec<String>, pin_name: &str) -> PyResult<()> {
+    let refs: Vec<&str> = op_types.iter().map(|s| s.as_str()).collect();
+    dec::validate_pin_op_types(&refs, pin_name)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Mirror the assertion in `apply_invisible_colliders`: returns the
+/// thickness back unchanged if positive, raises `AssertionError` (via
+/// `ValueError`) if not.
+#[pyfunction]
+#[pyo3(signature = (kind, value))]
+pub fn validate_invisible_collider_thickness(kind: &str, value: f64) -> PyResult<f64> {
+    dec::validate_invisible_collider_thickness(kind, value)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Mirror the legacy-pickle guard in `ParamDecoder.apply_to_objects`:
+/// the third tuple slot must be present.
+#[pyfunction]
+#[pyo3(signature = (length))]
+pub fn validate_param_group_has_uuids(length: usize) -> PyResult<()> {
+    dec::validate_param_group_has_uuids(length)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject empty UUIDs on the per-object pass of
+/// `ParamDecoder.apply_to_objects`.
+#[pyfunction]
+#[pyo3(signature = (obj_name, uuid))]
+pub fn validate_param_object_uuid(obj_name: &str, uuid: &str) -> PyResult<()> {
+    dec::validate_param_object_uuid(obj_name, uuid)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject objects without a name/uuid in `SceneDecoder.populate_objects`.
+#[pyfunction]
+#[pyo3(signature = (name, uuid))]
+pub fn validate_scene_object_identity(name: &str, uuid: &str) -> PyResult<()> {
+    dec::validate_scene_object_identity(name, uuid)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject the encoder bug where a STATIC object carries more than one
+/// motion source (`transform_animation`, `static_ops`, or
+/// `static_deform_animation`). At most one may be present.
+#[pyfunction]
+#[pyo3(signature = (name, has_anim, has_ops, has_deform))]
+pub fn validate_static_anim_xor_ops(
+    name: &str,
+    has_anim: bool,
+    has_ops: bool,
+    has_deform: bool,
+) -> PyResult<()> {
+    dec::validate_static_anim_xor_ops(name, has_anim, has_ops, has_deform)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Validate a STATIC op type tag. Mirrors the `else` arm of the
+/// dispatch in `populate_objects`'s static-ops loop.
+#[pyfunction]
+#[pyo3(signature = (op_type))]
+pub fn validate_static_op_type(op_type: &str) -> PyResult<()> {
+    dec::validate_static_op_type(op_type)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject ROD objects without an edge buffer.
+#[pyfunction]
+#[pyo3(signature = (name, has_edge))]
+pub fn validate_rod_has_edges(name: &str, has_edge: bool) -> PyResult<()> {
+    dec::validate_rod_has_edges(name, has_edge)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject groups with an unknown discriminator string.
+#[pyfunction]
+#[pyo3(signature = (group_type))]
+pub fn validate_group_type(group_type: &str) -> PyResult<()> {
+    dec::validate_group_type(group_type)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject `mesh_ref` values that do not match any canonical mesh UUID.
+#[pyfunction]
+#[pyo3(signature = (name, mesh_ref, found))]
+pub fn validate_mesh_ref_known(name: &str, mesh_ref: &str, found: bool) -> PyResult<()> {
+    dec::validate_mesh_ref_known(name, mesh_ref, found)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Reject objects that have neither inline `vert` nor a valid `mesh_ref`.
+#[pyfunction]
+#[pyo3(signature = (name, uuid, has_mesh))]
+pub fn validate_object_has_mesh(name: &str, uuid: &str, has_mesh: bool) -> PyResult<()> {
+    dec::validate_object_has_mesh(name, uuid, has_mesh)
+        .map_err(crate::errors::into_py_err)
+}
+
+/// Find the row in a `(P, 3)` `float64` buffer closest (squared L2)
+/// to `target`. Wraps `dec::closest_vertex_index`.
+#[pyfunction]
+#[pyo3(signature = (verts, target))]
+pub fn closest_vertex_index<'py>(
+    py: Python<'py>,
+    verts: PyReadonlyArray2<'py, f64>,
+    target: PyReadonlyArray1<'py, f64>,
+) -> PyResult<usize> {
+    let _n = require_n_by_k::<_, 3>(&verts, "verts")?;
+    if _n == 0 {
+        return Err(PyValueError::new_err("verts must have at least one row"));
+    }
+    if target.shape()[0] != 3 {
+        return Err(PyValueError::new_err(format!(
+            "target must have shape (3,), got {:?}",
+            target.shape()
+        )));
+    }
+    let v = verts
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("verts must be C-contiguous"))?;
+    let t = target
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("target must be C-contiguous"))?;
+    Ok(py.detach(|| dec::closest_vertex_index(v, t)))
+}
+
+/// Compute per-segment `(t_start, t_end, dx, dy, dz)` triples for a
+/// keyframe-driven pin animation. Mirrors the embedded-move
+/// derivation in `apply_pin_config`. `positions` is `(K, 3)`.
+///
+/// Returns a Python list of `(float, float, [float, float, float])`
+/// tuples, one per consecutive pair; an input shorter than two
+/// keyframes yields an empty list.
+#[pyfunction]
+#[pyo3(signature = (times, positions))]
+pub fn keyframe_translation_segments<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArray1<'py, f64>,
+    positions: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyList>> {
+    let n = times.shape()[0];
+    let pshape = positions.shape();
+    if pshape.len() != 2 || pshape[0] != n || pshape[1] != 3 {
+        return Err(PyValueError::new_err(format!(
+            "positions must have shape (K, 3) matching times length {n}, got {pshape:?}"
+        )));
+    }
+    let t = times
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("times must be C-contiguous"))?;
+    let p = positions
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("positions must be C-contiguous"))?;
+    let segs = py.detach(|| dec::keyframe_translation_segments(t, p));
+    let out = PyList::empty(py);
+    for (t_start, t_end, d) in segs {
+        out.append((t_start, t_end, (d[0], d[1], d[2])))?;
+    }
+    Ok(out)
+}
+
+/// Run the dedup pass over the object plan entries `SceneDecoder`
+/// builds (frontend/_decoder_.py) and rebuild the post-dedup
+/// `tetra_jobs` list, so the whole per-entry sweep is one call.
+///
+/// Two SOLID entries share a tetrahedralization exactly when they
+/// address the same cache file, so the dedup key is the entry's
+/// `tetra_cache_name`. That name covers the mesh hash and the object's
+/// tetrahedralizer settings together, so two objects built from one mesh
+/// with different settings each get their own run.
+///
+/// Mutations applied to each entry:
+///   - `tetra_reuse_from`: sets to the earlier entry index (int) when
+///     `tetra_cache_name` matches an earlier SOLID entry, else `None`.
+///   - `tetra_weight`: zeroed for reuse rows.
+///   - `tetra_index`: 1-indexed integer for fresh tet jobs, `None`
+///     for reuse rows.
+///
+/// Returns `(tetra_jobs, work_delta)` where `work_delta` is the total
+/// `tetra_weight` reclaimed (negative or zero) which the caller adds
+/// to its running `object_work` accumulator.
+#[pyfunction]
+#[pyo3(signature = (object_entries))]
+pub fn dedup_and_rebuild_tetra_jobs<'py>(
+    py: Python<'py>,
+    object_entries: &Bound<'_, PyList>,
+) -> PyResult<(Bound<'py, PyList>, f64)> {
+    use std::collections::HashMap;
+    let mut tet_key_seen: HashMap<String, usize> = HashMap::new();
+    let mut work_delta: f64 = 0.0;
+    // First pass: dedup decisions.
+    for (i, entry_obj) in object_entries.iter().enumerate() {
+        let entry = entry_obj
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each object entry must be a dict"))?;
+        let group_type: String = match entry.get_item("group_type")? {
+            Some(v) => v.extract().unwrap_or_default(),
+            None => String::new(),
+        };
+        let tri_mesh_present = match entry.get_item("tri_mesh")? {
+            Some(v) => !v.is_none(),
+            None => false,
+        };
+        if !tri_mesh_present {
+            continue;
+        }
+        if group_type != "SOLID" {
+            continue;
+        }
+        let h: String = match entry.get_item("tetra_cache_name")? {
+            Some(v) if !v.is_none() => v.extract()?,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "a SOLID plan entry holding a tri_mesh must also hold its \
+                     tetra_cache_name; the build planner composes the two together",
+                ))
+            }
+        };
+        if let Some(&earlier) = tet_key_seen.get(&h) {
+            entry.set_item("tetra_reuse_from", earlier)?;
+            let weight: f64 = entry
+                .get_item("tetra_weight")?
+                .map(|v| v.extract().unwrap_or(0.0f64))
+                .unwrap_or(0.0);
+            work_delta -= weight;
+            entry.set_item("tetra_weight", 0.0f64)?;
+        } else {
+            tet_key_seen.insert(h, i);
+            entry.set_item("tetra_reuse_from", py.None())?;
+        }
+    }
+    // Second pass: rebuild the (deduped) jobs list and reassign tetra_index.
+    let jobs = PyList::empty(py);
+    let mut tetra_idx: i64 = 0;
+    for entry_obj in object_entries.iter() {
+        let entry = entry_obj
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each object entry must be a dict"))?;
+        let group_type: String = match entry.get_item("group_type")? {
+            Some(v) => v.extract().unwrap_or_default(),
+            None => String::new(),
+        };
+        let tri_mesh_present = match entry.get_item("tri_mesh")? {
+            Some(v) => !v.is_none(),
+            None => false,
+        };
+        if group_type != "SOLID" || !tri_mesh_present {
+            continue;
+        }
+        let is_reuse = match entry.get_item("tetra_reuse_from")? {
+            Some(v) => !v.is_none(),
+            None => false,
+        };
+        if is_reuse {
+            entry.set_item("tetra_index", py.None())?;
+        } else {
+            tetra_idx += 1;
+            entry.set_item("tetra_index", tetra_idx)?;
+            let name: String = match entry.get_item("name")? {
+                Some(v) => v.extract().unwrap_or_default(),
+                None => String::new(),
+            };
+            let cached: bool = match entry.get_item("tetra_cached")? {
+                Some(v) => v.extract().unwrap_or(false),
+                None => false,
+            };
+            let row = PyDict::new(py);
+            row.set_item("name", name)?;
+            row.set_item("cached", cached)?;
+            jobs.append(row)?;
+        }
+    }
+    Ok((jobs, work_delta))
+}
+
+/// Re-project one side of a 6-slot cross-stitch onto its solver tet
+/// surface. A SOLID object is re-tetrahedralized at build time, so the
+/// snap-time surface indices do not map to the solver mesh; the side's
+/// per-row world anchors (`points_key` in the entry: `"source_points"`
+/// or `"target_points"`) are projected onto the object's tet surface
+/// (`V`/`F` in its `obj_info`) to recover the correct triangle +
+/// barycentric weights.
+///
+/// Returns `(tri_flat, bary_flat)` of length `n_rows * 3`, aligned per row.
+/// A side that cannot be placed is REFUSED, naming the object: anchors
+/// absent or not one per row, or any anchor that finds no triangle on the tet
+/// surface. Keeping the snap-time indices would pull on the wrong vertices,
+/// and dropping the entry would leave a seam the artist authored unformed.
+fn project_stitch_side<'py>(
+    py: Python<'py>,
+    np: &Bound<'py, PyModule>,
+    entry: &Bound<'py, PyDict>,
+    info: &Bound<'py, PyDict>,
+    points_key: &str,
+    n_rows: usize,
+) -> PyResult<(Vec<i64>, Vec<f32>)> {
+    let side = object_name(info);
+    let points = entry.get_item(points_key)?.ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "the stitch's SOLID side '{side}' carries no {points_key}, which \
+             places it on the tetrahedral surface; Re-snap the merge pair"
+        ))
+    })?;
+    let pts_len: usize = points.len()?;
+    if pts_len != n_rows {
+        return Err(PyValueError::new_err(format!(
+            "the stitch's SOLID side '{side}' carries {pts_len} {points_key} \
+             for {n_rows} rows; Re-snap the merge pair"
+        )));
+    }
+    let pos_v = info
+        .get_item("V")?
+        .ok_or_else(|| PyValueError::new_err("solid obj_info missing V"))?;
+    let face_f = info
+        .get_item("F")?
+        .ok_or_else(|| PyValueError::new_err("solid obj_info missing F"))?;
+    let pos: Bound<'py, PyArray2<f64>> = np
+        .call_method1("ascontiguousarray", (
+            np.call_method1("asarray", (pos_v,))?
+                .call_method1("astype", ("float64",))?,
+        ))?
+        .cast_into::<PyArray2<f64>>()
+        .map_err(|_| PyTypeError::new_err("obj_info V must be (N, 3) f64"))?;
+    let face: Bound<'py, PyArray2<i64>> = np
+        .call_method1("ascontiguousarray", (
+            np.call_method1("asarray", (face_f,))?
+                .call_method1("astype", ("int64",))?,
+        ))?
+        .cast_into::<PyArray2<i64>>()
+        .map_err(|_| PyTypeError::new_err("obj_info F must be (M, 3) i64"))?;
+    let anchors: Bound<'py, PyArray2<f64>> = np
+        .call_method1("ascontiguousarray", (
+            np.call_method1("asarray", (points,))?
+                .call_method1("astype", ("float64",))?,
+        ))?
+        .cast_into::<PyArray2<f64>>()
+        .map_err(|_| PyTypeError::new_err("stitch points must be (K, 3) f64"))?;
+    let face_view = face.readonly();
+    let pos_view = pos.readonly();
+    let anchors_view = anchors.readonly();
+    let tf = face_view
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("F must be C-contiguous"))?;
+    let tp = pos_view
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("V must be C-contiguous"))?;
+    let an = anchors_view
+        .as_slice()
+        .map_err(|_| PyTypeError::new_err("points must be C-contiguous"))?;
+    let rows = py.detach(|| dec::barycentric_project_anchors(tf, tp, an));
+    if rows.tri.len() != n_rows {
+        return Err(PyValueError::new_err(format!(
+            "{} of the stitch's {n_rows} points found no triangle on the \
+             tetrahedralized surface of '{side}'",
+            n_rows - rows.tri.len()
+        )));
+    }
+    let mut tri_flat = Vec::with_capacity(n_rows * 3);
+    let mut bary_flat = Vec::with_capacity(n_rows * 3);
+    for r in &rows.tri {
+        tri_flat.extend_from_slice(r);
+    }
+    for r in &rows.bary {
+        bary_flat.extend_from_slice(r);
+    }
+    Ok((tri_flat, bary_flat))
+}
+
+/// An object's name from its `obj_info`, for wording a refusal; its UUID key
+/// is what the payload carries, and the name is what the artist recognizes.
+fn object_name(info: &Bound<'_, PyDict>) -> String {
+    info.get_item("name")
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "(unnamed)".to_string())
+}
+
+/// Apply a batch of explicit cross-stitch entries to a scene's
+/// `_cross_stitch` list. Replaces the per-entry Python `for entry in
+/// param_decoder.cross_stitch: ...` loop in `BlenderApp.make()`
+/// (frontend/_decoder_.py:229) plus the per-call `.append` in
+/// `BlenderApp._apply_explicit_cross_stitch`.
+///
+/// For each entry: validate that source/target are known, run
+/// `barycentric_project_anchors` for SOLID sides, build the canonical dict,
+/// and append it to `scene_cross_stitch`. An entry that cannot be applied
+/// (no rows, a SOLID side that cannot be placed, a stiffness that is not a
+/// number) is refused with the objects' names rather than skipped, so every
+/// entry is either appended or an error.
+///
+/// Returns the count of entries appended, which is every entry.
+#[pyfunction]
+#[pyo3(signature = (entries, obj_info, scene_cross_stitch, verbose))]
+pub fn cross_stitch_apply_batch<'py>(
+    py: Python<'py>,
+    entries: &Bound<'py, PyList>,
+    obj_info: &Bound<'py, PyDict>,
+    scene_cross_stitch: &Bound<'py, PyList>,
+    verbose: bool,
+) -> PyResult<usize> {
+    let np = py.import("numpy")?;
+    let mut appended = 0usize;
+    for entry_obj in entries.iter() {
+        let entry = entry_obj
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each cross_stitch entry must be a dict"))?;
+        let source_name: String = match entry.get_item("source_uuid")? {
+            Some(v) => v.extract().unwrap_or_default(),
+            None => String::new(),
+        };
+        let target_name: String = match entry.get_item("target_uuid")? {
+            Some(v) => v.extract().unwrap_or_default(),
+            None => String::new(),
+        };
+        let source_info = obj_info.get_item(&source_name)?;
+        let target_info = obj_info.get_item(&target_name)?;
+        // Same guard as the rest of the cross-stitch decoder path.
+        dec::validate_cross_stitch_endpoints(
+            &source_name,
+            &target_name,
+            source_info.is_some(),
+            target_info.is_some(),
+        )
+        .map_err(crate::errors::into_py_err)?;
+
+        let ind_raw = entry.get_item("ind")?.unwrap_or_else(|| py.None().into_bound(py));
+        let w_raw = entry.get_item("w")?.unwrap_or_else(|| py.None().into_bound(py));
+        let mut ind_arr: Bound<'py, PyAny> = np
+            .call_method1("asarray", (ind_raw,))?
+            .call_method1("astype", ("int64",))?;
+        let mut w_arr: Bound<'py, PyAny> = np
+            .call_method1("asarray", (w_raw,))?
+            .call_method1("astype", ("float32",))?;
+        let target_info_dict = target_info
+            .expect("validated above")
+            .cast_into::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("target obj_info entry must be a dict"))?;
+        let source_info_dict = source_info
+            .expect("validated above")
+            .cast_into::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("source obj_info entry must be a dict"))?;
+        let pair = format!(
+            "the stitch between '{}' and '{}'",
+            object_name(&source_info_dict),
+            object_name(&target_info_dict),
+        );
+        let ind_len: usize = ind_arr.len()?;
+        let w_len: usize = w_arr.len()?;
+        if ind_len == 0 || w_len == 0 || ind_len != w_len {
+            return Err(PyValueError::new_err(format!(
+                "{pair} has {ind_len} index rows and {w_len} weight rows; \
+                 Re-snap the merge pair or remove it"
+            )));
+        }
+        let target_is_solid = match target_info_dict.get_item("type")? {
+            Some(t) => t.extract::<String>().unwrap_or_default() == "SOLID",
+            None => false,
+        };
+        let source_is_solid = match source_info_dict.get_item("type")? {
+            Some(t) => t.extract::<String>().unwrap_or_default() == "SOLID",
+            None => false,
+        };
+
+        // Read the 6-wide baseline rows the snap encoder produced: source
+        // slots [0..2] = degenerate [si, si, si] / [1, 0, 0], target slots
+        // [3..5] = the snap-time target barycentric. A SOLID side does not
+        // map its snap-time surface indices to the solver tet mesh, so it
+        // is re-projected below; a non-SOLID (SHELL/ROD) side keeps its
+        // snap-time slots verbatim (its mesh == the solver mesh).
+        let base_ind: Vec<i64> = {
+            let a = np
+                .call_method1("ascontiguousarray", (
+                    np.call_method1("asarray", (&ind_arr,))?
+                        .call_method1("astype", ("int64",))?,
+                ))?
+                .cast_into::<PyArray2<i64>>()
+                .map_err(|_| PyTypeError::new_err("cross stitch ind must be (K, 6) int64"))?;
+            let v = a.readonly();
+            let s = v.shape();
+            if s.len() != 2 || s[1] != 6 {
+                return Err(PyValueError::new_err(format!(
+                    "cross stitch ind must be (K, 6), got {s:?}"
+                )));
+            }
+            v.as_slice()
+                .map_err(|_| PyTypeError::new_err("cross stitch ind must be C-contiguous"))?
+                .to_vec()
+        };
+        let base_w: Vec<f32> = {
+            let a = np
+                .call_method1("ascontiguousarray", (
+                    np.call_method1("asarray", (&w_arr,))?
+                        .call_method1("astype", ("float32",))?,
+                ))?
+                .cast_into::<PyArray2<f32>>()
+                .map_err(|_| PyTypeError::new_err("cross stitch w must be (K, 6) float32"))?;
+            let v = a.readonly();
+            let s = v.shape();
+            if s.len() != 2 || s[1] != 6 {
+                return Err(PyValueError::new_err(format!(
+                    "cross stitch w must be (K, 6), got {s:?}"
+                )));
+            }
+            v.as_slice()
+                .map_err(|_| PyTypeError::new_err("cross stitch w must be C-contiguous"))?
+                .to_vec()
+        };
+        let n_rows = base_ind.len() / 6;
+
+        // A SOLID side's snap-time surface indices do not map to its solver
+        // mesh, so it is placed from its recorded points; one that cannot be
+        // placed is refused inside project_stitch_side.
+        let src_proj = if source_is_solid {
+            Some(project_stitch_side(py, &np, entry, &source_info_dict, "source_points", n_rows)?)
+        } else {
+            None
+        };
+        let tgt_proj = if target_is_solid {
+            Some(project_stitch_side(py, &np, entry, &target_info_dict, "target_points", n_rows)?)
+        } else {
+            None
+        };
+
+        // Merge: source slots [0..2] from src_proj or the baseline,
+        // target slots [3..5] from tgt_proj or the baseline.
+        let mut ind_flat: Vec<i64> = Vec::with_capacity(n_rows * 6);
+        let mut w_flat: Vec<f32> = Vec::with_capacity(n_rows * 6);
+        for r in 0..n_rows {
+            match &src_proj {
+                Some((tri, bary)) => {
+                    ind_flat.extend_from_slice(&tri[3 * r..3 * r + 3]);
+                    w_flat.extend_from_slice(&bary[3 * r..3 * r + 3]);
+                }
+                None => {
+                    ind_flat.extend_from_slice(&base_ind[6 * r..6 * r + 3]);
+                    w_flat.extend_from_slice(&base_w[6 * r..6 * r + 3]);
+                }
+            }
+            match &tgt_proj {
+                Some((tri, bary)) => {
+                    ind_flat.extend_from_slice(&tri[3 * r..3 * r + 3]);
+                    w_flat.extend_from_slice(&bary[3 * r..3 * r + 3]);
+                }
+                None => {
+                    ind_flat.extend_from_slice(&base_ind[6 * r + 3..6 * r + 6]);
+                    w_flat.extend_from_slice(&base_w[6 * r + 3..6 * r + 6]);
+                }
+            }
+        }
+        let ind_new = ndarray::Array2::<i64>::from_shape_vec((n_rows, 6), ind_flat)
+            .map_err(|e| PyValueError::new_err(format!("ind reshape: {e}")))?
+            .into_pyarray(py);
+        let w_new = ndarray::Array2::<f32>::from_shape_vec((n_rows, 6), w_flat)
+            .map_err(|e| PyValueError::new_err(format!("w reshape: {e}")))?
+            .into_pyarray(py);
+        ind_arr = ind_new.into_any();
+        w_arr = w_new.into_any();
+
+        let stitch_stiffness: f64 = match entry.get_item("stitch_stiffness")? {
+            Some(v) => v.extract().map_err(|_| {
+                PyValueError::new_err(format!(
+                    "{pair} carries a stitch_stiffness that is not a number"
+                ))
+            })?,
+            None => 1.0f64,
+        };
+        let row = PyDict::new(py);
+        row.set_item("source_name", &source_name)?;
+        row.set_item("target_name", &target_name)?;
+        row.set_item("ind", &ind_arr)?;
+        row.set_item("w", &w_arr)?;
+        row.set_item("stitch_stiffness", stitch_stiffness)?;
+        scene_cross_stitch.append(row)?;
+        appended += 1;
+        if verbose {
+            let n_ind = ind_arr.len()?;
+            println!(
+                "  Stitch {source_name} -> {target_name}: {n_ind} edges (explicit)"
+            );
+        }
+    }
+    Ok(appended)
+}
+
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(apply_transform_4x4, m)?)?;
+    m.add_function(wrap_pyfunction!(summarize_tetra_jobs, m)?)?;
+    m.add_function(wrap_pyfunction!(barycentric_project_anchors, m)?)?;
+    m.add_function(wrap_pyfunction!(solid_orig_to_sim, m)?)?;
+    m.add_function(wrap_pyfunction!(blender_app_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(app_state_persist_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_pickle_extension, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_param_top_keys, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_pin_op_types, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_invisible_collider_thickness, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_param_group_has_uuids, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_param_object_uuid, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_scene_object_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(closest_vertex_index, m)?)?;
+    m.add_function(wrap_pyfunction!(keyframe_translation_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_static_anim_xor_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_static_op_type, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_rod_has_edges, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_group_type, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_mesh_ref_known, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_object_has_mesh, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_stitch_apply_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(dedup_and_rebuild_tetra_jobs, m)?)?;
+    Ok(())
+}

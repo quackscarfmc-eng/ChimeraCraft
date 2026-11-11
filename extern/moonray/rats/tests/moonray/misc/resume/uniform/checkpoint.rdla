@@ -1,0 +1,39 @@
+rats_assets_dir = os.getenv("RATS_ASSETS_DIR")
+
+SceneVariables {
+    ["checkpoint_active"] = true,
+    ["checkpoint_interval"] = 0.1,
+    ["checkpoint_sample_cap"] = 8,
+    ["output_file"] = "checkpoint_result.exr",
+}
+
+RenderOutput("/output/alpha") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+
+RenderOutput("/output/beauty") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+
+RenderOutput("/output/weight") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+
+RenderOutput("/output/beautyaux") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+
+RenderOutput("/output/alphaAux") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+
+RenderOutput("/output/exposure") {
+    ["file_name"] = "checkpoint_result0.exr",
+    ["checkpoint_file_name"] = "checkpoint.exr",
+}
+

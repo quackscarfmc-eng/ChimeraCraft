@@ -1,0 +1,71 @@
+QWidget {
+    color: white;
+    font-size: 15px;
+}
+
+QSpinBox {
+    background-color: #333333;
+    width: 50px;
+}
+
+QSpinBox:disabled {
+    background-color: #121212;
+    color: grey;
+    width: 50px;
+}
+
+*[class~="button"] {
+    background-color: #b8d3ff;
+    color: black;
+    border-radius: 5px;
+    margin: 10px;
+    width: 70px;
+    padding: 5px;
+}
+
+QPushButton:hover {
+    background-color: #98b9ed;
+}
+
+*[class~="header"] {
+    background-color: #787878;
+    padding:5px;
+    font: bold 16px;
+    margin-top: 5px;
+}
+
+QSlider {
+    height: 25px;
+}
+
+QSlider::handle:horizontal {
+    background-color: #51A0D5;
+    width: 15px;
+    height: 25px;
+    border-radius: 4px;
+    margin: -5px 0px; /* Adjust margin if handle extends beyond groove */
+}
+
+QSlider::groove {
+    border: 1px solid #808080;
+    background: #2e2e2e;
+    height: 20px;
+    border-radius: 4px;
+}
+
+QCheckBox {
+    margin: 3px;
+}
+
+QCheckBox::indicator {
+    border: 1px solid #808080;
+    border-radius: 4px;
+    width: 15px;
+    height: 15px;
+    background-color: #2e2e2e;
+}
+
+QCheckBox::indicator::checked {
+    background-color: #789c81;
+    border: 1px solid #85eda1;
+}

@@ -1,0 +1,487 @@
+// Copyright 2023-2024 DreamWorks Animation LLC
+// SPDX-License-Identifier: Apache-2.0
+
+/// @file Math.isph
+/// @brief
+/// general math functions that are not specific to a particular type
+
+/**
+ * @mainpage
+ *
+ * @section intro_sec Introduction
+ * This is the ISPC math library for the Moonray core renderer.  It is
+ * composed of the basic math structures, typedefs, functions, and constants
+ * needed to implement an MCRT renderer.  The motivating requirements in its
+ * implementation are performance, exhaustive correctness testing
+ * and the avoidance of code duplication.  It is _not_ meant as an 
+ * example of how to write clean, readable ISPC code any more than the
+ * STL headers are meant as an example of how to write clean, readable
+ * C++ code.  If you want to learn to use the library, do not try to do
+ * so by reading the headers or looking at the unit tests.
+ *
+ * @section precision_sec Precision
+ * The math library only supports single precision.  Most of the types
+ * and functions are implemented using macros where the 'float' type is
+ * taken as an argument.  Extending to double precision is possible.  In fact,
+ * the library originally supported double and float, but double was removed
+ * due to lack of use and the associated higher maintenance costs. (If
+ * you need to implement double precision, check back in the git history).
+ * Most types end with the 'f' symbol to indicate single precision.  Double precision
+ * types would have the 'd' suffix.
+ *
+ * @section organization_sec Organziation
+ * The math library is organized around a set of structures.  For the most
+ * part, each important structure has its own .isph include file.  Within that
+ * file, the structure is defined along with its functions and operators.  For
+ * example, Vec3.isph defines the Vec3f struct along with the
+ * functions and operators that are relevant to it.  Numeric constants
+ * are defined in Constants.isph while functions and types that don't
+ * really warrant their own file can be found in the generic Math.isph file.
+ *
+ * @section tutorial_sec Tutorial
+ * \code
+ * #include <Color.isph>
+ * #include <Xform.isph>
+ *
+ * varying bool
+ * magnitudeOfSumGreaterThan1(const varying Color c0, const varying Color c1)
+ * {
+ *    // the library makes extensive use of operator overloading
+ *    // generally, if it makes sense to add, subtract, multiply,
+ *    // or divide types, an operator overload exists to accomplish
+ *    // the task.
+ *    Color sum = c0 + c1;
+ *
+ *    // Colors don't have a 'magnitude' function.  But Vec3
+ *    // has a length function, which will do exactly what
+ *    // we want.  The 'asA' functions in asA.isph can be used
+ *    // to cast compatible types.  In this case we cast
+ *    // Color to a Vec3f and call its length function.
+ *    varying float mag = length(asAVec3f(sum));
+ *
+ *    // and now return our result
+ *    return mag > 1.;
+ * }
+ *
+ * varying Vec3f
+ * scaleThenRotateThenTranslate(const varying Vec3f scale,
+ *                              const varying Vec3f rotAxis,
+ *                              const varying float rotAngle,
+ *                              const varying Vec3f trans,
+ *                              const varying Vec3f point)
+ * {
+ *     Xform3f xform = Xform3f_scale(scale)                 *
+ *                     Xform3f_rotate(rotateAxis, rotAngle) *
+ *                     Xform3f_translate(trans);
+ *     
+ *     // an xform3 is essentially a 4 row, 3 col matrix
+ *     // hence there isn't a vec3 * xform3 operator.  instead
+ *     // we use the 'transformPoint' function which is
+ *     // overloaded to take an Xform3f initial parameter.
+ *     varying Vec3f result = transformPoint(xform3, point);
+ *
+ *     return result;
+ * }
+ *    
+ * \endcode
+ *
+ * @section todo_sec TODO
+ * Moonray's ISPC math library is based on the scene_rdl2 c++ common math library.
+ * It is not a direct port, C++ and ISPC are just too different for that to
+ * make complete sense.  But is does aim to be at least functionally
+ * equivalent.  In that vain, the following features are missing, would make
+ * good additions and must be added before the library can be considered
+ * complete.  Not all missing features from the c++ version are listed, as
+ * not all of them are appropriate (e.g. they may duplicate functions that
+ * already exist in the ISPC standard library.)
+ * - BBox.isph bounding box struct and methods
+ * - Mat3.isph some missing methods related to Mat3
+ *    - quat() convert a rotation matrix to a quaternion
+ *    - row0(), row1(), row2() convenience methods
+ *    - col0(), col1(), col2() consruct Vec3 cols on the fly
+ *    - frame() construct a coordinate frame from a normal
+ *    - slerp() slerp between two rotation matrices
+ * - Math.isph some missing common math functions
+ *    - sign()  (but see ISPC's built-in function signbits())
+ *    - sq()
+ *    - Merge in some functions from MathUtil.h
+ *       - solve2x2LinearSystem()
+ *       - computeTrianglePartialDerivatives()
+ *
+ * Note that Random and Permutation are intentionally omitted.
+ */
+#pragma once
+
+#include "Constants.isph"
+#include "Transcendental.isph"
+
+// bool isEqual(float, float, float)
+inline uniform bool isEqual(const uniform float x, const uniform float y, const uniform float tol)
+{
+    return (abs(x-y) <= max(abs(x), 1.0f) * tol);
+}
+
+// bool isEqual(float, float, float)
+inline varying bool isEqual(const varying float x, const varying float y, const varying float tol)
+{
+    return (abs(x-y) <= max(abs(x), 1.0f) * tol);
+}
+
+// bool isEqual(float, float)
+inline uniform bool isEqual(const uniform float x, const uniform float y)
+{
+    return isEqual(x, y, sEpsilon);
+}
+
+// bool isEqual(float, float)
+inline varying bool isEqual(const varying float x, const varying float y)
+{
+    return isEqual(x, y, sEpsilon);
+}
+
+// bool isEqualFixedEps(float, float, float)
+inline uniform bool isEqualFixedEps(const uniform float x, const uniform float y, const uniform float tol)
+{
+    return (abs(x-y) <= tol);
+}
+
+// bool isEqualFixedEps(float, float, float)
+inline varying bool isEqualFixedEps(const varying float x, const varying float y, const varying float tol)
+{
+    return (abs(x-y) <= tol);
+}
+
+// bool isEqualFixedEps(float, float)
+inline uniform bool isEqualFixedEps(const uniform float x, const uniform float y)
+{
+    return isEqualFixedEps(x, y, sEpsilon);
+}
+
+// bool isEqualFixedEps(float, float)
+inline varying bool isEqualFixedEps(const varying float x, const varying float y)
+{
+    return isEqualFixedEps(x, y, sEpsilon);
+}
+
+// bool isZero(float, float)
+inline uniform bool isZero(const uniform float x, const uniform float tol)
+{
+    return (abs(x) <= tol);
+}
+
+// bool isZero(float, float)
+inline varying bool isZero(const varying float x, const varying float tol)
+{
+    return (abs(x) <= tol);
+}
+
+// bool isZero(float)
+inline uniform bool isZero(const uniform float x)
+{
+    return isZero(x, sEpsilon);
+}
+
+// bool isZero(float, float)
+inline varying bool isZero(const varying float x)
+{
+    return isZero(x, sEpsilon);
+}
+
+// bool isOne(float, float)
+inline uniform bool isOne(const uniform float x, const uniform float tol)
+{
+    return (abs(1.0f - x) <= tol);
+}
+
+// bool isOne(float, float)
+inline varying bool isOne(const varying float x, const varying float tol)
+{
+    return (abs(1.0f - x) <= tol);
+}
+
+// bool isOne(float)
+inline uniform bool isOne(const uniform float x)
+{
+    return isOne(x, sEpsilon);
+}
+
+// bool isOne(float, float)
+inline varying bool isOne(const varying float x)
+{
+    return isOne(x, sEpsilon);
+}
+
+// bool isNormalizedLengthSqr(float)
+inline uniform bool isNormalizedLengthSqr(const uniform float x)
+{
+    return (x > sNormalizedLengthSqrMin && x < sNormalizedLengthSqrMax);
+}
+
+// bool isNormalizedLengthSqr(float)
+inline varying bool isNormalizedLengthSqr(const varying float x)
+{
+    return (x > sNormalizedLengthSqrMin && x < sNormalizedLengthSqrMax);
+}
+
+// unsigned int privateGet754Fraction(float)
+inline uniform unsigned int privateGet754Fraction(const uniform float x)
+{
+    return intbits(x) & 0x7FFFFFu;
+}
+
+// unsigned int privateGet754Fraction(float)
+inline varying unsigned int privateGet754Fraction(const varying float x)
+{
+    return intbits(x) & 0x7FFFFFu;
+}
+
+// unsigned int privateGet754BiasedExponent(float)
+inline uniform unsigned int privateGet754BiasedExponent(const uniform float x)
+{
+    return (intbits(x) >> 23) & 0xFFu;
+}
+
+// unsigned int privateGet754BiasedExponent(float)
+inline varying unsigned int privateGet754BiasedExponent(const varying float x)
+{
+    return (intbits(x) >> 23) & 0xFFu;
+}
+
+// bool issubnormal(float)
+inline uniform unsigned int issubnormal(const uniform float x)
+{
+    return (privateGet754BiasedExponent(x) == 0);
+}
+
+// bool issubnormal(float)
+inline varying unsigned int issubnormal(const varying float x)
+{
+    return (privateGet754BiasedExponent(x) == 0);
+}
+
+// bool isinf(float)
+inline uniform unsigned int isinf(const uniform float x)
+{
+    return (privateGet754BiasedExponent(x) == 0xFFu && privateGet754Fraction(x) == 0);
+}
+
+// bool isinf(float)
+inline varying unsigned int isinf(const varying float x)
+{
+    return (privateGet754BiasedExponent(x) == 0xFFu && privateGet754Fraction(x) == 0);
+}
+
+// bool isfinite(float)
+inline uniform unsigned int isfinite(const uniform float x)
+{
+    return (!isnan(x) && !isinf(x));
+}
+
+// bool isfinite(float)
+inline varying unsigned int isfinite(const varying float x)
+{
+    return (!isnan(x) && !isinf(x));
+}
+
+// bool isnormal(float)
+inline uniform unsigned int isnormal(const uniform float x)
+{
+    return (x != 0.0f && isfinite(x) && !issubnormal(x));
+}
+
+// bool isnormal(float)
+inline varying unsigned int isnormal(const varying float x)
+{
+    return (x != 0.0f && isfinite(x) && !issubnormal(x));
+}
+
+// float trunc(float)
+inline uniform float trunc(const uniform float x)
+{
+    return (x > 0) ? floor(x) : ceil(x);
+}
+
+// float trunc(float)
+inline varying float trunc(const varying float x)
+{
+    return (x > 0) ? floor(x) : ceil(x);
+}
+
+// float lerp(float, float, float)
+inline uniform float lerp(const uniform float x0, const uniform float x1, const uniform float t)
+{
+    return (1.0f - t) * x0 + t * x1;
+}
+
+// float lerp(float, float, float)
+inline varying float lerp(const varying float x0, const varying float x1, const varying float t)
+{
+    return (1.0f - t) * x0 + t * x1;
+}
+
+// float bilerp(float, float, float, float, float, float)
+inline uniform float bilerp(const uniform float x00, const uniform float x01,
+                            const uniform float x10, const uniform float x11,
+                            const uniform float s,   const uniform float t)
+{
+    return lerp(lerp(x00, x01, s), lerp(x10, x11, s), t);
+}
+
+// float bilerp(float, float, float, float, float, float)
+inline varying float bilerp(const varying float x00, const varying float x01,
+                            const varying float x10, const varying float x11,
+                            const varying float s,   const varying float t)
+{
+    return lerp(lerp(x00, x01, s), lerp(x10, x11, s), t);
+}
+
+// float deg2rad(float deg)
+inline uniform float deg2rad(const uniform float deg)
+{
+    return deg * (sPi / 180.0f);
+}
+
+// float deg2rad(float deg)
+inline varying float deg2rad(const varying float deg)
+{
+    return deg * (sPi / 180.0f);
+}
+
+// float rad2deg(float rad)
+inline uniform float rad2deg(const uniform float rad)
+{
+    return rad * (180.0 / sPi);
+}
+
+// float rad2deg(float rad)
+inline varying float rad2deg(const varying float rad)
+{
+    return rad * (180.0 / sPi);
+}
+
+// float bias(float val, float bias)
+// The classic PDI lib/shading definition of "bias"
+inline uniform float bias(const uniform float val, const uniform float bias_)
+{
+    if (bias_ == 0.5f || val <= 0.0f || val >= 1.0f)
+        return val;
+    else if (bias_ <= 0.0f)
+        return 0.0f;
+    else return pow(val, log(bias_) * (1.0f / log(0.5f)));
+}
+
+// float bias(float val, float bias)
+// The classic PDI lib/shading definition of "bias"
+inline varying float bias(const varying float val, const varying float bias_)
+{
+    if (bias_ == 0.5f || val <= 0.0f || val >= 1.0f)
+        return val;
+    else if (bias_ <= 0.0f)
+        return 0.0f;
+    else return pow(val, log(bias_) * (1.0f / log(0.5f)));
+}
+
+// Fast approximation of bias
+// Christophe Schlick. Fast alternatives to perlin’s bias and gain
+// functions. Graphics Gems, 4, 1994
+inline varying float bias_Schlick(const varying float val, const varying float b)
+{
+    if (b <= 0.0f) return 0.0f;
+    if (b >= 1.0f) return 1.0f;
+    float bv = b * val;
+    return bv / ((1.0f - b)*(1.0f - val) + bv);
+}
+
+// float gain(float val, float gain)
+// The classic PDI lib/shading definition of "gain"
+inline uniform float gain(const uniform float val, const uniform float gain_)
+{
+    if (gain_ == 0.5f)
+        return val;
+    else if (val < 0.5f)
+        return bias(2.0f * val, 1.0f - gain_) * 0.5f;
+    else return 1.0f - bias(2.0f - 2.0f * val, 1.0f - gain_) * 0.5f;
+}
+
+// float gain(float val, float gain)
+// The classic PDI lib/shading definition of "gain"
+inline varying float gain(const varying float val, const varying float gain_)
+{
+    if (gain_ == 0.5f)
+        return val;
+    else if (val < 0.5f)
+        return bias(2.0f * val, 1.0f - gain_) * 0.5f;
+    else return 1.0f - bias(2.0f - 2.0f * val, 1.0f - gain_) * 0.5f;
+}
+
+#if ISPC_MAJOR_VERSION == 1 && ISPC_MINOR_VERSION < 26
+// ISPC 1.26 and newer have fmod() as a builtin and this definition clashes
+
+// float fmod(float, float)
+inline uniform float fmod(const uniform float x, const uniform float y)
+{
+    MNRY_ASSERT(!isEqual(y, 0.0f));
+    return x - trunc(x/y) * y;
+}
+
+// float fmod(float, float)
+inline varying float fmod(const varying float x, const varying float y)
+{
+    MNRY_ASSERT(!isEqual(y, 0.0f));
+    return x - trunc(x/y) * y;
+}
+
+#endif
+
+// float saturate(float)
+inline uniform float saturate(const uniform float x)
+{
+    return clamp(x, 0.0f, 1.0f);
+}
+
+// float saturate(float)
+inline varying float saturate(const varying float x)
+{
+    return clamp(x, 0.0f, 1.0f);
+}
+
+// float copysign(float, float)
+// Composes a value with the magnitude of x and the sign of y
+inline uniform float copysign(const uniform float x, const uniform float y)
+{
+    return floatbits((intbits(x) & 0x7fffffff) | (intbits(y) & 0x80000000));
+}
+
+// float copysign(float, float)
+// Composes a value with the magnitude of x and the sign of y
+inline varying float copysign(const varying float x, const varying float y)
+{
+    return floatbits((intbits(x) & 0x7fffffff) | (intbits(y) & 0x80000000));
+}
+
+// float = erf(float)
+// Algorithm 7.1.25 in Abromowitz and Stegun, Handbook of Mathematical
+// Functions With Formulas, Graphs, and Mathematical Tables (pg. 299)
+// (maximum error: 2.5e-05)
+// http://www.math.ubc.ca/~cbm/aands/abramowitz_and_stegun.pdf (pg. 88)
+static const uniform float sErfP  =  0.47047f;  
+static const uniform float sErfA1 =  0.3480242f;
+static const uniform float sErfA2 = -0.0958798f;
+static const uniform float sErfA3 =  0.7478556f;
+
+// float erf(float)
+inline uniform float erf(const uniform float x)
+{
+    const uniform float y  = 1.0f / (1.0f + sErfP * abs(x));
+    const uniform float z  = 1.0f - y * (sErfA1 + y * (sErfA2 + y * sErfA3)) * exp(-x*x);
+    return copysign(z, x);
+}
+
+// float erf(float)
+inline varying float erf(const varying float x)
+{
+    const varying float y  = 1.0f / (1.0f + sErfP * abs(x));
+    const varying float z  = 1.0f - y * (sErfA1 + y * (sErfA2 + y * sErfA3)) * exp(-x*x);
+    return copysign(z, x);
+}
+

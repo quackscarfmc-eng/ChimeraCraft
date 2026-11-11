@@ -1,0 +1,15 @@
+{
+    "attributes" : 
+    {
+        "positionAttr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "position", 
+            "type" : "Vec3f",
+            "comment" : "the 3D position at which the cell noise is evaluated"
+        }
+    },
+    "name" : "ND_cellnoise3d_float",
+    "type" : "Map"
+}

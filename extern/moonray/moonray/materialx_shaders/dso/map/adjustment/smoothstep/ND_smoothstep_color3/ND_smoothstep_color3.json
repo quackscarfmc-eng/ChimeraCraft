@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+{
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgb"
+        },
+        "lowAttr" : 
+        {
+            "default" : "Rgb(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "low",
+            "type" : "Rgb"
+        },
+        "highAttr" : 
+        {
+            "default" : "Rgb(1.0f, 1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "high",
+            "type" : "Rgb"
+        }
+    },
+    "name" : "ND_smoothstep_color3",
+    "type" : "Map"
+}

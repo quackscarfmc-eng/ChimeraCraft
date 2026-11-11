@@ -1,0 +1,45 @@
+# License: GPL-3.0-or-later
+# Reconnect cycles: assert the addon/server can survive multiple
+# disconnect/reconnect rounds without losing state-on-disk hashes,
+# and that runs continue to work each time.
+
+from __future__ import annotations
+from . import _chain_lib as cl
+from . import _runner as r
+
+NEEDS_BLENDER = True
+
+# RUNS ON THE REAL BACKEND, established by RUNNING it rather than by reading
+# it. A full rig sweep against a CPU build passed it, and that run is the
+# evidence this line rests on.
+BACKENDS = ("real",)
+
+# Chain scenarios hold the solver/server boundary across multiple
+# cycles; under parallel host load the cumulative timing slack runs
+# out and reconnect races trip. Always run serially after the
+# parallel batch.
+NOT_PARALLELIZABLE = True
+
+SEQUENCE = (
+    "connect", "transfer", "verify_idle",
+    "run", "fetch", "verify_pc2",
+    "disconnect", "reconnect", "verify_idle",
+    "run", "fetch", "verify_pc2",
+    "disconnect", "reconnect", "verify_idle",
+    "clear_animation", "verify_no_pc2",
+    "run", "fetch", "verify_pc2",
+)
+
+
+def build_driver(ctx: r.ScenarioContext) -> str:
+    return cl.build_chain_driver(
+        ctx, project_name="chain_reconnect",
+        mesh_name="ChainReconnectMesh", sequence=SEQUENCE,
+    )
+
+
+def run(ctx: r.ScenarioContext) -> dict:
+    result, err = r.wait_blender_result(ctx, timeout=max(ctx.timeout, 480.0))
+    if err is not None:
+        return err
+    return r.report_named_checks(result.get("checks", {}))

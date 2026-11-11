@@ -1,0 +1,18 @@
+# Copyright 2025 DreamWorks Animation LLC
+# SPDX-License-Identifier: Apache-2.0
+
+# This tests the ability of the RenderOutput objects to output material aovs with labels
+
+add_rats_test(
+    INPUTS
+        ../common.rdla
+        scene.rdla
+    CANONICALS
+        albedo.exr
+        color.exr
+        roughness.exr
+        metal.exr
+        matte.exr
+        normal.exr
+)
+

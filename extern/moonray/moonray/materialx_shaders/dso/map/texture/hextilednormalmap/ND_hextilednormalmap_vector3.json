@@ -1,0 +1,125 @@
+{
+    "attributes" :
+    {
+        "defaultAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "default" : "Rgb(0.5f, 0.5f, 1.0f)",
+            "label" : "Default Color",
+            "name" : "default",
+            "type" : "Rgb"
+        },
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "falloffAttr" :
+        {
+            "default" : "0.5f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "falloff",
+            "type" : "Float"
+        },
+        "fileAttr" :
+        {
+            "label" : "Filename",
+            "name" : "file",
+            "type" : "String"
+        },
+        "flip_gAttr" :
+        {
+            "label" : "Flip G",
+            "name" : "flip_g",
+            "type" : "Bool",
+            "default" : "false"
+        },
+        "normalAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "normal",
+            "type" : "Vec3f"
+        },
+        "offsetAttr" :
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "offset",
+            "type" : "Float"
+        },
+        "offsetrangeAttr" :
+        {
+            "default" : "Vec2f(0.0f, 1.0f)",
+            "label" : "Offset Range",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "offsetrange",
+            "type" : "Vec2f"
+        },
+        "rotationAttr" :
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "rotation",
+            "type" : "Float"
+        },
+        "rotationrangeAttr" :
+        {
+            "default" : "Vec2f(0.0f, 360.0f)",
+            "label" : "Rotation Range",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "rotationrange",
+            "type" : "Vec2f"
+        },
+        "scaleAttr" :
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "scale",
+            "type" : "Float"
+        },
+        "scalerangeAttr" :
+        {
+            "default" : "Vec2f(0.5f, 2.0f)",
+            "label" : "Scale Range",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "scalerange",
+            "type" : "Vec2f"
+        },
+        "strengthAttr" :
+        {
+            "default" : "1.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "strength",
+            "type" : "Float"
+        },
+        "tangentAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "tangent",
+            "type" : "Vec3f"
+        },
+        "bitangentAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bitangent",
+            "type" : "Vec3f"
+        },
+        "texcoordAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Texture Coordinates",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "tilingAttr" :
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "tiling",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_hextilednormalmap_vector3",
+    "type" : "Map"
+}

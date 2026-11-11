@@ -1,0 +1,34 @@
+{
+    "attributes" : 
+    {
+        "bgAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "bg",
+            "type" : "Vec2f"
+        },
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fgAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "fg",
+            "type" : "Vec2f"
+        },
+        "mixAttr" : 
+        {
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "mix",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_mix_vector2",
+    "type" : "Map"
+}

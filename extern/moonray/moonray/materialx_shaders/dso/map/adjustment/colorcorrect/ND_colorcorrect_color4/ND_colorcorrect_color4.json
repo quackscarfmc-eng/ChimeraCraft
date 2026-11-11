@@ -1,0 +1,84 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Rgba(1.0f, 1.0f, 1.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Rgba"
+        },
+        "hueAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "hue",
+            "type" : "Float"
+        },
+        "saturationAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "saturation",
+            "type" : "Float"
+        },
+        "gammaAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Float"
+        },
+        "liftAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "lift",
+            "type" : "Float"
+        },
+        "gainAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gain",
+            "type" : "Float"
+        },
+        "contrastAttr" :
+        {
+            "default" : 1.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "contrast",
+            "type" : "Float"
+        },
+        "contrastpivotAttr" :
+        {
+            "default" : 0.5,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "contrastpivot",
+            "type" : "Float"
+        },
+        "exposureAttr" :
+        {
+            "default" : 0.0,
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "exposure",
+            "type" : "Float"
+        }
+    },
+    "name" : "ND_colorcorrect_color4",
+    "outputAttributes" :
+    {
+        "outAttr" :
+        {
+            "name" : "out",
+            "type" : "Rgba"
+        }
+    },
+    "type" : "Map"
+}

@@ -1,0 +1,435 @@
+# File: ui_lists.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import bpy  # pyright: ignore
+
+from bpy.types import UIList  # pyright: ignore
+
+from bpy.app.translations import pgettext_iface as iface_, pgettext_tip as tip_
+
+from ...models.groups import GROUP_TYPE_ICONS
+from ..state import decode_vertex_group_identifier
+
+
+class OBJECT_UL_AssignedObjectsList(UIList):
+    """UI List for assigned objects"""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        # Determine icon based on group type
+        group = data  # data is the group object
+        object_icon = GROUP_TYPE_ICONS.get(group.object_type, {}).get(
+            "object", "MESH_DATA"
+        )
+
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...core.uuid_registry import get_object_by_uuid
+            obj = get_object_by_uuid(item.uuid) if item.uuid else None
+            if obj:
+                row = layout.row()
+                row.prop(item, "included", text="")
+                row.prop(obj, "name", text="", emboss=False, icon=object_icon)
+            else:
+                row = layout.row()
+                row.prop(item, "included", text="")
+                row.label(text=iface_("{name} (Missing)").format(name=item.name), icon="ERROR")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon=object_icon)
+
+
+class OBJECT_UL_IntersectionAllowanceObjectsList(UIList):
+    """UI List for the objects one intersection allowance is narrowed to.
+
+    An entry is an object reference stored by uuid, so three states are
+    drawn apart: the object is in the scene and still assigned to this
+    group, it is in the scene but no longer in the group, or it is gone.
+    Only the first reaches the solver. The other two are shown rather than
+    dropped, because they are what a user sees after removing an object from
+    the group by accident, and a silently shortened list would hide it.
+    """
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...core.uuid_registry import get_object_by_uuid
+
+            obj = get_object_by_uuid(item.uuid) if item.uuid else None
+            row = layout.row(align=True)
+            if obj is None:
+                row.label(
+                    text=iface_("{name} (Missing)").format(name=item.name),
+                    icon="ERROR",
+                )
+                return
+            in_group = any(
+                assigned.uuid == item.uuid for assigned in data.assigned_objects
+            )
+            if in_group:
+                row.label(text=obj.name, icon="OBJECT_DATA")
+            else:
+                row.label(
+                    text=iface_("{name} (Not in Group)").format(name=obj.name),
+                    icon="ERROR",
+                )
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="OBJECT_DATA")
+
+
+class OBJECT_UL_PinVertexGroupsList(UIList):
+    """UI List for pin vertex groups"""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...core.uuid_registry import resolve_pin, get_object_by_uuid
+            # Resolve object + VG renames before drawing
+            resolve_pin(item)
+            _, vg_name = decode_vertex_group_identifier(item.name)
+            obj = get_object_by_uuid(item.object_uuid) if item.object_uuid else None
+            row = layout.row(align=True)
+            if obj and vg_name:
+                has_pin = False
+                if obj.type == "MESH" and obj.vertex_groups.get(vg_name):
+                    has_pin = True
+                elif obj.type == "CURVE" and obj.get(f"_pin_{vg_name}"):
+                    has_pin = True
+                elif obj.type == "CURVES":
+                    from ...core.hair_curves import pin_exists
+                    has_pin = pin_exists(obj, vg_name)
+                if has_pin:
+                    row.label(text=f"[{obj.name}][{vg_name}]", icon="GROUP_VERTEX")
+                else:
+                    row.label(
+                        text=iface_("[{name}][{group}] (Missing)").format(name=obj.name, group=vg_name), icon="ERROR"
+                    )
+            else:
+                row.label(text=item.name, icon="ERROR")
+            # Per-pin viewport visibility (eye), default open. Replaces the
+            # former group-level "Show Pins" checkbox.
+            row.prop(
+                item, "show_overlay", text="", emboss=False,
+                icon="HIDE_OFF" if item.show_overlay else "HIDE_ON",
+            )
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="GROUP_VERTEX")
+
+
+class OBJECT_UL_PinOperationsList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        row = layout.row(align=True)
+        # EMBEDDED_MOVE is the sentinel that signals "this pin has
+        # animation"; the encoder splices a per-vertex pin_anim track
+        # at this op's index but never executes the op itself.
+        #
+        # Two motion sources reach this row:
+        #   - Manual Make Keyframe writes vertex-co fcurves on the
+        #     mesh action; the label stays ``[Embedded] Move``.
+        #   - Capture Deformation writes a ``_pindeform.pc2`` cache;
+        #     the label switches to ``[Embedded] Move (Captured)`` so
+        #     the user can tell which path is live. The pin item's
+        #     ``has_captured_anim`` flag is the source of truth.
+        if item.op_type == "EMBEDDED_MOVE":
+            pin_item = data
+            if getattr(pin_item, "has_captured_anim", False):
+                row.label(text="[Embedded] Move (Captured)", icon="KEYFRAME")
+            else:
+                row.label(text="[Embedded] Move", icon="KEYFRAME")
+            return
+        if item.op_type == "MOVE_BY":
+            d = item.delta
+            row.label(text=iface_("Move ({x:.1f}, {y:.1f}, {z:.1f})").format(x=d[0], y=d[1], z=d[2]), icon="ORIENTATION_LOCAL")
+        elif item.op_type == "SPIN":
+            row.label(text=iface_("Spin \u03c9={speed:.0f}\u00b0/s").format(speed=item.spin_angular_velocity), icon="DRIVER_ROTATIONAL_DIFFERENCE")
+        elif item.op_type == "SCALE":
+            row.label(text=iface_("Scale \u00d7{factor:.2f}").format(factor=item.scale_factor), icon="FULLSCREEN_ENTER")
+        elif item.op_type == "TORQUE":
+            row.label(text=iface_("Torque {magnitude:.1f} N\u00b7m").format(magnitude=item.torque_magnitude), icon="FORCE_MAGNETIC")
+        eye_icon = "HIDE_OFF" if item.show_overlay else "HIDE_ON"
+        row.prop(item, "show_overlay", text="", icon=eye_icon, emboss=False)
+
+
+class OBJECT_UL_StaticOpsList(bpy.types.UIList):
+    """UIList for UI-assigned static ops (move/spin/scale)."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        row = layout.row(align=True)
+        if item.op_type == "MOVE_BY":
+            d = item.delta
+            row.label(
+                text=iface_("Move ({x:.2f}, {y:.2f}, {z:.2f}) [{start}-{end}]").format(
+                    x=d[0], y=d[1], z=d[2], start=item.frame_start, end=item.frame_end
+                ),
+                icon="ORIENTATION_LOCAL",
+            )
+        elif item.op_type == "SPIN":
+            row.label(
+                text=iface_("Spin \u03c9={speed:.0f}\u00b0/s [{start}-{end}]").format(
+                    speed=item.spin_angular_velocity, start=item.frame_start, end=item.frame_end
+                ),
+                icon="DRIVER_ROTATIONAL_DIFFERENCE",
+            )
+        elif item.op_type == "SCALE":
+            row.label(
+                text=iface_("Scale \u00d7{factor:.2f} [{start}-{end}]").format(
+                    factor=item.scale_factor, start=item.frame_start, end=item.frame_end
+                ),
+                icon="FULLSCREEN_ENTER",
+            )
+        eye_icon = "HIDE_OFF" if item.show_overlay else "HIDE_ON"
+        row.prop(item, "show_overlay", text="", icon=eye_icon, emboss=False)
+
+
+class OBJECT_UL_MaterialMapsList(UIList):
+    """UI List for a group's spatial material maps."""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...models.material_maps import base_property
+
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            # The parameter reads first because it is what the map means; the
+            # source is how it is authored. A parameter this group's elements
+            # do not read is drawn in alert color: the enum offers every map
+            # parameter, and only the encoder would otherwise report it.
+            param = row.row(align=True)
+            param.alert = base_property(item.parameter, data.object_type) is None
+            param.prop(item, "parameter", text="")
+            src = row.row(align=True)
+            src.alert = not item.source_name
+            src.prop(item, "source_name", text="", icon="GROUP_VERTEX")
+            if len(item.samples):
+                row.label(text=f"+{len(item.samples)}")
+            row.prop(item, "target_value", text="")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="")
+
+
+class OBJECT_UL_MaterialMapSamplesList(UIList):
+    """UI List for one material map's later weight sources."""
+
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.label(text=f"Frame {item.frame}")
+            src = row.row(align=True)
+            src.alert = not item.source_name
+            src.prop(item, "source_name", text="", icon="GROUP_VERTEX")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="")
+
+
+class OBJECT_UL_MergePairsList(bpy.types.UIList):
+    def draw_item(
+        self, context, layout, data, item, icon, active_data, active_property, index
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            from ...core.uuid_registry import get_object_by_uuid
+            row = layout.row(align=True)
+            obj_a = get_object_by_uuid(item.object_a_uuid) if item.object_a_uuid else None
+            obj_b = get_object_by_uuid(item.object_b_uuid) if item.object_b_uuid else None
+            label_a = obj_a.name if obj_a else (item.object_a or iface_("(missing)"))
+            label_b = obj_b.name if obj_b else (item.object_b or iface_("(missing)"))
+            ico = "AUTOMERGE_ON" if (obj_a and obj_b) else "ERROR"
+            row.label(text=f"{label_a} \u2194 {label_b}", icon=ico)
+            eye_icon = "HIDE_OFF" if item.show_stitch else "HIDE_ON"
+            row.prop(item, "show_stitch", text="", icon=eye_icon, emboss=False)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="AUTOMERGE_ON")
+
+
+_DYN_PARAM_ICONS = {
+    "GRAVITY": "FORCE_FORCE",
+    "WIND": "FORCE_WIND",
+    "AIR_DENSITY": "MOD_FLUID",
+    "AIR_FRICTION": "FORCE_DRAG",
+    "VERTEX_AIR_DAMP": "MOD_SMOOTH",
+}
+
+_DYN_PARAM_LABELS = {
+    "GRAVITY": "Gravity",
+    "WIND": "Wind",
+    "AIR_DENSITY": "Air Density",
+    "AIR_FRICTION": "Air Friction",
+    "VERTEX_AIR_DAMP": "Vertex Air Damping",
+}
+
+
+class SCENE_UL_DynParamsList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            ico = _DYN_PARAM_ICONS.get(item.param_type, "PREFERENCES")
+            label = iface_(_DYN_PARAM_LABELS.get(item.param_type, item.param_type))
+            n_kf = len(item.keyframes)
+            layout.label(text=iface_("{label} ({count} kf)").format(label=label, count=n_kf), icon=ico)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="PREFERENCES")
+
+
+class SCENE_UL_DynParamKeyframesList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            if index == 0:
+                layout.label(text=iface_("Frame {frame} (Initial)").format(frame=item.frame), icon="DECORATE_KEYFRAME")
+            else:
+                layout.label(text=iface_("Frame {frame}").format(frame=item.frame), icon="KEYFRAME")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="KEYFRAME")
+
+
+class SOLVER_UL_CheckpointFrames(bpy.types.UIList):
+    """Saved-checkpoint frames offered in the Resume-From dialog."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            # item.frame is the remote 0-based checkpoint index (kept raw for
+            # the solver's --load on resume). Display it as the Blender 1-based
+            # frame so it matches "Last Saved" in Scene Info.
+            from ..main_panel import remote_frame_to_blender
+            layout.label(
+                text=iface_("Frame {frame}").format(frame=remote_frame_to_blender(item.frame)), icon="KEYFRAME"
+            )
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="KEYFRAME")
+
+
+class SCENE_UL_SaveCheckpointFrames(bpy.types.UIList):
+    """User-requested frames at which the solver saves a resumable state."""
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            # item.frame is the Blender 1-based frame the artist entered, so
+            # show it verbatim (the encoder converts to the solver's 0-based
+            # index at upload time).
+            layout.label(text=iface_("Frame {frame}").format(frame=item.frame), icon="KEYFRAME")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="KEYFRAME")
+
+
+class SCENE_UL_InvisibleCollidersList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            if item.collider_type == "WALL":
+                ico = "MESH_PLANE"
+            else:
+                ico = "MESH_UVSPHERE"
+            label = item.name
+            flags = []
+            if item.collider_type == "SPHERE":
+                if item.invert:
+                    flags.append(iface_("Inv"))
+                if item.hemisphere:
+                    flags.append(iface_("Hemi"))
+            if flags:
+                label += f" ({', '.join(flags)})"
+            row.label(text=label, icon=ico)
+            eye_icon = "HIDE_OFF" if item.show_preview else "HIDE_ON"
+            row.prop(item, "show_preview", text="", icon=eye_icon, emboss=False)
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="MESH_UVSPHERE")
+
+
+class SCENE_UL_ColliderKeyframesList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            if index == 0:
+                # The initial keyframe is the collider's state at the starting
+                # frame, which is where the encoder and the viewport overlay
+                # both place it, so that is the frame it is labeled with.
+                from ...core.encoder import resolve_start_frame_or_default
+                start = resolve_start_frame_or_default(context.scene)
+                layout.label(text=iface_("Frame {frame} (Initial)").format(frame=start), icon="DECORATE_KEYFRAME")
+            else:
+                layout.label(text=iface_("Frame {frame}").format(frame=item.frame), icon="KEYFRAME")
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="KEYFRAME")
+
+
+def _velocity_keyframe_label(item):
+    parts = []
+    if item.enable_translational:
+        d = item.direction
+        parts.append(
+            f"{item.speed:.1f} m/s [{d[0]:.1f}, {d[1]:.1f}, {d[2]:.1f}]"
+        )
+    if item.enable_angular:
+        parts.append(f"ω={item.angular_speed:.0f}°/s {item.angular_axis}")
+    summary = "; ".join(parts) if parts else iface_("No Op")
+    return iface_("Frame {frame} ({summary})").format(
+        frame=item.frame, summary=summary,
+    )
+
+
+class OBJECT_UL_VelocityKeyframesList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            layout.label(
+                text=_velocity_keyframe_label(item),
+                icon="KEYFRAME",
+            )
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="KEYFRAME")
+
+
+class OBJECT_UL_CollisionWindowsList(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            layout.label(
+                text=iface_("Frame {start} - {end}").format(start=item.frame_start, end=item.frame_end),
+                icon="TIME",
+            )
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text="", icon="TIME")
+
+
+classes = (
+    OBJECT_UL_AssignedObjectsList,
+    OBJECT_UL_IntersectionAllowanceObjectsList,
+    OBJECT_UL_PinVertexGroupsList,
+    OBJECT_UL_PinOperationsList,
+    OBJECT_UL_StaticOpsList,
+    OBJECT_UL_MergePairsList,
+    OBJECT_UL_MaterialMapsList,
+    OBJECT_UL_MaterialMapSamplesList,
+    SCENE_UL_DynParamsList,
+    SCENE_UL_DynParamKeyframesList,
+    SOLVER_UL_CheckpointFrames,
+    SCENE_UL_SaveCheckpointFrames,
+    SCENE_UL_InvisibleCollidersList,
+    SCENE_UL_ColliderKeyframesList,
+    OBJECT_UL_VelocityKeyframesList,
+    OBJECT_UL_CollisionWindowsList,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)

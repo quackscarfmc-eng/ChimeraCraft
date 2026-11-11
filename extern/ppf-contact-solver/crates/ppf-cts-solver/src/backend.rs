@@ -1,0 +1,2235 @@
+// File: backend.rs
+// Code: Claude Code and Codex
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+
+use super::cvec::CVec;
+use super::data::{
+    Constraint, EdgeParam, FaceParam, HingeParam, IntersectionRecord, Mat2x2f, Mat3x3f,
+    MaterialParamUpdate, RestShapeUpdate, StepResult, Vec3f, VertexParam,
+    MAX_INTERSECTION_RECORDS,
+};
+use super::plastic_state::{PlasticKinds, PlasticState};
+use super::{mesh::Mesh, DataSet, ParamSet, ProgramArgs, Scene, SimArgs};
+use chrono::Local;
+use log::*;
+use na::{Matrix2x3, Matrix3xX};
+use ppf_cts_formats::status::{crash_kind_from_step, Outcome, Phase};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
+use std::time::Instant;
+
+// The C++ side picks the implementation, and build.rs flips the link:
+// libsimbackend_cuda for the CUDA path, libsimbackend_metal for Metal.
+// Every library exposes the identical extern "C" surface, so this
+// declaration is unconditional.
+extern "C" {
+    fn advance(result: *mut StepResult);
+    fn fetch();
+    fn fetch_inv_rest();
+    fn fetch_rest_angles();
+    fn fetch_dyn_counts(n_value: *mut u32, n_offset: *mut u32);
+    fn fetch_dyn(index: *mut u32, value: *mut f32, offset: *mut u32);
+    fn update_dyn(index: *const u32, offset: *const u32);
+    fn update_constraint(constraint: *const Constraint);
+    fn update_rest_shape(update: *const RestShapeUpdate);
+    fn update_hinge_rest_angles(index: *const u32, angle: *const f32, count: u32);
+    fn update_material_params(update: *const MaterialParamUpdate);
+    fn initialize(data: *const DataSet, param: *const ParamSet) -> bool;
+    fn override_velocity(indices: *const u32, count: u32, vx: f32, vy: f32, vz: f32, dt: f32);
+    fn gather_current_positions(indices: *const u32, count: u32, out: *mut f32);
+    #[allow(clippy::too_many_arguments)]
+    fn override_angular_velocity(
+        indices: *const u32,
+        count: u32,
+        wx: f32,
+        wy: f32,
+        wz: f32,
+        cx: f32,
+        cy: f32,
+        cz: f32,
+        dt: f32,
+    );
+    fn init_collision_windows(
+        vert_dmap: *const u32,
+        vert_count: u32,
+        windows: *const f32,
+        window_counts: *const u32,
+        n_groups: u32,
+    );
+    fn refresh_collision_active(time: f32);
+    fn fetch_intersection_records(out: *mut IntersectionRecord, max_count: u32) -> u32;
+}
+
+/// One precomputed rest-shape keyframe: `(time, inv_rest2x2, inv_rest3x3,
+/// exclude_face, exclude_tet)`. The exclude masks (1 = element is near-singular
+/// at this keyframe and dropped from the energy) come from
+/// `builder::compute_inv_rest`.
+type RestShapeKeyframe = (f64, Vec<Mat2x2f>, Vec<Mat3x3f>, Vec<u8>, Vec<u8>);
+
+/// Linearly interpolate a precomputed inverse-rest keyframe schedule to
+/// `time`, component-wise on the matrices, and pack the result for upload via
+/// `update_rest_shape`. Times outside the schedule clamp to the nearest end.
+/// Endpoints reproduce `builder::compute_inv_rest` exactly (alpha 0). An
+/// element is excluded if it is near-singular in *either* bracketing keyframe
+/// (OR of the masks), so a element collapsing between two samples is dropped
+/// for the whole interval (its interpolated inv_rest is unused while excluded).
+/// Object index -> the user's name for it, from the session's statistics input.
+/// Empty when the session carries none, and the report then says "object N".
+fn object_names(input_dir: &str) -> std::collections::HashMap<u32, String> {
+    let path = std::path::Path::new(input_dir).join(ppf_cts_formats::files::STATISTICS_INPUT);
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| ppf_cts_formats::statistics::decode_statistics_input(&bytes).ok())
+        .map(|input| {
+            input
+                .objects
+                .into_iter()
+                .map(|object| (object.object_index, object.object_name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn interp_rest_shape(keyframes: &[RestShapeKeyframe], time: f64) -> RestShapeUpdate {
+    debug_assert!(
+        keyframes.windows(2).all(|w| w[0].0 < w[1].0),
+        "rest-shape keyframe times must be strictly increasing"
+    );
+    let n = keyframes.len();
+    let (i0, i1, alpha) = if time <= keyframes[0].0 {
+        (0, 0, 0.0f32)
+    } else if time >= keyframes[n - 1].0 {
+        (n - 1, n - 1, 0.0f32)
+    } else {
+        // Keyframe times are strictly increasing (the producer sorts a set of
+        // boundary times), so the bracketing pair is found with a binary search
+        // instead of a linear scan. In this interior branch
+        // keyframes[0].0 < time < keyframes[n-1].0, so partition_point returns
+        // hi in 1..=n-1, keeping lo and keyframes[hi] in bounds.
+        let hi = keyframes.partition_point(|k| k.0 < time);
+        let lo = hi - 1;
+        let (t0, t1) = (keyframes[lo].0, keyframes[hi].0);
+        let a = if t1 > t0 {
+            ((time - t0) / (t1 - t0)) as f32
+        } else {
+            0.0
+        };
+        (lo, hi, a)
+    };
+    let inv2: Vec<Mat2x2f> = keyframes[i0]
+        .1
+        .iter()
+        .zip(keyframes[i1].1.iter())
+        .map(|(x, y)| *x + (*y - *x) * alpha)
+        .collect();
+    let inv3: Vec<Mat3x3f> = keyframes[i0]
+        .2
+        .iter()
+        .zip(keyframes[i1].2.iter())
+        .map(|(x, y)| *x + (*y - *x) * alpha)
+        .collect();
+    let exclude_face: Vec<u8> = keyframes[i0]
+        .3
+        .iter()
+        .zip(keyframes[i1].3.iter())
+        .map(|(a, b)| a | b)
+        .collect();
+    let exclude_tet: Vec<u8> = keyframes[i0]
+        .4
+        .iter()
+        .zip(keyframes[i1].4.iter())
+        .map(|(a, b)| a | b)
+        .collect();
+    RestShapeUpdate {
+        inv_rest2x2: CVec::from(&inv2[..]),
+        inv_rest3x3: CVec::from(&inv3[..]),
+        exclude_face: CVec::from(&exclude_face[..]),
+        exclude_tet: CVec::from(&exclude_tet[..]),
+    }
+}
+
+/// The hinges an animated bending rest shape drives, and each keyframe's rest
+/// angles for exactly those hinges: `(time, angles)` with `angles[k]` the rest
+/// angle of hinge `index[k]`.
+struct BendRestSchedule {
+    index: Vec<u32>,
+    keyframes: Vec<(f64, Vec<f32>)>,
+}
+
+/// Wrap an angle difference into `(-pi, pi]`.
+fn wrap_angle(a: f32) -> f32 {
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let mut w = a % two_pi;
+    if w > std::f32::consts::PI {
+        w -= two_pi;
+    } else if w <= -std::f32::consts::PI {
+        w += two_pi;
+    }
+    w
+}
+
+/// Interpolate the bending rest angles of `schedule` to `time`. Times outside
+/// the schedule clamp to the nearest end, and an endpoint reproduces its
+/// keyframe exactly. Between two keyframes each hinge turns through the SHORTER
+/// way from one angle to the next, so a hinge whose rest angle crosses the
+/// +-pi seam of the signed dihedral angle does not sweep the long way round;
+/// the result is expressed in `(-pi, pi]`, the range the build-time angle
+/// (`builder::hinge_rest_angle`) uses.
+fn interp_bend_rest(schedule: &BendRestSchedule, time: f64) -> Vec<f32> {
+    let keyframes = &schedule.keyframes;
+    debug_assert!(
+        keyframes.windows(2).all(|w| w[0].0 < w[1].0),
+        "bending rest keyframe times must be strictly increasing"
+    );
+    let n = keyframes.len();
+    if time <= keyframes[0].0 {
+        return keyframes[0].1.clone();
+    }
+    if time >= keyframes[n - 1].0 {
+        return keyframes[n - 1].1.clone();
+    }
+    let hi = keyframes.partition_point(|k| k.0 < time);
+    let lo = hi - 1;
+    let (t0, t1) = (keyframes[lo].0, keyframes[hi].0);
+    let alpha = ((time - t0) / (t1 - t0)) as f32;
+    keyframes[lo]
+        .1
+        .iter()
+        .zip(keyframes[hi].1.iter())
+        .map(|(&a, &b)| wrap_angle(a + alpha * wrap_angle(b - a)))
+        .collect()
+}
+
+/// One precomputed material keyframe: `(time, face_params)`.
+///
+/// Each entry is a full face table assembled by `Scene::make_props_at` at that
+/// keyframe's time, so it went through the same assembly as the build-time
+/// table and carries the same derived quantities.
+struct MaterialKeyframe {
+    time: f64,
+    face: Vec<FaceParam>,
+    vertex: Vec<VertexParam>,
+    edge: Vec<EdgeParam>,
+    hinge: Vec<HingeParam>,
+}
+
+/// Interpolate a material keyframe schedule to `time` and pack every table for
+/// `update_material_params`. Clamps to the nearest end outside the schedule.
+///
+/// Every float field is blended, not a chosen subset. A field no animated key
+/// can reach holds the same value in both keyframes, so blending it is a
+/// no-op, and that is worth more than the saved arithmetic: a per-field
+/// allowlist has to be extended whenever a key becomes animatable, and
+/// forgetting one leaves that parameter frozen at its first keyframe with
+/// nothing to show it. `model` and the boolean flags are structural and come
+/// from the earlier keyframe.
+///
+/// Blending the DERIVED tables is exact rather than an approximation: a hinge,
+/// edge or vertex value is an area- or length-weighted average of face values,
+/// which is linear, so averaging blended faces and blending averaged hinges
+/// agree. Only the face table's own Lame conversion is nonlinear, and there
+/// the keyframes are what the artist set (see `interp_rest_shape`, which makes
+/// the same choice for assembled inverse-rest matrices).
+fn interp_material_params(
+    keyframes: &[MaterialKeyframe],
+    time: f64,
+) -> (Vec<FaceParam>, Vec<VertexParam>, Vec<EdgeParam>, Vec<HingeParam>) {
+    let n = keyframes.len();
+    let (lo, hi, alpha) = if n == 1 || time <= keyframes[0].time {
+        (0, 0, 0.0f32)
+    } else if time >= keyframes[n - 1].time {
+        (n - 1, n - 1, 0.0f32)
+    } else {
+        let hi = keyframes.partition_point(|k| k.time < time);
+        let lo = hi - 1;
+        let (t0, t1) = (keyframes[lo].time, keyframes[hi].time);
+        let a = if t1 > t0 {
+            ((time - t0) / (t1 - t0)) as f32
+        } else {
+            0.0
+        };
+        (lo, hi, a)
+    };
+    let f = |a: f32, b: f32| a + (b - a) * alpha;
+    let (ka, kb) = (&keyframes[lo], &keyframes[hi]);
+
+    let face = ka
+        .face
+        .iter()
+        .zip(kb.face.iter())
+        .map(|(a, b)| FaceParam {
+            model: a.model,
+            mu: f(a.mu, b.mu),
+            lambda: f(a.lambda, b.lambda),
+            friction: f(a.friction, b.friction),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            bend: f(a.bend, b.bend),
+            strainlimit: f(a.strainlimit, b.strainlimit),
+            shrink_x: f(a.shrink_x, b.shrink_x),
+            shrink_y: f(a.shrink_y, b.shrink_y),
+            pressure: f(a.pressure, b.pressure),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_plasticity: f(a.bend_plasticity, b.bend_plasticity),
+            bend_plasticity_threshold: f(
+                a.bend_plasticity_threshold,
+                b.bend_plasticity_threshold,
+            ),
+            bend_rest_from_geometry: a.bend_rest_from_geometry,
+            deform_damping: f(a.deform_damping, b.deform_damping),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+            bend_warp: f(a.bend_warp, b.bend_warp),
+            bend_weft: f(a.bend_weft, b.bend_weft),
+        })
+        .collect();
+
+    let vertex = ka
+        .vertex
+        .iter()
+        .zip(kb.vertex.iter())
+        .map(|(a, b)| VertexParam {
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            friction: f(a.friction, b.friction),
+        })
+        .collect();
+
+    let edge = ka
+        .edge
+        .iter()
+        .zip(kb.edge.iter())
+        .map(|(a, b)| EdgeParam {
+            stiffness: f(a.stiffness, b.stiffness),
+            bend: f(a.bend, b.bend),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            friction: f(a.friction, b.friction),
+            strainlimit: f(a.strainlimit, b.strainlimit),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_rest_from_geometry: a.bend_rest_from_geometry,
+            deform_damping: f(a.deform_damping, b.deform_damping),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+            cosserat_shear: f(a.cosserat_shear, b.cosserat_shear),
+            cosserat_bend: f(a.cosserat_bend, b.cosserat_bend),
+            cosserat_twist: f(a.cosserat_twist, b.cosserat_twist),
+            // Read once, by the frame builder at the scene's build, so a key
+            // holds the build's value as `bend_rest_from_geometry` does.
+            cosserat_rest_twist: a.cosserat_rest_twist,
+            cosserat_fix_ends: a.cosserat_fix_ends,
+            cosserat_end_twist_rate: a.cosserat_end_twist_rate,
+            cosserat_straight_rest: a.cosserat_straight_rest,
+        })
+        .collect();
+
+    let hinge = ka
+        .hinge
+        .iter()
+        .zip(kb.hinge.iter())
+        .map(|(a, b)| HingeParam {
+            bend: f(a.bend, b.bend),
+            ghat: f(a.ghat, b.ghat),
+            offset: f(a.offset, b.offset),
+            plasticity: f(a.plasticity, b.plasticity),
+            plasticity_threshold: f(a.plasticity_threshold, b.plasticity_threshold),
+            bend_damping: f(a.bend_damping, b.bend_damping),
+            bend_warp: f(a.bend_warp, b.bend_warp),
+            bend_weft: f(a.bend_weft, b.bend_weft),
+        })
+        .collect();
+
+    (face, vertex, edge, hinge)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Backend {
+    pub mesh: MeshSet,
+    pub state: State,
+    /// A resumed run's friction memory, read from the checkpoint's
+    /// `friction_<N>.bin.gz` and installed once `initialize()` has accepted the
+    /// scene. Not part of this record's own serialization: it travels in its
+    /// own file, beside the state.
+    #[serde(skip)]
+    pub friction_memory: Option<crate::driver::friction_memory::FrictionMemoryState>,
+    /// A resumed run's rotational run state (Cosserat frames, grain spin, PDRD
+    /// running rotation), read from the checkpoint's `runstate_<N>.bin.gz`
+    /// and installed once `initialize()` has accepted the scene. Travels in
+    /// its own file, beside the state, like the friction memory.
+    #[serde(skip)]
+    pub run_state: Option<crate::driver::run_state::RunState>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MeshSet {
+    pub mesh: Mesh,
+    pub uv: Option<Vec<Matrix2x3<f32>>>,
+    pub vertex: Matrix3xX<f32>,
+    pub rest_vertex: Option<Matrix3xX<f32>>,
+    /// Per-object bending reference rest shape: hinge rest angles for the
+    /// objects marked in `bend_rest_vertex_mask` are computed from these
+    /// positions instead of the initial `vertex`. Unmasked columns equal the
+    /// initial vert, so it is a no-op for non-reference objects. `None` when
+    /// no object uses a reference rest angle.
+    #[serde(default)]
+    pub bend_rest_vertex: Option<Matrix3xX<f32>>,
+    /// Per-vertex mask (length = vertex count, or empty when
+    /// `bend_rest_vertex` is `None`) marking vertices whose hinges take their
+    /// rest angle from `bend_rest_vertex`.
+    #[serde(default)]
+    pub bend_rest_vertex_mask: Vec<bool>,
+    /// Per-vertex mask (length = vertex count, or empty when the scene has no
+    /// STATIC collider in the solved namespace) marking vertices that belong to
+    /// a collider. Contact and intersection reporting skip a pair only when
+    /// BOTH sides are marked, so a collider still meets every dynamic object.
+    /// `serde(default)` so a checkpoint carrying no such mask loads as "no
+    /// colliders", the same as a scene with no STATIC collider.
+    #[serde(default)]
+    pub collider_vertex_mask: Vec<u8>,
+    /// Per-vertex source-object identity (length = vertex count, or empty when
+    /// the session directory carries no `object_vert.bin`). Separates a self-
+    /// intersection from an inter-object one; empty means the solver knows no
+    /// object boundaries and can grant neither allowance. `serde(default)` so
+    /// a checkpoint whose serialized form omits it deserializes as empty.
+    #[serde(default)]
+    pub object_vertex_index: Vec<u32>,
+    /// Per-vertex source-group identity (length = vertex count, or empty when
+    /// the session directory carries no `group_vert.bin`, which the frontend
+    /// writes only for a scene that asks for the inter-group allowance).
+    /// Empty puts every vertex in one group. `serde(default)` for the same
+    /// reason as `object_vertex_index`.
+    #[serde(default)]
+    pub group_vertex_index: Vec<u32>,
+    /// Per-vertex intersection allowances resolved from each vertex's object's
+    /// material (`INTERSECT_ALLOW_SELF | INTERSECT_ALLOW_INTER_OBJECT |
+    /// INTERSECT_ALLOW_INTER_GROUP`).
+    /// Empty means every object is at the default, which allows nothing.
+    #[serde(default)]
+    pub intersect_policy: Vec<u8>,
+    /// Allow Existing Intersections' vertex links, flat `u32` pairs in the
+    /// combined namespace (the dynamic vertices, then the collision-mesh
+    /// vertices after them), exactly as `start_link.bin` carries them.
+    /// `builder::start_link_table` turns them into the per-vertex table the
+    /// contact passes read. Empty means nothing is linked.
+    #[serde(default)]
+    pub start_link: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct State {
+    pub curr_vertex: Matrix3xX<f32>,
+    pub prev_vertex: Matrix3xX<f32>,
+    pub dyn_index: Vec<u32>,
+    pub dyn_offset: Vec<u32>,
+    pub time: f64,
+    pub prev_dt: f32,
+    pub curr_frame: i32,
+}
+
+impl Backend {
+    pub fn new(mesh: MeshSet) -> Self {
+        let state = State {
+            curr_vertex: mesh.vertex.clone(),
+            prev_vertex: mesh.vertex.clone(),
+            dyn_index: Vec::new(),
+            dyn_offset: Vec::new(),
+            time: 0.0,
+            prev_dt: 1.0,
+            curr_frame: -1,
+        };
+        let num_face = mesh.mesh.mesh.face.ncols();
+        let num_tet = mesh.mesh.mesh.tet.ncols();
+        info!(
+            "#v = {}, #f = {}, #tet = {}",
+            mesh.mesh.mesh.vertex_count, num_face, num_tet
+        );
+        Self { state, mesh, friction_memory: None, run_state: None }
+    }
+
+    fn fetch_state(&mut self, dataset: &DataSet, param: &ParamSet) {
+        // Per-frame readback only needs vertex.prev/vertex.curr (fetch())
+        // plus the dyn arrays below. The inv_rest / rest-angle DtoH copies
+        // are serialized solely by save_state, so they live there now to
+        // keep this per-frame write path off that extra bandwidth.
+        unsafe {
+            fetch();
+        }
+        let prev_vertex = unsafe {
+            Matrix3xX::from_column_slice(std::slice::from_raw_parts(
+                dataset.vertex.prev.data as *const f32,
+                3 * dataset.vertex.prev.size as usize,
+            ))
+        };
+        let curr_vertex = unsafe {
+            Matrix3xX::from_column_slice(std::slice::from_raw_parts(
+                dataset.vertex.curr.data as *const f32,
+                3 * dataset.vertex.curr.size as usize,
+            ))
+        };
+        let prev_dt = param.prev_dt;
+        let mut n_value = 0;
+        let mut n_offset = 0;
+        unsafe {
+            fetch_dyn_counts(&mut n_value, &mut n_offset);
+        }
+        self.state.dyn_index.resize(n_value as usize, 0);
+        self.state.dyn_offset.resize(n_offset as usize, 0);
+        unsafe {
+            fetch_dyn(
+                self.state.dyn_index.as_mut_ptr(),
+                std::ptr::null_mut(),
+                self.state.dyn_offset.as_mut_ptr(),
+            );
+        }
+        self.state.prev_vertex = prev_vertex;
+        self.state.curr_vertex = curr_vertex;
+        self.state.prev_dt = prev_dt;
+    }
+
+    pub fn load_state(frame: i32, dirpath: &str) -> Self {
+        let (mesh, state) = {
+            let path_mesh = format!("{dirpath}/{}", ppf_cts_formats::files::MESHSET);
+            let path_state = format!(
+                "{dirpath}/{}",
+                ppf_cts_formats::files::state_filename(frame)
+            );
+            let mesh = super::read(&super::read_gz(path_mesh.as_str()));
+            let state = super::read(&super::read_gz(path_state.as_str()));
+            (mesh, state)
+        };
+        Self { state, mesh, friction_memory: None, run_state: None }
+    }
+
+    /// Write `vert_<n>.bin`, `time_per_frame.out`, and
+    /// `frame_to_time.out` for one finalized frame and run the optional
+    /// auto-save side-effects. Extracted from the per-iteration loop in
+    /// `run` so the rest pose (frame 0) and post-advance frames share
+    /// the same write path.
+    ///
+    /// The frame is emitted at the EXACT frame time `t_frame` (= `frame /
+    /// fps`), not at the variable, TOI-limited post-step time the solver
+    /// happened to land on. The step that crossed this frame boundary ran
+    /// from `t_prev` to `t_curr`, bracketing it, so the written vertex
+    /// positions are linearly interpolated between `prev_vertex` and
+    /// `curr_vertex` to `t_frame`. This keeps each output frame on the
+    /// scene's framerate base instead of drifting by up to one substep,
+    /// which otherwise shows up as a sawtooth in relative frame time. For
+    /// the rest pose (frame 0) the caller passes `t_prev == t_curr`, which
+    /// collapses the interpolation to `curr_vertex`.
+    ///
+    /// A fix-pinned vertex is the exception, and is placed exactly rather than
+    /// interpolated: see `pin_at_frame` below.
+    fn write_frame_outputs(
+        &mut self,
+        program_args: &ProgramArgs,
+        sim_args: &SimArgs,
+        dataset: &DataSet,
+        param: &ParamSet,
+        scene: &Scene,
+        last_time: &mut Instant,
+        frame: i32,
+        t_frame: f64,
+        t_prev: f64,
+        t_curr: f64,
+        statistics: &mut Option<crate::statistics::TimelineStatistics>,
+    ) {
+        // Name: Time Per Video Frame
+        // Format: list[(frame, ms)]
+        // Description:
+        // Wall-clock time in milliseconds elapsed between producing
+        // the previous output video frame and this one. Because each
+        // simulation step can advance less than one frame's worth of
+        // time, this aggregates however many solver steps were needed
+        // to cross the frame boundary.
+        /*== push "time_per_frame" ==*/
+        let mut time_per_frame = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/data/time_per_frame.out", program_args.output).as_str())
+            .unwrap();
+        // Name: Video Frame to Simulation Time Map
+        // Format: list[(frame, seconds)]
+        // Description:
+        // Pairs of (video frame index, simulation time in seconds)
+        // emitted once per output frame. Lets you look up which
+        // simulation time each output frame corresponds to, which is
+        // useful when the playback rate varies over time.
+        /*== push "frame_to_time" ==*/
+        let mut frame_to_time = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{}/data/frame_to_time.out", program_args.output).as_str())
+            .unwrap();
+        let curr_time = Instant::now();
+        let elapsed = curr_time - *last_time;
+        self.fetch_state(dataset, param);
+        // Stamp the frame this fetched state belongs to before any
+        // save_state below. The run loop only advances self.state.curr_frame
+        // to the batch's final frame *after* write_frame_outputs returns, so
+        // without this an auto-save or checkpoint here would name its file
+        // state_<frame - 1> (the previous frame), surfacing as an off-by-one
+        // in the Resume-From dialog. The loop's frame range is built before
+        // this call, so updating curr_frame here does not affect iteration.
+        self.state.curr_frame = frame;
+        writeln!(time_per_frame, "{} {}", frame, elapsed.as_millis()).unwrap();
+        writeln!(frame_to_time, "{} {}", frame, t_frame).unwrap();
+        let path = format!(
+            "{}/{}.tmp",
+            program_args.output,
+            ppf_cts_formats::files::vert_filename(frame)
+        );
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.clone())
+            .unwrap();
+        let mut writer = std::io::BufWriter::with_capacity(super::IO_BUF_CAPACITY, file);
+        // A faceless point cloud (e.g. a SAND grain set) derives no surface
+        // vertices from elements, so vertex_count is 0. Fall back to the full
+        // cloud width so the loose verts still reach vert_<i>.bin.
+        let surface_vert_count = self
+            .mesh
+            .mesh
+            .mesh
+            .vertex_count
+            .max(self.mesh.vertex.ncols());
+        // Undo the world-scaling applied to all input geometry on ingest
+        // (scene.rs), so the written positions are at the user's authored scale.
+        // A 1.0 factor (the default) makes this a no-op.
+        let inv_world = if sim_args.world_scaling > 0.0 {
+            1.0 / sim_args.world_scaling
+        } else {
+            1.0
+        };
+        // Linear-interpolation weight that lands the written positions on the
+        // exact frame time. `prev_vertex` is the pose at `t_prev` (step start),
+        // `curr_vertex` the pose at `t_curr` (step end, which overshoots the
+        // boundary); alpha places the output at `t_frame` in between. A zero
+        // span (frame 0 rest pose, or a degenerate step) writes `curr_vertex`
+        // verbatim. This is output-only: `self.state.*_vertex` stay as the true
+        // GPU readback so `save_state` checkpoints the real solver state.
+        let alpha = frame_interp_alpha(t_frame, t_prev, t_curr);
+
+        // A fix-pinned vertex rides a prescribed path, so where it belongs at
+        // t_frame is known outright. Interpolating its absolute position
+        // between the two steps bracketing the frame instead draws a chord
+        // across that path and cuts the corner, by up to dt/4 times the path's
+        // curvature. The step boundaries fall wherever the CCD line search
+        // leaves them, so the size of that cut varies frame to frame, and on a
+        // driven collider it reads as a jitter over an animation that should be
+        // perfectly smooth. It is most visible against a camera that shares the
+        // collider's motion: the camera samples the exact keyframe path while
+        // the collider is displayed from the chord, and the mismatch between
+        // them is exactly the jiggle.
+        //
+        // So place the pin at its exact pose for t_frame and interpolate only
+        // the residual: how far the solver's readback sits off that path. For
+        // an exact-Dirichlet fix pin the residual is zero to round-off (its DOF
+        // are eliminated, so the solver holds it dead on the path), which is
+        // why the collider now tracks its keyframe exactly. For the one fix pin
+        // still held by a barrier (a PDRD anchor) the residual is small and
+        // smooth, so interpolating it is genuinely second-order. For a pin that
+        // never moves the residual identity collapses this back to the plain
+        // lerp.
+        //
+        // Only vertices pinned across the whole step qualify; one whose pin
+        // starts or is released mid-step is left to the lerp for that frame.
+        let pin_at_frame: HashMap<u32, (Vec3f, Vec3f, Vec3f)> = {
+            let at_prev: HashMap<u32, Vec3f> =
+                scene.fix_pin_positions(t_prev).into_iter().collect();
+            let at_curr: HashMap<u32, Vec3f> =
+                scene.fix_pin_positions(t_curr).into_iter().collect();
+            scene
+                .fix_pin_positions(t_frame)
+                .into_iter()
+                .filter_map(|(i, at_f)| match (at_prev.get(&i), at_curr.get(&i)) {
+                    (Some(&p), Some(&c)) => Some((i, (at_f, p, c))),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Every vertex's output first, then the rigid-body correction, then the
+        // write: a body vertex's output depends on the whole body's motion.
+        let n_out = self.state.curr_vertex.ncols();
+        let mut outputs: Vec<[f32; 3]> = Vec::with_capacity(n_out);
+        let mut output_positions = Vec::with_capacity(n_out);
+        for v in 0..n_out {
+            let p = self.state.prev_vertex.column(v);
+            let c = self.state.curr_vertex.column(v);
+            let mut output = [0.0; 3];
+            let mut analysis_output = [0.0_f64; 3];
+            match pin_at_frame.get(&(v as u32)) {
+                Some((at_f, at_p, at_c)) => {
+                    for k in 0..3 {
+                        // INTERPOLATE THE RESIDUAL, not the absolute position:
+                        // the exact scripted pose is added back at the end, so
+                        // the interpolation runs on a small offset rather than
+                        // on two large nearby coordinates whose difference
+                        // would lose its leading digits.
+                        let rp = f32::from(p[k] - at_p[k]);
+                        let rc = f32::from(c[k] - at_c[k]);
+                        let exact = f32::from(at_f[k]);
+                        output[k] = (exact + rp + alpha * (rc - rp)) * inv_world;
+                        let rp64 = f64::from(p[k] - at_p[k]);
+                        let rc64 = f64::from(c[k] - at_c[k]);
+                        let exact64 = f64::from(at_f[k]);
+                        analysis_output[k] =
+                            (exact64 + rp64 + alpha as f64 * (rc64 - rp64)) * inv_world as f64;
+                    }
+                }
+                None => {
+                    for k in 0..3 {
+                        let pf = f32::from(p[k]);
+                        let cf = f32::from(c[k]);
+                        output[k] = (pf + alpha * (cf - pf)) * inv_world;
+                        let pf64 = f64::from(p[k]);
+                        let cf64 = f64::from(c[k]);
+                        analysis_output[k] =
+                            (pf64 + alpha as f64 * (cf64 - pf64)) * inv_world as f64;
+                    }
+                }
+            }
+            outputs.push(output);
+            output_positions.push(analysis_output);
+        }
+
+        // A RIGID (PDRD) BODY IS INTERPOLATED AS A RIGID MOTION, not vertex by
+        // vertex. The solver holds a body exactly rigid at every step, but the
+        // straight line between a vertex's two step positions is a chord of
+        // its arc, so a turning body drawn by the plain lerp shrinks toward
+        // its centroid by up to r * theta^2 / 8 at a frame inside a step, and
+        // a pinned anchor on the body (placed exactly above) sits off it by
+        // that much. So each body's step is fitted as a rotation R about its
+        // centroid and a translation, the frame takes the fraction alpha of
+        // both (the rotation through its axis-angle), and the lerp of each
+        // vertex's residual off that fit is added back, which is round-off for
+        // a body the solver keeps rigid. With no rotation this is the plain
+        // lerp. Pinned vertices keep their exact placement above.
+        if alpha > 0.0 && alpha < 1.0 {
+            rigid_interpolate(
+                dataset,
+                &self.state.prev_vertex,
+                &self.state.curr_vertex,
+                alpha,
+                inv_world,
+                &pin_at_frame,
+                &mut outputs,
+                &mut output_positions,
+            );
+        }
+
+        // A TIE-HELD VERTEX FOLLOWS ITS CONTROLLERS' OUTPUTS, for the reason a
+        // pin is placed exactly above. When a controller is placed on its
+        // exact path at t_frame and the held vertex is lerped between the two
+        // steps, the two are drawn on different curves: the chord of a turning
+        // pin misses its arc by up to r * theta^2 / 8, and the held vertex
+        // would appear off its tie by that much at every frame that falls
+        // inside a step, though the solver holds it to round-off at every step.
+        // So the held vertex is written as the combination of its controllers'
+        // outputs plus the lerp of its own residual off the tie, which is the
+        // round-off the solver leaves; with no pinned controller this is the
+        // plain lerp, since a lerp of an affine combination is the combination
+        // of the lerps. A controller is never itself held, so every output read
+        // here is final.
+        {
+            // Safety: the scene arrays live as long as `dataset`.
+            let held: &[u32] = unsafe { crate::driver::tie::scene_slice(&dataset.tie_vertex) };
+            let ctrl: &[u32] = unsafe { crate::driver::tie::scene_slice(&dataset.tie_ctrl) };
+            let weight: &[f32] = unsafe { crate::driver::tie::scene_slice(&dataset.tie_weight) };
+            let slots = crate::driver::tie::TIE_SLOTS;
+            for (tie, &t) in held.iter().enumerate() {
+                let t = t as usize;
+                let p = self.state.prev_vertex.column(t);
+                let c = self.state.curr_vertex.column(t);
+                let mut combined = [0.0f64; 3];
+                let mut residual_prev = [0.0f64; 3];
+                let mut residual_curr = [0.0f64; 3];
+                for slot in 0..slots {
+                    let w = weight[slots * tie + slot];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let g = ctrl[slots * tie + slot] as usize;
+                    let pg = self.state.prev_vertex.column(g);
+                    let cg = self.state.curr_vertex.column(g);
+                    for k in 0..3 {
+                        combined[k] += f64::from(w) * output_positions[g][k];
+                        residual_prev[k] += f64::from(w) * (f64::from(p[k]) - f64::from(pg[k]));
+                        residual_curr[k] += f64::from(w) * (f64::from(c[k]) - f64::from(cg[k]));
+                    }
+                }
+                for k in 0..3 {
+                    let residual = residual_prev[k]
+                        + f64::from(alpha) * (residual_curr[k] - residual_prev[k]);
+                    let value = combined[k] + residual * f64::from(inv_world);
+                    output_positions[t][k] = value;
+                    outputs[t][k] = value as f32;
+                }
+            }
+        }
+
+        // Write visible vertices in chunks; the exact full pose is retained for
+        // solver-side object statistics. Interior SOLID vertices are not
+        // written to PC2, but volume analysis needs them.
+        const CHUNK_SIZE: usize = 4096;
+        let mut chunk_buf: Vec<f32> = Vec::with_capacity(CHUNK_SIZE);
+        for (v, output) in outputs.iter().enumerate() {
+            if v < surface_vert_count {
+                chunk_buf.extend_from_slice(output);
+            }
+            if chunk_buf.len() >= CHUNK_SIZE {
+                let buff = unsafe {
+                    std::slice::from_raw_parts(
+                        chunk_buf.as_ptr() as *const u8,
+                        chunk_buf.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+                writer.write_all(buff).unwrap();
+                chunk_buf.clear();
+            }
+        }
+        if !chunk_buf.is_empty() {
+            let buff = unsafe {
+                std::slice::from_raw_parts(
+                    chunk_buf.as_ptr() as *const u8,
+                    chunk_buf.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            writer.write_all(buff).unwrap();
+        }
+        writer.flush().unwrap();
+        if let Some(statistics) = statistics {
+            statistics.analyze_and_write(
+                frame as u32,
+                t_frame,
+                &output_positions,
+                &self.mesh.mesh.mesh,
+                dataset,
+                inv_world as f64,
+            );
+        }
+        // Build the final path explicitly rather than stripping ".tmp" with
+        // String::replace, which would also rewrite any ".tmp" inside the
+        // output directory path. This mirrors the temp-path construction above
+        // with the same {output}/vert_{frame} stem.
+        let final_path = format!(
+            "{}/{}",
+            program_args.output,
+            ppf_cts_formats::files::vert_filename(frame)
+        );
+        std::fs::rename(&path, &final_path).unwrap();
+        super::remove_old_files(
+            &program_args.output,
+            ppf_cts_formats::files::VERT_PREFIX,
+            ppf_cts_formats::files::VERT_SUFFIX,
+            sim_args.keep_verts,
+            frame,
+        );
+        // Display pins: the scripted positions, at t_frame, of the Blender
+        // vertices exact SOLID pins hold (see `Scene::display_pin_positions`).
+        // The file is one byte per block, 1 while the block is still pinned
+        // and 0 once it is released, followed by every position as three
+        // float32s at the user's authored scale, blocks in order. Its layout
+        // is fixed for the scene, so a reader checks the size against the
+        // counts the scene was exported with.
+        if scene.has_display_pins() {
+            let (active, positions) = scene.display_pin_positions(t_frame);
+            let mut bytes: Vec<u8> = Vec::with_capacity(active.len() + 12 * positions.len());
+            bytes.extend(active.iter().map(|&a| u8::from(a)));
+            for p in positions.iter() {
+                for k in 0..3 {
+                    bytes.extend_from_slice(&(f32::from(p[k]) * inv_world).to_le_bytes());
+                }
+            }
+            let final_path = format!(
+                "{}/{}",
+                program_args.output,
+                ppf_cts_formats::files::display_pin_filename(frame)
+            );
+            let tmp_path = format!("{final_path}.tmp");
+            std::fs::write(&tmp_path, &bytes).unwrap();
+            std::fs::rename(&tmp_path, &final_path).unwrap();
+            super::remove_old_files(
+                &program_args.output,
+                ppf_cts_formats::files::DISPLAY_PIN_PREFIX,
+                ppf_cts_formats::files::DISPLAY_PIN_SUFFIX,
+                sim_args.keep_verts,
+                frame,
+            );
+        }
+        // Save a resumable state when this frame hits the auto-save cadence
+        // or appears in the explicit checkpoint list. Both use the same
+        // `frame` convention so a checkpoint saves the exact frame the
+        // artist requested, and a frame matched by both saves only once.
+        //
+        // Auto-save counts the 1-based output frame: `frame` is solver 0-based
+        // with frame 0 the rest pose, and the UI displays it as frame+1, so an
+        // interval N must land on the displayed frames N, 2N, 3N (solver frames
+        // N-1, 2N-1, ...). Using `(frame + 1) % N == 0` makes the cadence match
+        // what the user sees and the Blender->solver checkpoint conversion
+        // (display N -> solver N-1).
+        let is_auto_save = sim_args.auto_save > 0 && (frame + 1) % sim_args.auto_save == 0;
+        let is_checkpoint = sim_args
+            .checkpoints
+            .split(',')
+            .filter_map(|t| t.trim().parse::<i32>().ok())
+            .any(|c| c == frame);
+        if frame > 0 && (is_auto_save || is_checkpoint) {
+            info!("saving state (auto_save={is_auto_save}, checkpoint={is_checkpoint})...");
+            self.save_state(program_args, sim_args, dataset);
+        }
+        *last_time = Instant::now();
+    }
+
+    fn save_state(&self, program_args: &ProgramArgs, sim_args: &SimArgs, dataset: &DataSet) {
+        use ppf_cts_formats::files;
+        let path_mesh = format!("{}/{}", program_args.output, files::MESHSET);
+        let path_dataset = format!("{}/{}", program_args.output, files::DATASET);
+        info!(">>> saving state started...");
+        // The dataset and the meshset are both build-time products that the
+        // simulation does not change, so each is written once and skipped on
+        // every later checkpoint. The single exception is the rest shape: the
+        // dataset's `inv_rest*` matrices and rest angles are build-time values
+        // like everything else here, but plasticity creeps them on the device
+        // as the run proceeds. That is why they are ALSO written per frame,
+        // and only for the kernels the scene enables. See `plastic_state`.
+        if !std::path::Path::new(&path_dataset).exists() {
+            info!("saving dataset to {path_dataset}");
+            super::save(dataset, path_dataset.as_str());
+        }
+        if !std::path::Path::new(&path_mesh).exists() {
+            info!("saving meshset to {path_mesh}");
+            super::save(&self.mesh, path_mesh.as_str());
+        }
+        // Record which layout produced these checkpoints, so the resume path
+        // knows whether the dataset's rest shape is the build-time one (this
+        // layout, marker present) or the last frame's (a layout that rewrites
+        // the dataset every save, marker absent). It must not be inferred from
+        // the per-frame files themselves: they are pruned, so their absence
+        // cannot distinguish "never written" from "deleted".
+        let path_layout = format!("{}/{}", program_args.output, files::CHECKPOINT_LAYOUT);
+        if !std::path::Path::new(&path_layout).exists() {
+            std::fs::write(&path_layout, files::CHECKPOINT_LAYOUT_NOTE)
+                .unwrap_or_else(|err| panic!("failed to write {path_layout}: {err}"));
+        }
+        // Before the state, deliberately. A checkpoint is resumable once its
+        // `state_<N>.bin.gz` exists, so writing the rest shape first means a
+        // crash between the two leaves a rest shape with no state, which is an
+        // inert orphan, rather than a state with no rest shape, which is the
+        // one combination that cannot be resumed.
+        self.save_plastic_state(program_args, sim_args, dataset);
+        self.save_friction_memory(program_args, sim_args, dataset);
+        self.save_run_state(program_args, sim_args);
+        let path_state = format!(
+            "{}/{}",
+            program_args.output,
+            files::state_filename(self.state.curr_frame)
+        );
+        info!("saving state to {path_state}...");
+        super::save(&self.state, path_state.as_str());
+        super::remove_old_files(
+            &program_args.output,
+            files::STATE_PREFIX,
+            files::STATE_SUFFIX,
+            sim_args.keep_states,
+            self.state.curr_frame,
+        );
+        // A resumable checkpoint now exists on disk; reflect it in the
+        // status record's `resumable` flag.
+        crate::status_writer::note_saved();
+        info!("<<< save state done.");
+    }
+
+    /// Write `plastic_<frame>.bin.gz`, this frame's rest shape, for a scene
+    /// where plasticity creeps it away from the build-time values the dataset
+    /// holds.
+    ///
+    /// Only the enabled kernels' arrays are pulled back from the device and
+    /// only those are stored, so a scene with no plastic material does no DtoH
+    /// copy and writes no file. Retention matches the state checkpoints, so a
+    /// `state_<N>.bin.gz` that survives pruning still has its rest shape beside
+    /// it.
+    fn save_plastic_state(
+        &self,
+        program_args: &ProgramArgs,
+        sim_args: &SimArgs,
+        dataset: &DataSet,
+    ) {
+        use ppf_cts_formats::files;
+        let kinds = PlasticKinds::of(dataset);
+        if !kinds.any() {
+            return;
+        }
+        // Refresh the host arrays from the device right before serializing: the
+        // refresh is a real DOWNLOAD, not a copy out of a host-side mirror. The
+        // plastic commit is a kernel, so the device holds the crept rest shape
+        // and the host copy is stale from that dispatch until this runs. This
+        // is the checkpoint path alone, which is where the shape has to reach
+        // the host anyway.
+        unsafe {
+            if kinds.needs_inv_rest() {
+                fetch_inv_rest();
+            }
+            if kinds.needs_rest_angles() {
+                fetch_rest_angles();
+            }
+        }
+        let path = format!(
+            "{}/{}",
+            program_args.output,
+            files::plastic_filename(self.state.curr_frame)
+        );
+        info!("saving plastic rest shape to {path}");
+        super::save(&PlasticState::extract(dataset, kinds), path.as_str());
+        super::remove_old_files(
+            &program_args.output,
+            files::PLASTIC_PREFIX,
+            files::PLASTIC_SUFFIX,
+            sim_args.keep_states,
+            self.state.curr_frame,
+        );
+    }
+
+    /// Write `friction_<frame>.bin.gz`, the friction's memory of where each
+    /// contact stuck, for a scene in which some pair can carry friction.
+    ///
+    /// Before the state, for the reason the rest shape is: a crash between the
+    /// two leaves an inert orphan rather than a resumable state whose stuck
+    /// contacts would restart from zero slip. Retention matches the state
+    /// checkpoints.
+    fn save_friction_memory(&self, program_args: &ProgramArgs, sim_args: &SimArgs, dataset: &DataSet) {
+        use ppf_cts_formats::files;
+        if !crate::driver::scene_has_friction(dataset) {
+            return;
+        }
+        let memory = crate::driver::friction_memory_snapshot();
+        let path = format!(
+            "{}/{}",
+            program_args.output,
+            files::friction_filename(self.state.curr_frame)
+        );
+        info!("saving friction memory ({} pairs) to {path}", memory.word0.len());
+        super::save(&memory, path.as_str());
+        super::remove_old_files(
+            &program_args.output,
+            files::FRICTION_PREFIX,
+            files::FRICTION_SUFFIX,
+            sim_args.keep_states,
+            self.state.curr_frame,
+        );
+    }
+
+    /// Write `runstate_<frame>.bin.gz`, the rotational state a step reads from
+    /// the step before it beside the positions (`driver/run_state.rs`), for a
+    /// scene that carries any.
+    ///
+    /// Before the state, for the reason the rest shape is, and retained with
+    /// the state checkpoints.
+    fn save_run_state(&self, program_args: &ProgramArgs, sim_args: &SimArgs) {
+        use ppf_cts_formats::files;
+        let kinds = crate::driver::run_state_kinds();
+        if !kinds.any() {
+            return;
+        }
+        let run = crate::driver::run_state_snapshot();
+        let path = format!(
+            "{}/{}",
+            program_args.output,
+            files::runstate_filename(self.state.curr_frame)
+        );
+        info!("saving run state ({}) to {path}", kinds.describe());
+        super::save(&run, path.as_str());
+        super::remove_old_files(
+            &program_args.output,
+            files::RUNSTATE_PREFIX,
+            files::RUNSTATE_SUFFIX,
+            sim_args.keep_states,
+            self.state.curr_frame,
+        );
+    }
+
+    /// Hold the run at the current frame until the caller releases it.
+    ///
+    /// The process, the device and every buffer stay alive: this is a wait
+    /// between two steps, not a checkpoint. Before the next step the solver
+    /// takes whatever live inputs the caller rewrote while it was held.
+    fn hold_at_frame(
+        &self,
+        program_args: &ProgramArgs,
+        sim_args: &SimArgs,
+        scene: &mut Scene,
+        dataset: &DataSet,
+    ) {
+        use ppf_cts_formats::files;
+        let output = std::path::Path::new(program_args.output.as_str());
+        let frame = self.state.curr_frame;
+        let held_path = output.join(files::HELD);
+        let save_path = output.join(files::SAVE_AND_QUIT);
+        std::fs::write(&held_path, format!("{frame}\n")).unwrap_or_else(|err| {
+            panic!("cannot write {}: {err}", held_path.display())
+        });
+        info!("held at frame {frame}");
+        let started = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if save_path.exists() {
+                break;
+            }
+            match read_hold(&program_args.output) {
+                None => break,
+                Some((hold, timeout)) => {
+                    if hold > frame {
+                        break;
+                    }
+                    if started.elapsed() > timeout {
+                        info!(
+                            "held at frame {frame} for {:.0} s with no release; saving and \
+                             quitting so the hold does not keep the device",
+                            started.elapsed().as_secs_f64()
+                        );
+                        std::fs::write(&save_path, b"").unwrap();
+                        break;
+                    }
+                }
+            }
+        }
+        let updated = output.join(files::INPUTS_UPDATED);
+        if updated.exists() && !save_path.exists() {
+            scene.reload_dyn_param(&program_args.path);
+            match crate::force_field::load(&program_args.path, dataset.vertex.curr.size as usize) {
+                Ok(Some(field)) => {
+                    info!("held run takes an updated {}", field.describe());
+                    crate::driver::install_force_field(&field, sim_args.world_scaling);
+                }
+                Ok(None) => {
+                    info!("held run takes updated inputs: the force field is removed");
+                    crate::driver::install_force_field(
+                        &crate::force_field::ForceFieldData::default(),
+                        sim_args.world_scaling,
+                    );
+                }
+                Err(message) => panic!("force field: {message}"),
+            }
+            std::fs::remove_file(&updated).unwrap_or_else(|err| {
+                panic!("cannot remove {}: {err}", updated.display())
+            });
+        }
+        let _ = std::fs::remove_file(&held_path);
+        info!("released from frame {frame}");
+    }
+
+    pub fn run(
+        &mut self,
+        program_args: &ProgramArgs,
+        sim_args: &SimArgs,
+        mut dataset: DataSet,
+        mut param: ParamSet,
+        mut scene: Scene,
+    ) {
+        let initialize_finish_path = std::path::Path::new(program_args.output.as_str())
+            .join(ppf_cts_formats::files::INITIALIZE_FINISH);
+        let finished_path = std::path::Path::new(program_args.output.as_str())
+            .join(ppf_cts_formats::files::FINISHED);
+        if finished_path.exists() {
+            std::fs::remove_file(finished_path.clone()).unwrap();
+        }
+        if initialize_finish_path.exists() {
+            std::fs::remove_file(initialize_finish_path.clone()).unwrap();
+        }
+        let mut timeline_statistics = crate::statistics::TimelineStatistics::load(
+            &program_args.path,
+            &program_args.output,
+            &self.mesh.mesh.mesh,
+            sim_args.fps,
+        );
+        if let Some(statistics) = &timeline_statistics {
+            statistics.configure_dataset(&mut dataset);
+        }
+        if unsafe { initialize(&dataset, &param) } {
+            // Initialize collision windows on GPU
+            let cw = scene.build_collision_window_table();
+            info!("collision windows: has_windows={}, n_groups={}, vert_dmap_len={}, window_counts={:?}",
+                  cw.has_windows, cw.n_groups, cw.vert_dmap.len(),
+                  if cw.has_windows { &cw.window_counts[..cw.n_groups.min(20) as usize] } else { &[] });
+            if cw.has_windows {
+                unsafe {
+                    init_collision_windows(
+                        cw.vert_dmap.as_ptr(),
+                        cw.vert_dmap.len() as u32,
+                        cw.windows.as_ptr(),
+                        cw.window_counts.as_ptr(),
+                        cw.n_groups,
+                    );
+                }
+            }
+            // THE MULTIGRID'S HIERARCHY, laid over the mesh's own positions,
+            // which are the authored ones whether this run is fresh or
+            // resumed; `dataset.vertex` holds the saved pose on a resume. A
+            // no-op unless the scene names that preconditioner.
+            crate::driver::install_multigrid(&self.mesh.vertex);
+            // A RESUMED RUN'S FRICTION MEMORY, before its first step, so a
+            // contact that was sticking at the checkpoint holds across the
+            // resume as it holds across a step.
+            if let Some(memory) = self.friction_memory.take() {
+                info!("installing friction memory ({} pairs)", memory.word0.len());
+                crate::driver::install_friction_memory(&memory);
+            }
+            // A RESUMED RUN'S ROTATIONAL STATE, for the same reason: the
+            // Cosserat frames and their history, the grains' spin and the PDRD
+            // running rotation are what a step reads from the one before it
+            // beside the positions. Which parts the scene carries is known only
+            // now that the state is allocated, so the refusal is here: a
+            // checkpoint of such a scene without the file would restart every
+            // one of them from its authored value.
+            if program_args.load > 0 {
+                let kinds = crate::driver::run_state_kinds();
+                match self.run_state.take() {
+                    Some(run) => {
+                        info!("installing run state ({})", kinds.describe());
+                        crate::driver::install_run_state(&run);
+                    }
+                    None if kinds.any() => panic!(
+                        "checkpoint {} has no matching {}: the scene carries {}, which a step \
+                         reads from the step before it, and their state at this frame is not \
+                         on disk (a checkpoint written before the solver kept it has none), so \
+                         it cannot be resumed; run it from the start",
+                        ppf_cts_formats::files::state_filename(program_args.load),
+                        ppf_cts_formats::files::runstate_filename(program_args.load),
+                        kinds.describe()
+                    ),
+                    None => {}
+                }
+            }
+            // THE EXTERNAL FORCE FIELD, read, verified and installed once. A
+            // malformed field stops the run here, naming the file and the
+            // field, rather than reaching a dispatch; a session with none
+            // installs nothing and every step runs as it always has.
+            match crate::force_field::load(
+                &program_args.path,
+                dataset.vertex.curr.size as usize,
+            ) {
+                Ok(Some(field)) => {
+                    info!("{}", field.describe());
+                    for script in &field.scripts {
+                        info!("force field script:\n{}", script.source);
+                    }
+                    crate::driver::install_force_field(&field, sim_args.world_scaling);
+                }
+                Ok(None) => {}
+                Err(message) => panic!("force field: {message}"),
+            }
+            // EVERY REFUSAL A RESUME CAN MEET HAS NOW HAD ITS CHANCE (the
+            // checkpoint's files in `main.rs`, the scene in `initialize()`, the
+            // installs and the force field above), so what the resumed run will
+            // write again is discarded here, and not before (`setup` in
+            // `main.rs` says why).
+            if program_args.load > 0 {
+                super::discard_after_resume_point(program_args);
+            }
+            write_current_time_to_file(initialize_finish_path.to_str().unwrap()).unwrap();
+            crate::status_writer::progress(
+                Phase::Initialized,
+                self.state.curr_frame.max(0),
+                self.state.time,
+            );
+        } else {
+            // initialize() reports failure through a bare `false`, so the
+            // cause has to come from the fatal code the backend stamped
+            // alongside it. A code of zero means a failure path inside
+            // initialize() that named no cause; report that as unknown rather
+            // than inheriting the label of the one path that does set a code,
+            // which would attribute a future second failure mode to an
+            // intersection it never saw.
+            crate::status_writer::terminal_init_failure();
+            std::process::exit(1);
+        }
+        if program_args.load > 0 && !sim_args.disable_contact {
+            unsafe {
+                update_dyn(
+                    self.state.dyn_index.as_ptr(),
+                    self.state.dyn_offset.as_ptr(),
+                );
+            }
+        }
+        let mut last_time = Instant::now();
+        let mut constraint;
+        // Frame 0 is the rest pose at sim time 0. It is written once
+        // before the loop so the loop body has a single concern: each
+        // iteration prepares the *target* pin positions for the next
+        // advance, runs the step, and writes vert_n.bin only after the
+        // step completes, so the pinned and the free vertices in one
+        // file always reflect the same sim time.
+        //
+        // THE ORDER IS WHAT MAKES THAT TRUE, and it is easy to lose.
+        // Setting the pin constraint from `pin_at(state.time)`, the START
+        // of the step, and writing vert_n.bin BEFORE the next advance puts
+        // step n's pinned positions at the previous iteration's start time
+        // while the free vertices in the same file have been integrated to
+        // `state.time`. The two halves of one file then disagree by one
+        // step, which is what the `bl_pin_*` fidelity scenarios detect.
+        if self.state.curr_frame < 0 && self.state.time == 0.0 {
+            self.write_frame_outputs(
+                program_args,
+                sim_args,
+                &dataset,
+                &param,
+                &scene,
+                &mut last_time,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                &mut timeline_statistics,
+            );
+            self.state.curr_frame = 0;
+            crate::status_writer::progress(Phase::Running, 0, self.state.time);
+        }
+        // Precompute the per-keyframe inverse rest matrices for a streamed
+        // time-varying rest shape (the captured pull-pin deformation). Reuses
+        // the exact build-time formula (builder::compute_inv_rest) so init and
+        // animated rest shapes stay identical, then interpolates between
+        // keyframes per step. Empty (no per-step upload) when the scene has no
+        // schedule.
+        // Assembled lazily on the first step: `self.mesh` is borrowed
+        // immutably to build it and the surrounding scope holds `&mut self`,
+        // so it is cheaper to defer than to restructure the borrow here.
+        let mut material_keyframes: Option<Vec<MaterialKeyframe>> = None;
+        let rest_shape_keyframes: Vec<RestShapeKeyframe> = match scene.rest_shape_schedule() {
+            Some((times, frames)) => {
+                let face_props = dataset.prop.face.as_slice();
+                let tet_props = dataset.prop.tet.as_slice();
+                let face_params = dataset.param_arrays.face.as_slice();
+                let tet_params = dataset.param_arrays.tet.as_slice();
+                times
+                    .into_iter()
+                    .zip(frames.iter())
+                    .map(|(t, rest_v)| {
+                        // exclude_singular = true: a folded captured frame can
+                        // drive a rest element near-singular; rather than
+                        // clamp (which fattens it and hides the bend's
+                        // stretch), flag it so update_rest_shape drops it from
+                        // the energy. Every non-singular element keeps its
+                        // exact rest.
+                        let (inv2, inv3, ef, et) = super::builder::compute_inv_rest(
+                            rest_v,
+                            &self.mesh,
+                            face_props,
+                            tet_props,
+                            face_params,
+                            tet_params,
+                            true,
+                        );
+                        (t, inv2, inv3, ef, et)
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        // An animated bending rest shape (a shape-key mix that changes over
+        // time): each keyframe's hinge rest angles, measured with the exact
+        // build-time formula, for the hinges whose shared edge the bending
+        // reference mask covers (the same rule the build uses). Interpolated
+        // and streamed per step below.
+        let bend_rest_schedule: Option<BendRestSchedule> =
+            scene.bend_rest_schedule().map(|(times, frames, mask)| {
+                let hinge_params = dataset.param_arrays.hinge.as_slice();
+                let hinge_props = dataset.prop.hinge.as_slice();
+                let mut index = Vec::new();
+                let mut hinges = Vec::new();
+                for (i, hinge) in self.mesh.mesh.mesh.hinge.column_iter().enumerate() {
+                    if !mask[hinge[0]] {
+                        continue;
+                    }
+                    // Bend plasticity rewrites the same rest angle every step,
+                    // so the two cannot both own it. The add-on refuses the
+                    // pair at encode; a scene built some other way stops here.
+                    let param = &hinge_params[hinge_props[i].param_index as usize];
+                    assert!(
+                        param.plasticity <= 0.0,
+                        "hinge {i} takes an animated bending rest angle and also \
+                         has bend plasticity; an object cannot have both"
+                    );
+                    index.push(i as u32);
+                    hinges.push([hinge[0], hinge[1], hinge[2], hinge[3]]);
+                }
+                let keyframes = times
+                    .into_iter()
+                    .zip(frames.iter())
+                    .map(|(t, rest_v)| {
+                        let angles = hinges
+                            .iter()
+                            .map(|&h| super::builder::hinge_rest_angle(h, rest_v))
+                            .collect();
+                        (t, angles)
+                    })
+                    .collect();
+                BendRestSchedule { index, keyframes }
+            });
+        loop {
+            // GPU clock sampling is meaningful only against a CUDA device, so
+            // it is gated on the backend build.rs actually chose, never on a
+            // feature flag standing in for one. A Metal or CPU build enables no
+            // feature here either, so any weaker condition would spawn
+            // nvidia-smi once per simulation step on a machine that has none.
+            #[cfg(cuda_backend)]
+            if let Ok(output) = std::process::Command::new("nvidia-smi")
+                .arg("--query-gpu=clocks.current.sm")
+                .arg("--format=csv,noheader,nounits")
+                .output()
+            {
+                if let Ok(clock_str) = String::from_utf8(output.stdout) {
+                    let clock = clock_str.trim();
+                    info!("GPU SM Clock: {clock} MHz");
+
+                    // Name: GPU SM Clock Speed
+                    // Format: list[(time, MHz)]
+                    // Description:
+                    // GPU streaming-multiprocessor clock speed in MHz, sampled
+                    // from nvidia-smi once per simulation step. Useful for
+                    // correlating slow steps with thermal or power-related
+                    // clock throttling on the device.
+                    /*== push "clock" ==*/
+                    let mut clock_log = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{}/data/clock.out", program_args.output).as_str())
+                        .unwrap();
+                    writeln!(clock_log, "{} {}", self.state.time, clock).unwrap();
+                }
+            }
+
+            // THE FRAME-STEP HOLD, checked before save_and_quit so a caller
+            // can save a held run. A run past its last frame is not held: it
+            // finishes, which is what a hold beyond the end means.
+            if self.state.curr_frame < sim_args.frames {
+                if let Some((hold, _)) = read_hold(&program_args.output) {
+                    if self.state.curr_frame >= hold {
+                        self.hold_at_frame(program_args, sim_args, &mut scene, &dataset);
+                    }
+                }
+            }
+
+            // save_and_quit / frames-done checks happen at the top now;
+            // the previous flow placed them after the frame-write
+            // block, but with the write moved post-advance these need
+            // to gate the *upcoming* step instead.
+            let save_and_quit_path =
+                std::path::Path::new(program_args.output.as_str()).join("save_and_quit");
+            if save_and_quit_path.exists() {
+                info!("save_and_quit file found, saving state...");
+                crate::status_writer::progress(
+                    Phase::Saving,
+                    self.state.curr_frame.max(0),
+                    self.state.time,
+                );
+                self.save_state(program_args, sim_args, &dataset);
+                std::fs::remove_file(save_and_quit_path).unwrap_or_else(|err| {
+                    println!("Failed to delete 'save_and_quit' file: {err}");
+                });
+                crate::status_writer::terminal(Outcome::SavedAndQuit);
+                break;
+            }
+
+            if self.state.curr_frame >= sim_args.frames {
+                if sim_args.auto_save > 0 || sim_args.save_state_on_finish {
+                    info!("simulation finished, saving state...");
+                    self.save_state(program_args, sim_args, &dataset);
+                } else {
+                    info!("simulation finished, not saving state...");
+                }
+                crate::status_writer::terminal(Outcome::Finished);
+                break;
+            }
+
+            // Precompute the material keyframes on the first step. The
+            // face table is expanded to one entry per face for an animated
+            // scene, so this is the largest per-frame upload here and it is
+            // assembled once per keyframe rather than once per step.
+            if material_keyframes.is_none() {
+                material_keyframes = Some(if scene.has_material_animation() {
+                    let face_area =
+                        crate::triutils::face_areas(&self.mesh.vertex, &self.mesh.mesh.mesh.face);
+                    let tet_volumes =
+                        crate::triutils::tet_volumes(&self.mesh.vertex, &self.mesh.mesh.mesh.tet);
+                    scene
+                        .param_anim_times()
+                        .iter()
+                        .map(|&t| {
+                            let props =
+                                scene.make_props_at(t, &self.mesh, &face_area, &tet_volumes);
+                            // The hinge, edge and vertex tables are averages of
+                            // the faces, so this frame's faces imply this
+                            // frame's derived tables. Deriving them here, once
+                            // per keyframe, keeps the per-step work to a blend.
+                            let (vertex, edge, hinge) = crate::builder::rederive_animated_tables(
+                                &self.mesh,
+                                dataset.prop.face.as_slice(),
+                                &props.face_params,
+                                dataset.prop.edge.as_slice(),
+                                dataset.prop.hinge.as_slice(),
+                                dataset.prop.vertex.as_slice(),
+                                dataset.param_arrays.vertex.as_slice(),
+                                dataset.param_arrays.edge.as_slice(),
+                                &face_area,
+                            );
+                            MaterialKeyframe {
+                                time: t,
+                                face: props.face_params,
+                                vertex,
+                                edge,
+                                hinge,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                });
+            }
+
+            // Interpolate dynamic params (including a keyframed dt) for this
+            // step BEFORE deriving the step's target time. update_param looks
+            // up self.state.time (the step START), which is the correct sample
+            // point for the dt that governs this step, and it touches neither
+            // the pin constraint nor the rest shape. Doing it first means
+            // make_constraint, interp_rest_shape, and advance all use the same,
+            // freshly-interpolated param.dt; otherwise a dt keyframe would land
+            // one step late, targeting pins/rest at the previous step's dt.
+            scene.update_param(sim_args, self.state.time, &mut param);
+
+            // Pin target = end-of-step time. The implicit integrator
+            // pulls pinned vertices toward this constraint during the
+            // step, so picking pin_at(state.time + dt) means the
+            // post-advance positions match what frontend.FixedScene.
+            // time(state.time + dt) computes, vertex for vertex. The
+            // previous wiring used state.time (start of step) as the
+            // target which left every pin one step behind by the end
+            // of the step.
+            let target_time = self.state.time + param.dt as f64;
+            constraint = scene.make_constraint(target_time, self.state.time);
+            unsafe { update_constraint(&constraint) };
+
+            // Stream the time-varying rest shape for this step's target time,
+            // right after the pin constraint (same per-frame upload pattern).
+            // The elastic kernels re-read inv_rest each Newton iteration, so
+            // this drives each element's rest pose toward the captured
+            // deformation while pull pins guide it and contact still resolves.
+            if !rest_shape_keyframes.is_empty() {
+                let rest_shape = interp_rest_shape(&rest_shape_keyframes, target_time);
+                unsafe { update_rest_shape(&rest_shape) };
+            }
+
+            // Stream the animated bending rest angles the same way: the bending
+            // kernels read each hinge's rest angle off the hinge records every
+            // Newton iteration, so writing them here drives the fold through
+            // the step.
+            if let Some(schedule) = bend_rest_schedule.as_ref() {
+                if !schedule.index.is_empty() {
+                    let angles = interp_bend_rest(schedule, target_time);
+                    unsafe {
+                        update_hinge_rest_angles(
+                            schedule.index.as_ptr(),
+                            angles.as_ptr(),
+                            schedule.index.len() as u32,
+                        )
+                    };
+                }
+            }
+
+            // Stream this step's material tables, on the same schedule and for
+            // the same reason as the rest shape: the energy kernels read the
+            // param arrays fresh each Newton iteration, so overwriting them
+            // here drives the material through the step.
+            if let Some(keyframes) = material_keyframes.as_ref() {
+                if !keyframes.is_empty() {
+                    let (face, vertex, edge, hinge) =
+                        interp_material_params(keyframes, target_time);
+                    let update = MaterialParamUpdate {
+                        face: CVec::from(&face[..]),
+                        vertex: CVec::from(&vertex[..]),
+                        edge: CVec::from(&edge[..]),
+                        hinge: CVec::from(&hinge[..]),
+                    };
+                    unsafe { update_material_params(&update) };
+                }
+            }
+
+            for (indices, vx, vy, vz) in scene.get_velocity_overrides(self.state.time, param.dt) {
+                unsafe {
+                    override_velocity(indices.as_ptr(), indices.len() as u32, vx, vy, vz, param.dt);
+                }
+            }
+            // Angular velocity overrides: the spin axis is resolved from the
+            // body's LIVE geometry each firing (gather current positions, then
+            // a principal-axis solve), so it tracks the simulated (rotated /
+            // deformed) pose rather than a frame-0 pose. Runs AFTER the linear
+            // loop so a keyframe carrying both yields a full rigid-velocity
+            // overwrite: prev = curr - (v_lin + ω × (x - c)) * dt.
+            for (indices, pca_index, speed) in
+                scene.get_angular_velocity_overrides(self.state.time, param.dt)
+            {
+                let count = indices.len();
+                let mut positions = vec![0.0f32; count * 3];
+                unsafe {
+                    gather_current_positions(
+                        indices.as_ptr(),
+                        count as u32,
+                        positions.as_mut_ptr(),
+                    );
+                }
+                if let Some((c, axis)) = resolve_principal_axis(&positions, pca_index as usize) {
+                    let (wx, wy, wz) = (axis[0] * speed, axis[1] * speed, axis[2] * speed);
+                    unsafe {
+                        override_angular_velocity(
+                            indices.as_ptr(),
+                            count as u32,
+                            wx,
+                            wy,
+                            wz,
+                            c[0],
+                            c[1],
+                            c[2],
+                            param.dt,
+                        );
+                    }
+                }
+            }
+            // Fixed world-axis angular overrides (World X/Y/Z / Custom): ω is
+            // a world-space vector given directly, so no principal-axis solve
+            // is needed; only the live centroid is gathered for the ω × (x-c)
+            // pivot.
+            for (indices, omega) in
+                scene.get_angular_velocity_world_overrides(self.state.time, param.dt)
+            {
+                let count = indices.len();
+                let mut positions = vec![0.0f32; count * 3];
+                unsafe {
+                    gather_current_positions(
+                        indices.as_ptr(),
+                        count as u32,
+                        positions.as_mut_ptr(),
+                    );
+                }
+                if let Some(c) = centroid_of(&positions) {
+                    unsafe {
+                        override_angular_velocity(
+                            indices.as_ptr(),
+                            count as u32,
+                            omega[0],
+                            omega[1],
+                            omega[2],
+                            c[0],
+                            c[1],
+                            c[2],
+                            param.dt,
+                        );
+                    }
+                }
+            }
+            unsafe { refresh_collision_active(self.state.time as f32) };
+            let mut result = StepResult::default();
+            let _phase = crate::driver::phase::start("solver.advance");
+            unsafe { advance(&mut result) };
+            drop(_phase);
+            if !result.success() {
+                // Derive the crash sub-kind from the StepResult booleans the
+                // backend already returns (no log parsing).
+                let kind = crash_kind_from_step(
+                    result.ccd_success,
+                    result.pcg_success,
+                    result.intersection_free,
+                    result.newton_progress,
+                    result.pin_feasible,
+                    result.contact_separated,
+                );
+                let mut detail = format!(
+                    "advance failed at frame {} (ccd={}, pcg={}, \
+                     intersection_free={}, newton_progress={}, \
+                     pin_feasible={}, contact_separated={})",
+                    self.state.curr_frame,
+                    result.ccd_success,
+                    result.pcg_success,
+                    result.intersection_free,
+                    result.newton_progress,
+                    result.pin_feasible,
+                    result.contact_separated
+                );
+                // A STALL THAT A PINNED COLLIDER CAUSED NAMES THE COLLIDER (issue
+                // #160), in the user's words for the objects, so the panel says
+                // what to change rather than which cloth vertex was stuck.
+                if let Some(pinch) = crate::driver::pinch::take() {
+                    let names = object_names(&program_args.path);
+                    let name = |object: Option<u32>| match object {
+                        Some(index) => match names.get(&index) {
+                            Some(name) => format!("'{name}'"),
+                            None => format!("object {index}"),
+                        },
+                        None => "an unnamed object".to_string(),
+                    };
+                    detail.push_str(". ");
+                    detail.push_str(&crate::driver::pinch::describe(&pinch, &name));
+                }
+                // The terminal record is the crash report proper, and it is
+                // stamped FIRST so nothing written afterward can cost it. It is
+                // durable (tmp + fsync + rename) and first-writer-wins, so once
+                // it lands the panic hook sees a terminal outcome present and
+                // skips its Crashed{Panic}: a later failure while writing the
+                // diagnostics can no longer downgrade a precise sub-kind to a
+                // generic panic.
+                crate::status_writer::terminal_crash(kind, detail.clone());
+
+                // The diagnostics are written after the terminal record, so a
+                // failure while writing them cannot cost the crash report
+                // itself.
+                let records = fetch_records();
+                write_intersection_records(
+                    &program_args.output,
+                    &records,
+                    if sim_args.world_scaling > 0.0 {
+                        1.0 / sim_args.world_scaling
+                    } else {
+                        1.0
+                    },
+                );
+                panic!("failed to advance");
+            }
+            // Step start/end times bracket this advance. `t_prev` is the time
+            // before the step, `t_curr` the (possibly overshot) time after.
+            // Both are handed to write_frame_outputs so each crossed frame is
+            // interpolated onto its exact frame time rather than snapped to the
+            // overshot post-step time (which drifts as a sawtooth in relative
+            // frame time when the substep dt does not divide 1/fps).
+            let t_prev = self.state.time;
+            self.state.time = result.time;
+            let t_curr = self.state.time;
+
+            // Frame detection now happens AFTER advance: the post-step
+            // state is what gets recorded, with pin and free verts
+            // both at sim time = self.state.time.
+            let new_frame = (self.state.time * sim_args.fps).floor() as i32;
+            if new_frame > self.state.curr_frame {
+                // A single advance can cross more than one frame boundary when
+                // the timestep spans several frame periods (dt * fps >= 2).
+                // Emit every integer frame in the crossed span so the output
+                // stays contiguous (downstream readers index frames
+                // sequentially); each crossed index is interpolated to its own
+                // exact frame time t_frame = f / fps within [t_prev, t_curr].
+                for f in self.state.curr_frame + 1..=new_frame {
+                    let t_frame = f as f64 / sim_args.fps;
+let _wphase = crate::driver::phase::start("solver.write_frame");
+                    self.write_frame_outputs(
+                        program_args,
+                        sim_args,
+                        &dataset,
+                        &param,
+                        &scene,
+                        &mut last_time,
+                        f,
+                        t_frame,
+                        t_prev,
+                        t_curr,
+                        &mut timeline_statistics,
+                    );
+drop(_wphase);
+                }
+                self.state.curr_frame = new_frame;
+                crate::status_writer::progress(Phase::Running, new_frame, self.state.time);
+                // Fire the crash injection once on the final frame, preserving
+                // the existing per-advance crash semantics.
+                if self.state.curr_frame == sim_args.fake_crash_frame {
+                    panic!("fake crash!");
+                }
+            }
+        }
+        write_current_time_to_file(finished_path.to_str().unwrap()).unwrap();
+    }
+}
+
+/// The hold a caller asked for, `(frame, timeout)`, or `None` when there is
+/// none. A file that does not parse stops the run: a caller that wrote a hold
+/// and got a run that ignored it would lose exactly the frames it wanted.
+fn read_hold(output: &str) -> Option<(i32, std::time::Duration)> {
+    let path = std::path::Path::new(output).join(ppf_cts_formats::files::HOLD_AT_FRAME);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut words = text.split_whitespace();
+    let frame = words.next().and_then(|w| w.parse::<i32>().ok());
+    let timeout = match words.next() {
+        None => Some(3600.0),
+        Some(w) => w.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0),
+    };
+    match (frame, timeout) {
+        (Some(frame), Some(timeout)) => {
+            Some((frame, std::time::Duration::from_secs_f64(timeout)))
+        }
+        // An empty file is a caller mid-write; the next check reads it whole.
+        _ if text.trim().is_empty() => None,
+        _ => panic!(
+            "{}: {:?} is not `<frame> [<timeout seconds>]`",
+            path.display(),
+            text
+        ),
+    }
+}
+
+/// Interpolate every rigid (PDRD) body of `prev` -> `curr` as a rigid motion
+/// at the fraction `alpha` (see the call site), overwriting the outputs of its
+/// vertices that no pin places exactly.
+#[allow(clippy::too_many_arguments)]
+fn rigid_interpolate(
+    dataset: &DataSet,
+    prev: &na::Matrix3xX<f32>,
+    curr: &na::Matrix3xX<f32>,
+    alpha: f32,
+    inv_world: f32,
+    pinned: &HashMap<u32, (Vec3f, Vec3f, Vec3f)>,
+    outputs: &mut [[f32; 3]],
+    output_positions: &mut [[f64; 3]],
+) {
+    let props = dataset.prop.vertex.as_slice();
+    let mut members: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    for (v, prop) in props.iter().enumerate().take(prev.ncols()) {
+        if prop.pdrd_body_index != 0 {
+            members.entry(prop.pdrd_body_index).or_default().push(v);
+        }
+    }
+    for vertices in members.values() {
+        if vertices.len() < 3 {
+            continue;
+        }
+        // Offsets from the body's first vertex, differenced in f64 so the fit
+        // works on small numbers rather than absolute coordinates.
+        let base = vertices[0];
+        let rel = |m: &na::Matrix3xX<f32>, v: usize| -> na::Vector3<f64> {
+            na::Vector3::new(
+                f64::from(m[(0, v)]) - f64::from(m[(0, base)]),
+                f64::from(m[(1, v)]) - f64::from(m[(1, base)]),
+                f64::from(m[(2, v)]) - f64::from(m[(2, base)]),
+            )
+        };
+        let n = vertices.len() as f64;
+        let cp = vertices.iter().map(|&v| rel(prev, v)).sum::<na::Vector3<f64>>() / n;
+        // The current pose relative to the PREVIOUS base vertex, so the two
+        // centroids are in one frame.
+        let shift = na::Vector3::new(
+            f64::from(curr[(0, base)]) - f64::from(prev[(0, base)]),
+            f64::from(curr[(1, base)]) - f64::from(prev[(1, base)]),
+            f64::from(curr[(2, base)]) - f64::from(prev[(2, base)]),
+        );
+        let cc = vertices.iter().map(|&v| rel(curr, v) + shift).sum::<na::Vector3<f64>>() / n;
+        let mut h = na::Matrix3::<f64>::zeros();
+        for &v in vertices {
+            h += (rel(prev, v) - cp) * (rel(curr, v) + shift - cc).transpose();
+        }
+        let svd = h.svd(true, true);
+        let (Some(u), Some(vt)) = (svd.u, svd.v_t) else { continue };
+        let mut d = na::Matrix3::<f64>::identity();
+        if (vt.transpose() * u.transpose()).determinant() < 0.0 {
+            d[(2, 2)] = -1.0;
+        }
+        // THROUGH A UNIT QUATERNION, with the angle from `atan2` of its
+        // vector and scalar parts. The fitted matrix is orthonormal only to
+        // round-off, and an angle read off its trace through `acos` is NaN when
+        // the trace rounds past 3, which is exactly a body that did not turn.
+        let fitted = vt.transpose() * d * u.transpose();
+        let mut q = na::UnitQuaternion::from_matrix(&fitted);
+        if q.w < 0.0 {
+            q = na::UnitQuaternion::new_unchecked(-q.into_inner());
+        }
+        let r = q.to_rotation_matrix().into_inner();
+        let vector = q.imag();
+        let sine = vector.norm();
+        let ra = if sine > 0.0 {
+            let angle = 2.0 * sine.atan2(q.w);
+            na::Rotation3::from_axis_angle(&na::Unit::new_unchecked(vector / sine), f64::from(alpha) * angle)
+                .into_inner()
+        } else {
+            na::Matrix3::identity()
+        };
+        let a = f64::from(alpha);
+        for &v in vertices {
+            if pinned.contains_key(&(v as u32)) {
+                continue;
+            }
+            let p = rel(prev, v);
+            let c = rel(curr, v) + shift;
+            let fit_c = cc + r * (p - cp);
+            let residual = c - fit_c;
+            let at = cp + a * (cc - cp) + ra * (p - cp) + a * residual;
+            assert!(
+                at.iter().all(|x| x.is_finite()),
+                "the rigid interpolation of PDRD body vertex {v} is not finite"
+            );
+            for k in 0..3 {
+                let value = (f64::from(prev[(k, base)]) + at[k]) * f64::from(inv_world);
+                output_positions[v][k] = value;
+                outputs[v][k] = value as f32;
+            }
+        }
+    }
+}
+
+/// Interpolation weight that places an output frame at its exact frame time.
+///
+/// `t_prev` is the sim time whose pose lives in `prev_vertex` (step start) and
+/// `t_curr` the time in `curr_vertex` (step end, which overshoots the frame
+/// boundary because the substep dt rarely divides `1/fps`). `t_frame` is the
+/// exact boundary `frame / fps`. Returns the lerp weight `alpha` in `[0, 1]`
+/// such that `prev + alpha * (curr - prev)` is the pose at `t_frame`. A
+/// zero/degenerate span (frame 0 rest pose where `t_prev == t_curr`) returns
+/// `1.0`, which writes `curr_vertex` verbatim.
+fn frame_interp_alpha(t_frame: f64, t_prev: f64, t_curr: f64) -> f32 {
+    let span = t_curr - t_prev;
+    if span > 1e-12 {
+        (((t_frame - t_prev) / span).clamp(0.0, 1.0)) as f32
+    } else {
+        1.0
+    }
+}
+
+/// Resolve the world-space spin axis for an angular velocity override from a
+/// body's live positions. `positions` is packed `(x, y, z)` per vertex
+/// (length `3 * count`) as gathered from the GPU at the current step.
+/// Returns the centroid and the unit principal axis `pca_index`
+/// (0 = largest extent ... 2 = thinnest), eigenvalues sorted descending to
+/// match the `pdrd_hinge_axis` convention. The eigenvector sign is
+/// canonicalized (the component of largest magnitude is made positive) so a
+/// signed angular speed has a well-defined handedness that agrees with the
+/// Blender overlay. Returns `None` when the body is too small or the chosen
+/// axis is degenerate.
+/// Mean of the gathered positions (packed `(x, y, z)` per vertex). Used as
+/// the pivot for a fixed world-axis angular override. Returns `None` if empty.
+fn centroid_of(positions: &[f32]) -> Option<[f32; 3]> {
+    let count = positions.len() / 3;
+    if count == 0 {
+        return None;
+    }
+    let mut c = [0.0f64; 3];
+    for k in 0..count {
+        c[0] += positions[3 * k] as f64;
+        c[1] += positions[3 * k + 1] as f64;
+        c[2] += positions[3 * k + 2] as f64;
+    }
+    let inv = 1.0 / count as f64;
+    Some([
+        (c[0] * inv) as f32,
+        (c[1] * inv) as f32,
+        (c[2] * inv) as f32,
+    ])
+}
+
+fn resolve_principal_axis(positions: &[f32], pca_index: usize) -> Option<([f32; 3], [f32; 3])> {
+    let count = positions.len() / 3;
+    if count < 3 {
+        return None;
+    }
+    let mut centroid = na::Vector3::<f64>::zeros();
+    for k in 0..count {
+        centroid += na::Vector3::new(
+            positions[3 * k] as f64,
+            positions[3 * k + 1] as f64,
+            positions[3 * k + 2] as f64,
+        );
+    }
+    centroid /= count as f64;
+
+    let mut cov = na::Matrix3::<f64>::zeros();
+    for k in 0..count {
+        let r = na::Vector3::new(
+            positions[3 * k] as f64,
+            positions[3 * k + 1] as f64,
+            positions[3 * k + 2] as f64,
+        ) - centroid;
+        cov += r * r.transpose();
+    }
+
+    let eig = cov.symmetric_eigen();
+    // Sort axes by DESCENDING eigenvalue (0 = largest extent, 2 = thinnest),
+    // matching the hinge / Blender PCA convention.
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| {
+        eig.eigenvalues[b]
+            .partial_cmp(&eig.eigenvalues[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut axis = eig.eigenvectors.column(order[pca_index]).into_owned();
+    let norm = axis.norm();
+    if !norm.is_finite() || norm <= 1e-12 {
+        return None;
+    }
+    axis /= norm;
+
+    // Canonicalize sign: component of largest magnitude is made positive.
+    let mut jmax = 0usize;
+    for j in 1..3 {
+        if axis[j].abs() > axis[jmax].abs() {
+            jmax = j;
+        }
+    }
+    if axis[jmax] < 0.0 {
+        axis = -axis;
+    }
+
+    Some((
+        [centroid[0] as f32, centroid[1] as f32, centroid[2] as f32],
+        [axis[0] as f32, axis[1] as f32, axis[2] as f32],
+    ))
+}
+
+fn write_current_time_to_file(file_path: &str) -> std::io::Result<()> {
+    let now = Local::now();
+    let time_str = now.to_rfc3339();
+    let path = Path::new(file_path);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{time_str}")?;
+    Ok(())
+}
+
+/// Pull the intersection records the backend latched during the failed step.
+///
+/// Fetched once here and handed on, rather than fetched again inside each
+/// writer: two independent fetches could report different record sets, and a
+/// reader comparing the resulting artifacts would have no way to tell which was
+/// which.
+///
+/// The buffer length and the max_count handed across the FFI both use the Rust
+/// mirror of the capacity, which must equal the canonical
+/// MAX_INTERSECTION_RECORDS macro in `src/kernels/data_records.hpp` that bounds
+/// the C++-side writes; if they diverge the C++ getter clamps to its own macro
+/// and silently under-reports.
+fn fetch_records() -> Vec<IntersectionRecord> {
+    let mut records = vec![IntersectionRecord::default(); MAX_INTERSECTION_RECORDS];
+    let count = unsafe {
+        fetch_intersection_records(records.as_mut_ptr(), MAX_INTERSECTION_RECORDS as u32)
+    };
+    records.truncate(count as usize);
+    records
+}
+
+fn write_intersection_records(output_dir: &str, records: &[IntersectionRecord], inv_world: f32) {
+    if records.is_empty() {
+        return;
+    }
+    let count = records.len();
+    let type_name = |t: u32| match t {
+        0 => "face_edge",
+        1 => "edge_edge",
+        2 => "collision_mesh",
+        3 => "point_point",
+        4 => "collision_edge",
+        _ => "unknown",
+    };
+    let json_records: Vec<serde_json::Value> = records
+        .iter()
+        .map(|r| {
+            let n0 = r.num_verts0 as usize;
+            let n1 = r.num_verts1 as usize;
+            // Positions come back at sim scale; divide by world_scaling (via
+            // inv_world) so the overlay markers land at the authored scale.
+            let mut pos0 = Vec::new();
+            for i in 0..n0 {
+                pos0.push(vec![
+                    r.positions[i * 3] * inv_world,
+                    r.positions[i * 3 + 1] * inv_world,
+                    r.positions[i * 3 + 2] * inv_world,
+                ]);
+            }
+            let mut pos1 = Vec::new();
+            for i in 0..n1 {
+                let base = n0 * 3 + i * 3;
+                pos1.push(vec![
+                    r.positions[base] * inv_world,
+                    r.positions[base + 1] * inv_world,
+                    r.positions[base + 2] * inv_world,
+                ]);
+            }
+            serde_json::json!({
+                "type": type_name(r.itype),
+                "elem0": r.elem0,
+                "elem1": r.elem1,
+                "positions0": pos0,
+                "positions1": pos1,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "count": count,
+        "records": json_records,
+    });
+    // Write via a temp file + atomic rename so a crash mid-write never
+    // leaves a half-written records file for the overlay / server to read.
+    // Every failure names its path and the OS error: on the crash path, a
+    // message carrying neither leaves nothing to act on.
+    let path = format!(
+        "{output_dir}/{}",
+        ppf_cts_formats::files::INTERSECTION_RECORDS_JSON
+    );
+    let tmp = format!("{path}.tmp");
+    let write_result = std::fs::File::create(&tmp)
+        .map_err(|e| format!("create {tmp}: {e}"))
+        .and_then(|file| {
+            serde_json::to_writer_pretty(file, &json).map_err(|e| format!("write {tmp}: {e}"))
+        })
+        .and_then(|()| std::fs::rename(&tmp, &path).map_err(|e| format!("rename to {path}: {e}")));
+    match write_result {
+        Ok(()) => info!("wrote {count} intersection records to {path}"),
+        Err(msg) => {
+            error!("failed to write intersection records: {msg}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rest_shape_tests {
+    use super::*;
+
+    // The time-varying rest-shape keyframe interpolation used per step.
+    // Endpoints must reproduce the keyframes exactly (alpha 0), the interior
+    // is a component-wise lerp, and out-of-range times clamp to the ends.
+    #[test]
+    fn interp_rest_shape_endpoints_midpoint_and_clamp() {
+        let i2 = Mat2x2f::identity();
+        let i3 = Mat3x3f::identity();
+        let keyframes: Vec<RestShapeKeyframe> = vec![
+            (0.0_f64, vec![i2], vec![i3], vec![0u8], vec![0u8]),
+            (
+                1.0_f64,
+                vec![i2 * 2.0],
+                vec![i3 * 2.0],
+                vec![0u8],
+                vec![0u8],
+            ),
+        ];
+
+        let r0 = interp_rest_shape(&keyframes, 0.0);
+        assert!((r0.inv_rest2x2.as_slice()[0] - i2).amax() < 1e-6);
+        assert!((r0.inv_rest3x3.as_slice()[0] - i3).amax() < 1e-6);
+
+        let r1 = interp_rest_shape(&keyframes, 1.0);
+        assert!((r1.inv_rest2x2.as_slice()[0] - i2 * 2.0).amax() < 1e-6);
+        assert!((r1.inv_rest3x3.as_slice()[0] - i3 * 2.0).amax() < 1e-6);
+
+        let rm = interp_rest_shape(&keyframes, 0.5);
+        assert!((rm.inv_rest2x2.as_slice()[0] - i2 * 1.5).amax() < 1e-6);
+        assert!((rm.inv_rest3x3.as_slice()[0] - i3 * 1.5).amax() < 1e-6);
+
+        // Below the first keyframe clamps to frame 0.
+        let rb = interp_rest_shape(&keyframes, -5.0);
+        assert!((rb.inv_rest2x2.as_slice()[0] - i2).amax() < 1e-6);
+        // Above the last keyframe clamps to the final frame.
+        let ra = interp_rest_shape(&keyframes, 5.0);
+        assert!((ra.inv_rest2x2.as_slice()[0] - i2 * 2.0).amax() < 1e-6);
+    }
+
+    // The exclude mask is the OR of the two bracketing keyframes, so an element
+    // near-singular in either adjacent sample is dropped for the whole interval.
+    #[test]
+    fn interp_rest_shape_excludes_union_of_bracketing() {
+        let i3 = Mat3x3f::identity();
+        // two tets: tet0 singular only at the second keyframe, tet1 never.
+        let keyframes: Vec<RestShapeKeyframe> = vec![
+            (0.0_f64, vec![], vec![i3, i3], vec![], vec![0u8, 0u8]),
+            (1.0_f64, vec![], vec![i3, i3], vec![], vec![1u8, 0u8]),
+        ];
+        // Mid-interval: tet0 excluded (OR), tet1 not.
+        let rm = interp_rest_shape(&keyframes, 0.5);
+        assert_eq!(rm.exclude_tet.as_slice(), &[1u8, 0u8]);
+        // At the first keyframe exactly, still excluded for tet0 (i0==i1==1? no:
+        // time 0.0 -> i0=i1=0, mask = 0|0). Confirm the clamp picks frame 0.
+        let r0 = interp_rest_shape(&keyframes, 0.0);
+        assert_eq!(r0.exclude_tet.as_slice(), &[0u8, 0u8]);
+    }
+
+    // A single-keyframe schedule must not panic and returns that frame for any
+    // query time (the degenerate static-rest case).
+    #[test]
+    fn interp_rest_shape_single_keyframe() {
+        let i3 = Mat3x3f::identity();
+        let keyframes: Vec<RestShapeKeyframe> = vec![(
+            0.5_f64,
+            Vec::<Mat2x2f>::new(),
+            vec![i3 * 3.0],
+            vec![],
+            vec![0u8],
+        )];
+        let r = interp_rest_shape(&keyframes, 2.0);
+        assert!(r.inv_rest2x2.as_slice().is_empty());
+        assert!((r.inv_rest3x3.as_slice()[0] - i3 * 3.0).amax() < 1e-6);
+    }
+
+    // The animated bending rest angle: endpoints reproduce their keyframe,
+    // interior times interpolate linearly, and times outside clamp.
+    #[test]
+    fn interp_bend_rest_endpoints_midpoint_and_clamp() {
+        let schedule = BendRestSchedule {
+            index: vec![3, 7],
+            keyframes: vec![(0.0, vec![0.0, 0.5]), (2.0, vec![1.0, -0.5])],
+        };
+        let near = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-6);
+        assert!(near(&interp_bend_rest(&schedule, 0.0), &[0.0, 0.5]));
+        assert!(near(&interp_bend_rest(&schedule, 2.0), &[1.0, -0.5]));
+        assert!(near(&interp_bend_rest(&schedule, 1.0), &[0.5, 0.0]));
+        assert!(near(&interp_bend_rest(&schedule, -3.0), &[0.0, 0.5]));
+        assert!(near(&interp_bend_rest(&schedule, 9.0), &[1.0, -0.5]));
+    }
+
+    // A rest angle crossing the +-pi seam of the signed dihedral angle turns
+    // the short way (through pi), not back through zero.
+    #[test]
+    fn interp_bend_rest_crosses_the_pi_seam_the_short_way() {
+        let pi = std::f32::consts::PI;
+        let schedule = BendRestSchedule {
+            index: vec![0],
+            keyframes: vec![(0.0, vec![pi - 0.1]), (1.0, vec![-pi + 0.1])],
+        };
+        let mid = interp_bend_rest(&schedule, 0.5)[0];
+        assert!((mid.abs() - pi).abs() < 1e-5, "midpoint {mid} should sit at +-pi");
+        let quarter = interp_bend_rest(&schedule, 0.25)[0];
+        assert!((quarter - (pi - 0.05)).abs() < 1e-5, "quarter {quarter}");
+    }
+}
+
+#[cfg(test)]
+mod frame_interp_tests {
+    use super::frame_interp_alpha;
+
+    // dt=0.01, fps=30 (3.333 substeps/frame): the step that crosses frame 1
+    // runs from t=0.03 to 0.04, and the exact boundary 1/30 = 0.03333 sits one
+    // third of the way in. Without interpolation the frame would be recorded at
+    // the overshot 0.04 (a 0.2-frame error); the weight pulls it back to 0.0333.
+    #[test]
+    fn alpha_places_frame_on_the_exact_boundary() {
+        let a = frame_interp_alpha(1.0 / 30.0, 0.03, 0.04);
+        assert!((a - 1.0 / 3.0).abs() < 1e-5, "alpha={a}");
+    }
+
+    // A full step that lands exactly on the boundary (alpha 1) writes curr; a
+    // boundary sitting exactly on the step start writes prev (alpha 0). These
+    // are the integer-substeps-per-frame endpoints, where the output is exact.
+    #[test]
+    fn alpha_endpoints_are_exact() {
+        assert_eq!(frame_interp_alpha(0.04, 0.03, 0.04), 1.0);
+        assert_eq!(frame_interp_alpha(0.03, 0.03, 0.04), 0.0);
+    }
+
+    // The rest pose (frame 0) is emitted with t_prev == t_curr; the degenerate
+    // span must collapse to curr (weight 1.0) instead of dividing by zero.
+    #[test]
+    fn alpha_zero_span_is_curr() {
+        assert_eq!(frame_interp_alpha(0.0, 0.0, 0.0), 1.0);
+    }
+
+    // A boundary outside the bracketing step (should never happen given the
+    // caller only emits crossed frames) clamps into range rather than
+    // extrapolating past prev/curr.
+    #[test]
+    fn alpha_clamps_out_of_range() {
+        assert_eq!(frame_interp_alpha(0.05, 0.03, 0.04), 1.0);
+        assert_eq!(frame_interp_alpha(0.02, 0.03, 0.04), 0.0);
+    }
+}

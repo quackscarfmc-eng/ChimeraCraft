@@ -1,0 +1,42 @@
+# License: GPL-3.0-or-later
+# Data-evolution chain: each ``data_retransfer`` adds a vertex
+# (topology change) and re-uploads. Catches missed mesh-hash
+# invalidations and stale runner._fetched lists across rebuilds.
+
+from __future__ import annotations
+from . import _chain_lib as cl
+from . import _runner as r
+
+NEEDS_BLENDER = True
+
+# RUNS ON THE REAL BACKEND, established by RUNNING it rather than by reading
+# it. A full rig sweep against a CPU build passed it, and that run is the
+# evidence this line rests on.
+BACKENDS = ("real",)
+
+# Chain scenarios hold the solver/server boundary across multiple
+# cycles; under parallel host load the cumulative timing slack runs
+# out and reconnect races trip. Always run serially after the
+# parallel batch.
+NOT_PARALLELIZABLE = True
+
+SEQUENCE = (
+    "connect", "transfer", "verify_idle",
+    "run", "fetch", "verify_pc2", "clear_animation",
+    "data_retransfer", "run", "fetch", "verify_pc2", "clear_animation",
+    "data_retransfer", "run", "fetch", "verify_pc2",
+)
+
+
+def build_driver(ctx: r.ScenarioContext) -> str:
+    return cl.build_chain_driver(
+        ctx, project_name="chain_data_evolution",
+        mesh_name="ChainDataMesh", sequence=SEQUENCE,
+    )
+
+
+def run(ctx: r.ScenarioContext) -> dict:
+    result, err = r.wait_blender_result(ctx, timeout=max(ctx.timeout, 480.0))
+    if err is not None:
+        return err
+    return r.report_named_checks(result.get("checks", {}))

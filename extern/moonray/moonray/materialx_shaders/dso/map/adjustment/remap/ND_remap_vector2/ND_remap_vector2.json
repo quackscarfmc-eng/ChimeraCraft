@@ -1,0 +1,61 @@
+{
+    "attributes" : 
+    {
+        "disableAttr" : 
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec2f"
+        },
+        "inLowAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inlow",
+            "type" : "Vec2f"
+        },
+        "inHighAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "inhigh",
+            "type" : "Vec2f"
+        },
+        "outLowAttr" : 
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outlow",
+            "type" : "Vec2f"
+        },
+        "outHighAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "outhigh",
+            "type" : "Vec2f"
+        },
+        "gammaAttr" : 
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "gamma",
+            "type" : "Vec2f"
+        },
+        "doClampAttr" : 
+        {
+            "default" : 0,
+            "name" : "doclamp",
+            "type" : "Bool"
+        }
+    },
+    "name" : "ND_remap_vector2",
+    "type" : "Map"
+}

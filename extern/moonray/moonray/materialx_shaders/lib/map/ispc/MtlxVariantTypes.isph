@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Contributors to the Moonray Project
+#pragma once
+#include "MtlxVariantTypes.hh"
+
+#include <moonray/rendering/shading/ispc/Shading.isph>
+#include <scene_rdl2/scene/rdl2/rdl2.isph>
+#include <scene_rdl2/scene/rdl2/ISPCSupport.h>
+#include <scene_rdl2/common/platform/IspcUtil.isph>
+
+typedef float Float;
+typedef bool Bool;
+typedef int Int;
+
+void MtlxPHPrint(int k);

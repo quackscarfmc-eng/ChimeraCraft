@@ -1,0 +1,194 @@
+// File: crates/ppf-cts-core/src/events.rs
+// Code: Claude Code
+// Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+// License: Apache v2.0
+//
+// Typed event enum for the server state machine. Historically ported
+// from the now-removed server/events.py (Rust is now authoritative):
+// every former Python event class became a Rust enum variant carrying
+// the same fields.
+//
+// Events come from three sources:
+//   1. Client requests parsed from the socket protocol.
+//   2. Build task callbacks (progress, completion, failure).
+//   3. Solver monitor task (frame ticks, exit detection, crash).
+
+/// A crash reconstructed from disk when the server has no in-memory record
+/// of it, which is every reconnect after a restart.
+///
+/// It carries the same two values a live crash carries, produced by the same
+/// renderer, so a reconnected report reads identically to the one the user
+/// saw when the run failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledCrash {
+    /// Stable snake_case cause name (`CrashKind::tag`).
+    pub kind_tag: String,
+    /// The full rendered report, including the log tails.
+    pub rendered: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    // ---- Client request events ----
+
+    /// Client connected with a project name. Sets up project context.
+    /// `upload_id` reconciles disk identity: when the server restarts
+    /// or a different process wrote data to the project dir, the id
+    /// from upload_id.txt is stamped here without disturbing the
+    /// build state.
+    ProjectSelected {
+        name: String,
+        root: String,
+        has_data: bool,
+        has_param: bool,
+        has_app: bool,
+        is_resumable: bool,
+        /// The crash the solver-authored `status.cbor` records (a terminal
+        /// Crashed outcome, or a non-terminal record whose owning process is
+        /// gone), not yet superseded by a launch or rebuild. `None` when the
+        /// project did not fail. Lets a reconnect (which has no in-memory
+        /// `Solver::Failed`) reconstruct the failed state AND its reason, so
+        /// the status still reads "Failed (Resumable)" and the panel still
+        /// names the cause.
+        crash: Option<ReconciledCrash>,
+        upload_id: String,
+        data_hash: String,
+        param_hash: String,
+        /// `Total Frames` from scene_info.json when readable; 0 when
+        /// the project has never been built (no scene_info.json yet)
+        /// or the field is missing/unparseable. Lets a reconnect (or
+        /// any other re-select) rehydrate state.total_frames from
+        /// disk so the progress bar keeps working after the connect
+        /// probe's `--name __probe__` transition cleared the field.
+        total_frames: i32,
+        /// The exempted pairs the project's last successful build recorded
+        /// (`build_exemptions.json`), opaque like `BuildCompleted`'s. Read
+        /// only when the selection changes, and used only when the project
+        /// is built; empty otherwise.
+        exemptions: Vec<String>,
+    },
+
+    /// Client requested a scene build. `preserve_output` keeps the
+    /// `session/output/` checkpoints in place across the rebuild so a
+    /// resume can re-decode edited scene input without discarding the
+    /// already-simulated frames; `false` is a fresh build that wipes
+    /// the output directory (the historical behavior).
+    BuildRequested { preserve_output: bool },
+
+    /// Client requested cancellation of an in-progress build.
+    CancelBuildRequested,
+
+    /// Client requested simulation start.
+    StartRequested,
+
+    /// Client requested simulation resume. `from_frame` is `None` to
+    /// resume from the latest checkpoint (the historical behavior), or
+    /// `Some(n)` to resume from frame `n`.
+    ResumeRequested { from_frame: Option<i32> },
+
+    /// Client requested solver termination.
+    TerminateRequested,
+
+    /// Client requested save-and-quit.
+    SaveAndQuitRequested,
+
+    /// Client requested project data deletion.
+    DeleteRequested,
+
+    /// A `data.pickle` / `param.pickle` write completed. Fresh
+    /// `upload_id` is stamped onto the state so any in-flight builds
+    /// from other clients know their target was replaced.
+    UploadLanded {
+        upload_id: String,
+        data_hash: String,
+        param_hash: String,
+        has_data: bool,
+        has_param: bool,
+    },
+
+    // ---- Build task events ----
+    /// Build thread reports a progress update.
+    BuildProgress { progress: f64, info: String },
+
+    /// Build worker forwards the per-build static metadata it learned
+    /// from `param.pickle` (currently `frames`). Dispatched once per
+    /// build, after `make()` finishes parsing the param set, so the
+    /// solver-progress field on status responses can publish
+    /// `frame / total_frames` without re-reading the param file.
+    BuildMetadata { total_frames: i32 },
+
+    /// Build task finished successfully. `exemptions` is opaque: the pairs
+    /// Allow Existing Intersections exempted, empty when none were.
+    BuildCompleted { exemptions: Vec<String> },
+
+    /// Build task encountered an error. `violations` is opaque.
+    BuildFailed {
+        error: String,
+        violations: Vec<String>,
+    },
+
+    /// Build task was cancelled cooperatively (via the
+    /// CancellationToken from `crate::cancel`).
+    BuildCancelledEvent,
+
+    /// GPU availability check failed before build.
+    GpuCheckFailed { error: String },
+
+    // ---- Solver monitor events ----
+    /// Monitor detected a new frame in the output directory.
+    SolverFrameUpdated { frame: i32 },
+
+    /// Monitor observed `<output>/initialize_finish.txt`, the file the
+    /// solver writes immediately after its in-process `initialize()`
+    /// call returns. Flips `state.initialized` to true so the addon's
+    /// status text leaves "Initializing" before the first frame's
+    /// advance completes.
+    SolverInitialized,
+
+    /// Monitor detected the solver subprocess exited cleanly.
+    SolverFinished { resumable: bool },
+
+    /// Monitor determined that the solver run failed. `error` is the full
+    /// rendered report; `kind_tag` is the stable snake_case name of the
+    /// cause (`ppf_cts_formats::status::CrashKind::tag`), which the addon
+    /// maps to a localized one-line headline. A `String` rather than the
+    /// enum because this crate does not depend on `ppf-cts-formats`.
+    SolverCrashed {
+        error: String,
+        kind_tag: String,
+        violations: Vec<String>,
+    },
+
+    /// Monitor detected the `save_and_quit` flag file.
+    SolverSaving,
+
+    /// Monitor detected a `ppf-contact-solver` process running outside
+    /// this server (e.g. launched from a JupyterLab notebook against
+    /// the same project root). Promotes `solver` to `Running` so the
+    /// rest of the monitor loop drives frame / finish / crash
+    /// transitions normally; without this the addon's status panel
+    /// would stay frozen at "Ready to Run" for the duration of an
+    /// externally-launched simulation. `has_data_on_disk` reflects
+    /// whether `data.pickle` + `param.pickle` exist under the project
+    /// root: when true, `data` and `build` are advanced to mirror what
+    /// the running solver implies.
+    ExternalSolverAdopted { has_data_on_disk: bool },
+
+    // ---- Generic error ----
+    /// A generic error from any subsystem.
+    ErrorOccurred { error: String },
+}
+
+impl Event {
+    /// Field-default constructors handy for tests and dispatch sites
+    /// that don't need every field.
+    pub fn upload_landed(upload_id: impl Into<String>) -> Self {
+        Event::UploadLanded {
+            upload_id: upload_id.into(),
+            data_hash: String::new(),
+            param_hash: String::new(),
+            has_data: true,
+            has_param: true,
+        }
+    }
+}

@@ -1,0 +1,90 @@
+{
+    "attributes" :
+    {
+        "defaultAttr" :
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "label" : "Default Color",
+            "name" : "default",
+            "type" : "Vec3f"
+        },
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "fileAttr" :
+        {
+            "label" : "Filename",
+            "name" : "file",
+            "type" : "String"
+        },
+        "filtertypeAttr" :
+        {
+            "default" : 0,
+            "enum" :
+            {
+                "closest" : 0,
+                "cubic" : 2,
+                "linear" : 1
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Filter Type",
+            "name" : "filtertype",
+            "type" : "Int",
+            "comment" : "NOT SUPPORTED BY MOONRAY"
+        },
+        "frameendactionAttr" :
+        {
+            "default" : 0,
+            "enum" :
+            {
+                "clamp" : 1,
+                "constant" : 0,
+                "mirror" : 3,
+                "periodic" : 2
+            },
+            "flags" : "FLAGS_ENUMERABLE",
+            "label" : "Frame End Action",
+            "name" : "frameendaction",
+            "type" : "Int"
+        },
+        "frameoffsetAttr" :
+        {
+            "default" : "0",
+            "label" : "Frame Offset",
+            "name" : "frameoffset",
+            "type" : "Int"
+        },
+        "framerangeAttr" :
+        {
+            "label" : "Frame Range",
+            "name" : "framerange",
+            "type" : "String"
+        },
+        "texcoordAttr" :
+        {
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "Texture Coordinates",
+            "name" : "texcoord",
+            "type" : "Vec2f"
+        },
+        "uvoffsetAttr" :
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvoffset",
+            "type" : "Vec2f"
+        },
+        "uvtilingAttr" :
+        {
+            "default" : "Vec2f(1.0f, 1.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "uvtiling",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_tiledimage_vector3",
+    "type" : "Map"
+}

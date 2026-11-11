@@ -1,0 +1,681 @@
+# License: GPL-3.0-or-later
+"""``_ParamProxy`` and ``_Group`` proxies for dynamics groups.
+
+See :mod:`blender_addon.ops.api` for the package overview.
+"""
+
+import bpy  # pyright: ignore
+
+from ...models.groups import get_addon_data
+from .._api_markers import blender_api
+from .pin import _Pin
+
+
+# ---------------------------------------------------------------------------
+# Group proxy
+# ---------------------------------------------------------------------------
+
+_PARAM_PROPS = {
+    "solid_model", "shell_model", "rod_model",
+    "shell_density", "solid_density", "rod_density",
+    "shell_young_modulus", "solid_young_modulus", "rod_young_modulus",
+    "shell_poisson_ratio", "solid_poisson_ratio",
+    "friction",
+    "use_group_bounding_box_diagonal",
+    "contact_gap", "contact_gap_rat",
+    "contact_offset", "contact_offset_rat",
+    "contact_gap_limit_percent",
+    "enable_strain_limit", "strain_limit_percent",
+    "enable_inflate", "inflate_pressure",
+    "force_field_weight",
+    "enable_plasticity", "plasticity", "plasticity_threshold",
+    "enable_bend_plasticity", "bend_plasticity", "bend_plasticity_threshold",
+    "bend_rest_angle_source",
+    "bend", "shrink", "shrink_x", "shrink_y", "length_factor",
+    "stitch_stiffness",
+    # STATIC-specific (used only when the group's object_type is "STATIC").
+    # PDRD-specific (used only when the group's object_type is "PDRD").
+    "pdrd_density",
+    # SAND-specific (used only when the group's object_type is "SAND").
+    "sand_grain_radius", "sand_particle_mass", "sand_friction",
+}
+
+
+@blender_api
+class _ParamProxy:
+    """Proxy for material and simulation parameters on a group.
+
+    Accessed via :attr:`Group.param`.  Attribute access is whitelisted:
+    reading or writing a name outside the whitelist raises
+    :class:`AttributeError`.
+
+    Whitelisted attributes:
+
+    - **Solver model**: ``solid_model``, ``shell_model``, ``rod_model``
+      (``rod_model`` currently accepts only ``"ARAP"``: the enum has a
+      single item and ROD groups force-pin it to ARAP)
+    - **Density**: ``solid_density``, ``shell_density``, ``rod_density``
+    - **Young's modulus**: ``solid_young_modulus``, ``shell_young_modulus``,
+      ``rod_young_modulus``
+    - **Poisson ratio**: ``solid_poisson_ratio``, ``shell_poisson_ratio``
+    - **Contact**: ``friction``, ``use_group_bounding_box_diagonal``,
+      ``contact_gap``, ``contact_gap_rat``, ``contact_offset``,
+      ``contact_offset_rat``.  When
+      ``use_group_bounding_box_diagonal`` is ``True`` (the default),
+      each assigned object is solved at ``contact_gap_rat`` and
+      ``contact_offset_rat`` times ITS OWN bounding-box diagonal, so the
+      objects of one group get distances in proportion to their own
+      sizes; the box around the group is never measured. Set it to
+      ``False`` to give every object the absolute ``contact_gap`` /
+      ``contact_offset`` values directly. ``contact_gap_limit_percent``
+      (every type but Sand; 1 to 50, default 25) caps the gap of either
+      mode at that share of the room between mesh neighbors, which is the
+      smallest triangle altitude or rod segment length nearby less twice
+      the contact offset, so a mesh finer than its gap does not press its
+      own neighbors apart.
+    - **Strain limit**: ``enable_strain_limit``, ``strain_limit_percent``
+    - **Inflation**: ``enable_inflate``, ``inflate_pressure``
+    - **Force fields**: ``force_field_weight`` (every type but Static): the
+      scene's force fields and force field script scale by this on the
+      group's objects, 1.0 as authored, 0.0 not at all
+    - **Plasticity**: ``enable_plasticity``, ``plasticity``,
+      ``plasticity_threshold``
+    - **Bend plasticity**: ``enable_bend_plasticity``, ``bend_plasticity``,
+      ``bend_plasticity_threshold``, ``bend_rest_angle_source``
+    - **Bend stiffness**: ``bend``, drawn on Shell and Rod groups
+    - **Rest-shape scale**: ``shrink_x`` / ``shrink_y`` (Shell, per axis),
+      ``shrink`` (Solid, uniform), ``length_factor`` (Rod, labeled
+      **Shrink** in the panel; it scales the rod's rest edge length)
+    - **Stitch**: ``stitch_stiffness`` (Solid and Shell)
+    - **PDRD-specific**: ``pdrd_density`` (kg/m^3, volumetric). The PDRD hinge
+      joint is per-object, set via :meth:`set_hinge` (not a group material).
+    - **Sand-specific**: ``sand_grain_radius`` (meters), ``sand_particle_mass``
+      (grams; the encoder sends kilograms), ``sand_friction``.  Once
+      :meth:`Solver.convert_to_particle_mesh` has run, the radius it seeded
+      is stamped on the object and the encoder reads that in preference to
+      ``sand_grain_radius``.
+
+    Example::
+
+        # Solver model
+        group.param.solid_model = "ARAP"
+        group.param.shell_model = "ARAP"
+
+        # Density (kg/m^3 solid, kg/m^2 shell, kg/m rod)
+        group.param.solid_density = 100.0
+        group.param.shell_density = 0.3
+        group.param.rod_density = 0.05
+
+        # Young's modulus (Pa) and Poisson ratio
+        group.param.solid_young_modulus = 1.0e6
+        group.param.shell_young_modulus = 5.0e5
+        group.param.rod_young_modulus = 1.0e7
+        group.param.solid_poisson_ratio = 0.45
+        group.param.shell_poisson_ratio = 0.30
+
+        # Contact (absolute mode)
+        group.param.use_group_bounding_box_diagonal = False
+        group.param.friction = 0.5
+        group.param.contact_gap = 0.001
+        group.param.contact_offset = 0.002
+
+        # Contact (ratio mode -- defaults)
+        group.param.use_group_bounding_box_diagonal = True
+        group.param.contact_gap_rat = 0.1
+        group.param.contact_offset_rat = 0.2
+
+        # Never more than 10% of the room between mesh neighbors
+        group.param.contact_gap_limit_percent = 10.0
+
+        # Strain limit (percentage; 5.0 == 5% allowed stretch)
+        group.param.enable_strain_limit = True
+        group.param.strain_limit_percent = 5.0
+
+        # Inflation
+        group.param.enable_inflate = True
+        group.param.inflate_pressure = 100.0
+
+        # Plasticity (shells and tets only)
+        group.param.enable_plasticity = True
+        group.param.plasticity = 0.3
+        group.param.plasticity_threshold = 0.2
+        group.param.enable_bend_plasticity = True
+        group.param.bend_plasticity = 0.5
+        group.param.bend_plasticity_threshold = 0.1
+        group.param.bend_rest_angle_source = "FROM_GEOMETRY"
+
+        # Bending (Shell and Rod), and the Shell per-axis rest-shape scale
+        group.param.bend = 1.0e-4
+        group.param.shrink_x = 0.99
+        group.param.shrink_y = 0.97
+
+        # Solid uniform rest-shape scale, and the Rod rest-length scale
+        group.param.shrink = 0.98
+        group.param.length_factor = 0.97
+
+        # Stitch (Solid, Shell and Rod)
+        group.param.stitch_stiffness = 5.0e4
+
+        # Sand-specific (particle mass in grams)
+        group.param.sand_particle_mass = 10.0
+        group.param.sand_friction = 0.4
+    """
+
+    def __init__(self, group_proxy: "_Group"):
+        object.__setattr__(self, "_group_proxy", group_proxy)
+
+    def __setattr__(self, key, value):
+        if key not in _PARAM_PROPS:
+            raise AttributeError(f"Unknown material parameter '{key}'")
+        gp = object.__getattribute__(self, "_group_proxy")
+        group = gp._get_group()
+        setattr(group, key, value)
+        from ...core.utils import redraw_all_windows
+        redraw_all_windows()
+
+    def __getattr__(self, key):
+        if key not in _PARAM_PROPS:
+            raise AttributeError(f"Unknown material parameter '{key}'")
+        gp = object.__getattribute__(self, "_group_proxy")
+        group = gp._get_group()
+        return getattr(group, key)
+
+@blender_api
+class _Group:
+    """A dynamics group proxy.
+
+    Created via :meth:`Solver.create_group`.  Material parameters are
+    accessed via :attr:`param`.  Every mutating method returns ``self``
+    so operations chain.
+
+    Example::
+
+        group = solver.create_group("Shirt", type="SHELL")
+        group.add("Shirt").set_overlay_color(0.9, 0.2, 0.1)
+        group.param.friction = 0.5
+        group.param.shell_density = 1.0
+    """
+
+    def __init__(self, uuid: str):
+        object.__setattr__(self, "_uuid", uuid)
+        object.__setattr__(self, "_param", _ParamProxy(self))
+
+    @property
+    @blender_api
+    def uuid(self) -> str:
+        """The UUID of this group.  Stable across renames.
+
+        Example::
+
+            group = solver.create_group("Shirt", type="SHELL")
+            same_group = solver.get_group(group.uuid)
+        """
+        return object.__getattribute__(self, "_uuid")
+
+    @property
+    @blender_api
+    def name(self) -> str:
+        """Display name of this group.
+
+        Example::
+
+            for g in solver.get_groups():
+                if g.name == "WovenStrands":
+                    g.delete()
+        """
+        return self._get_group().name
+
+    @property
+    @blender_api
+    def slot(self) -> int:
+        """The ``object_group_N`` slot index this group occupies.
+
+        This is the index every group operator addresses, resolved
+        through ``object_group_{index}``.  It is not
+        ``ObjectGroup.index``, which numbers the active groups
+        consecutively for display: the two agree only while every slot
+        below this one is active, so a scene that has ever deleted a
+        group can have them disagree.
+
+        Raises:
+            ValueError: If no slot holds this group's UUID.
+
+        Example::
+
+            group = solver.create_group("Shirt", type="SHELL")
+            print(f"stored in object_group_{group.slot}")
+        """
+        from ...models.groups import get_group_slot_index
+
+        # Resolve the group first, so this property accepts exactly the
+        # handles every other accessor on the proxy accepts:
+        # get_group_slot_index answers for any slot carrying the UUID,
+        # without consulting the slot's own state.
+        self._get_group()
+        slot = get_group_slot_index(bpy.context.scene, self._uuid)
+        if slot is None:
+            raise ValueError(f"Group '{self._uuid}' not found")
+        return slot
+
+    @property
+    @blender_api
+    def type(self) -> str:
+        """Dynamics type of this group.
+
+        One of ``"SOLID"``, ``"SHELL"``, ``"ROD"``, ``"STATIC"``,
+        ``"PDRD"``, ``"SAND"``.  Set at creation through
+        :meth:`Solver.create_group`.
+
+        Example::
+
+            for g in solver.get_groups():
+                if g.type == "ROD":
+                    g.param.length_factor = 0.97
+        """
+        return self._get_group().object_type
+
+    @property
+    @blender_api
+    def param(self) -> _ParamProxy:
+        """Material and simulation parameter proxy.  See :class:`GroupParam`.
+
+        Example::
+
+            group.param.friction = 0.5
+            group.param.shell_density = 1.0
+        """
+        return object.__getattribute__(self, "_param")
+
+    def _get_group(self):
+        from ...models.groups import get_group_by_uuid
+
+        group = get_group_by_uuid(bpy.context.scene, self._uuid)
+        if group is None:
+            raise ValueError(f"Group '{self._uuid}' not found")
+        return group
+
+    # -- Overlay -------------------------------------------------------------
+
+    @blender_api
+    def set_overlay_color(self, r: float, g: float, b: float, a: float = 1.0) -> "_Group":
+        """Set the viewport overlay color for this group and enable it.
+
+        Args:
+            r: Red channel in ``[0, 1]``.
+            g: Green channel in ``[0, 1]``.
+            b: Blue channel in ``[0, 1]``.
+            a: Alpha in ``[0, 1]`` (default ``1.0``).
+
+        Returns:
+            ``self`` for chaining.
+
+        Example::
+
+            group.set_overlay_color(0.9, 0.2, 0.1)  # red overlay
+        """
+        from ...ui.dynamics.overlay import apply_object_overlays
+
+        group = self._get_group()
+        group.color = (r, g, b, a)
+        group.show_overlay_color = True
+        apply_object_overlays()
+        return self
+
+    # -- Object assignment ---------------------------------------------------
+
+    @blender_api
+    def add(self, *object_names: str) -> "_Group":
+        """Add objects to this group by name.
+
+        Every group type takes meshes. A ROD group also takes curves and
+        Hair Curves objects, both of which are simulated as rods. A Hair
+        Curves point is a rod vertex, so the hair is simulated as it is
+        groomed, and when it is the first object of the group the group
+        takes the settings hair implies: the rest angle from the groom and a
+        zero contact offset. Hair attached to a surface gets its ``Roots``
+        pin, which holds the first segment of every curve.
+
+        Args:
+            *object_names: One or more Blender object names.
+
+        Returns:
+            ``self`` for chaining.
+
+        Example::
+
+            group.add("Shirt", "Skirt", "Sleeve")
+        """
+        import json
+
+        bpy.ops.zozo_contact_solver.add_objects_to_group(
+            group_uuid=self._uuid, object_names=json.dumps(list(object_names))
+        )
+        return self
+
+    @blender_api
+    def remove(self, object_name: str) -> "_Group":
+        """Remove an object from this group.
+
+        Args:
+            object_name: Name of the object to remove.
+
+        Returns:
+            ``self`` for chaining.
+
+        Example::
+
+            group.remove("Sleeve")
+        """
+        bpy.ops.zozo_contact_solver.remove_object_from_group(
+            group_uuid=self._uuid, object_name=object_name,
+        )
+        return self
+
+    # -- Initial velocity ----------------------------------------------------
+
+    @blender_api
+    def set_velocity(self, object_name: str,
+                     direction: tuple[float, float, float],
+                     speed: float, frame: int = 1,
+                     angular_axis: "int | str" = "PC3",
+                     angular_speed: float = 0.0,
+                     angular_axis_custom: tuple[float, float, float] = (0.0, 0.0, 1.0),
+                     enable_translational: bool = True,
+                     enable_angular: bool | None = None) -> "_Group":
+        """Keyframe a velocity on an object assigned to this group.
+
+        Appends an entry to the assigned object's
+        ``velocity_keyframes`` collection.  Call once with
+        ``frame=1`` for an initial-velocity launch; call again with
+        higher ``frame`` values to build a velocity schedule.
+
+        Args:
+            object_name: Name of an object already added to this group
+                via :meth:`add`.
+            direction: ``(dx, dy, dz)`` velocity direction; normalized
+                by the solver before use.
+            speed: Velocity magnitude in m/s.
+            frame: Frame at which the keyframe takes effect.  ``1`` (the
+                default) is the initial-velocity slot.
+            angular_axis: Axis to spin about (SOLID, SHELL, PDRD only).
+                One of ``"PC1"``/``"PC2"``/``"PC3"`` (principal axes,
+                resolved dynamically from the simulated geometry),
+                ``"X"``/``"Y"``/``"Z"`` (fixed world axes), or ``"CUSTOM"``
+                (the ``angular_axis_custom`` vector). Ints ``0``/``1``/``2``
+                are accepted as ``PC1``/``PC2``/``PC3`` for convenience.
+                Ignored when ``angular_speed == 0``.
+            angular_speed: Signed spin speed in degrees per second
+                (0 = no spin).
+            angular_axis_custom: World-space ``(x, y, z)`` axis used when
+                ``angular_axis == "CUSTOM"`` (normalized before use).
+            enable_translational: Overwrite the translational velocity at
+                this frame. When ``False`` the keyframe leaves translation
+                alone (e.g. a pure-spin keyframe).
+            enable_angular: Overwrite the angular velocity at this frame.
+                Defaults to ``True`` when ``angular_speed`` is non-zero,
+                else ``False``. Pass explicitly to override.
+
+        Returns:
+            ``self`` for chaining.
+
+        Raises:
+            ValueError: If the object is not assigned to this group, or
+                a keyframe already exists at the requested frame.
+
+        Example::
+
+            ball = solver.create_group("Ball", type="SOLID")
+            ball.add("Sphere")
+            ball.set_velocity("Sphere", direction=(1, 0, 0), speed=2.3)
+        """
+        if isinstance(angular_axis, int):
+            angular_axis = {0: "PC1", 1: "PC2", 2: "PC3"}.get(angular_axis, "PC3")
+        angular_axis = str(angular_axis).upper()
+        valid_axes = {"PC1", "PC2", "PC3", "X", "Y", "Z", "CUSTOM"}
+        if angular_axis not in valid_axes:
+            raise ValueError(
+                f"angular_axis must be one of {sorted(valid_axes)} or 0/1/2"
+            )
+        if enable_angular is None:
+            enable_angular = angular_speed != 0.0
+        from ...core.uuid_registry import get_or_create_object_uuid
+        from ...models.collection_utils import sort_keyframes_by_frame
+
+        group = self._get_group()
+        obj = bpy.data.objects.get(object_name)
+        obj_uuid = get_or_create_object_uuid(obj) if obj else ""
+
+        target = None
+        for assigned in group.assigned_objects:
+            if obj_uuid and assigned.uuid == obj_uuid:
+                target = assigned
+                break
+            if not obj_uuid and assigned.name == object_name:
+                target = assigned
+                break
+        if target is None:
+            raise ValueError(
+                f"Object '{object_name}' is not assigned to this group"
+            )
+
+        for kf in target.velocity_keyframes:
+            if kf.frame == frame:
+                raise ValueError(
+                    f"Velocity keyframe at frame {frame} already exists "
+                    f"on '{object_name}'"
+                )
+
+        kf = target.velocity_keyframes.add()
+        kf.frame = frame
+        kf.direction = direction
+        kf.speed = speed
+        kf.angular_axis = angular_axis
+        kf.angular_speed = float(angular_speed)
+        kf.angular_axis_custom = tuple(float(c) for c in angular_axis_custom)
+        kf.enable_translational = bool(enable_translational)
+        kf.enable_angular = bool(enable_angular)
+        target.velocity_keyframes_index = sort_keyframes_by_frame(
+            target.velocity_keyframes
+        )
+        return self
+
+    @blender_api
+    def set_hinge(self, object_name: str, pca_axis: int = 2,
+                  enable: bool = True) -> "_Group":
+        """Pin a PDRD body assigned to this group as a hinge (per object).
+
+        Locks the body's position and restricts its rotation to one principal
+        (PCA) axis of its rest shape, the building block for gears. The group
+        must be of type ``PDRD``. This is a per-object setting, so different
+        bodies in the same group can be hinged on different axles.
+
+        Args:
+            object_name: Name of an object already added to this group via
+                :meth:`add`.
+            pca_axis: Which principal axis is the free axle: ``0`` (largest
+                extent), ``1`` (middle), or ``2`` (thinnest, the usual axle
+                for a flat gear or disk). Defaults to ``2``.
+            enable: Set ``False`` to clear the hinge and let the body move
+                freely. Defaults to ``True``.
+
+        Returns:
+            ``self`` for chaining.
+
+        Raises:
+            ValueError: If the group is not PDRD, the object is not assigned to
+                it, or ``pca_axis`` is not in ``{0, 1, 2}``.
+
+        Example::
+
+            gears = solver.create_group("Gears", type="PDRD")
+            gears.add("GearA")
+            gears.set_hinge("GearA", pca_axis=2)
+        """
+        from ...core.uuid_registry import get_or_create_object_uuid
+
+        group = self._get_group()
+        if group.object_type != "PDRD":
+            raise ValueError("set_hinge requires a PDRD group")
+        if pca_axis not in (0, 1, 2):
+            raise ValueError(f"pca_axis must be 0, 1 or 2; got {pca_axis!r}")
+
+        obj = bpy.data.objects.get(object_name)
+        obj_uuid = get_or_create_object_uuid(obj) if obj else ""
+        target = None
+        for assigned in group.assigned_objects:
+            if obj_uuid and assigned.uuid == obj_uuid:
+                target = assigned
+                break
+            if not obj_uuid and assigned.name == object_name:
+                target = assigned
+                break
+        if target is None:
+            raise ValueError(
+                f"Object '{object_name}' is not assigned to this group"
+            )
+
+        target.pdrd_hinge_enable = bool(enable)
+        target.pdrd_hinge_axis = str(int(pca_axis))
+        return self
+
+    # -- Pin management ------------------------------------------------------
+
+    @blender_api
+    def create_pin(self, object_name: str, vertex_group_name: str,
+                   indices: list[int] | None = None,
+                   weights: list[float] | None = None) -> _Pin:
+        """Pin a vertex group (mesh), a set of control points (curve) or a
+        set of points (Hair Curves).
+
+        Args:
+            object_name: Name of the mesh, curve or Hair Curves object.
+            vertex_group_name: For meshes, the name of an existing vertex
+                group on the object.  For curves, the logical name used
+                for the curve's ``_pin_<vertex_group_name>`` custom
+                property holding the pinned control-point indices.  For
+                Hair Curves, the name of a point attribute, or ``"Roots"``,
+                which holds the first segment of every curve and needs no
+                attribute.  A boolean attribute holds the points it marks; a
+                float one holds every point with a weight above zero.
+            indices: Control-point indices of a curve, or point indices of
+                a Hair Curves object.  When given, the curve's
+                ``_pin_<vertex_group_name>`` property, or the Hair Curves
+                object's point attribute of that name, is written before the
+                pin is registered, so the same call both defines and binds
+                the pin.  Must be ``None`` for meshes (meshes use existing
+                vertex groups).
+            weights: One weight per entry of ``indices``, each above 0 and
+                at most 1, for a Hair Curves object only.  The pin is then
+                stored as a float point attribute, and once the pin pulls
+                (:meth:`Pin.pull`) each point is pulled with the strength
+                times its own weight.  A pin that holds exactly holds every
+                listed point alike.
+
+        Returns:
+            A :class:`Pin` proxy for the newly created pin.
+
+        Raises:
+            ValueError: If the object is missing, not a mesh, curve or
+                Hair Curves object, the vertex group does not exist on a
+                mesh, the ``_pin_<name>`` property is missing on a curve
+                and no ``indices`` were supplied, a Hair Curves object has
+                no attribute of that name and the name is not ``"Roots"``,
+                ``indices`` is passed for a mesh, or ``weights`` is passed
+                for anything but a Hair Curves object with ``indices``.
+
+        Example::
+
+            # Mesh: vertex group must already exist.
+            pin = group.create_pin("Cloth", "collar")
+            pin.move_by(delta=(0, 0, 0.2), frame_start=1, frame_end=60)
+
+            # Curve: pass control-point indices to define and bind in
+            # one call.
+            rod_pin = rod_group.create_pin(
+                "WovenCylinder", "left", indices=[0, 7, 14, 21],
+            )
+
+            # Hair Curves: the roots need no indices.
+            hair_pin = rod_group.create_pin("Hair", "Roots")
+
+            # Hair Curves: a pull that fades from the second point of a
+            # strand to its tip.
+            goal = rod_group.create_pin(
+                "Hair", "Goal", indices=[1, 2, 3, 4],
+                weights=[1.0, 0.6, 0.3, 0.1],
+            )
+            goal.pull(strength=5.0)
+        """
+        obj = bpy.data.objects.get(object_name)
+        if weights is not None:
+            if obj is None or obj.type != "CURVES":
+                raise ValueError(
+                    "'weights' is only valid for a Hair Curves object, whose pin "
+                    f"is a point attribute that can hold them; '{object_name}' is "
+                    f"{obj.type if obj is not None else 'missing'}"
+                )
+            if indices is None:
+                raise ValueError(
+                    "'weights' gives one weight per entry of 'indices', and no "
+                    "indices were given"
+                )
+        if obj is not None and indices is not None:
+            if obj.type not in ("CURVE", "CURVES"):
+                raise ValueError(
+                    f"'indices' is only valid for curve and Hair Curves "
+                    f"objects; '{object_name}' is {obj.type}"
+                )
+            if obj.type == "CURVES":
+                from ...core.hair_curves import store_pin_indices
+                store_pin_indices(obj, vertex_group_name, indices, weights)
+            else:
+                import json
+                obj[f"_pin_{vertex_group_name}"] = json.dumps(list(indices))
+
+        # Validation + locking + raw mutation all go through
+        # core.mutation so scripts and MCP clients share one gate.
+        from ...core import mutation
+        try:
+            mutation.create_pin(self._uuid, object_name, vertex_group_name)
+        except mutation.MutationError as e:
+            raise ValueError(str(e))
+        return _Pin(self._uuid, object_name, vertex_group_name)
+
+    @blender_api
+    def get_pins(self) -> list[_Pin]:
+        """Return all pins in this group as :class:`Pin` proxies.
+
+        Example::
+
+            for pin in group.get_pins():
+                print(pin.object_name, pin.vertex_group_name)
+        """
+        from ...models.groups import decode_vertex_group_identifier
+
+        group = self._get_group()
+        result = []
+        for pin in group.pin_vertex_groups:
+            obj_name, vg_name = decode_vertex_group_identifier(pin.name)
+            if obj_name and vg_name:
+                result.append(_Pin(self._uuid, obj_name, vg_name))
+        return result
+
+    # -- Lifecycle -----------------------------------------------------------
+
+    @blender_api
+    def delete(self) -> None:
+        """Delete this group and every pin it owns.
+
+        Example::
+
+            group.delete()
+        """
+        bpy.ops.zozo_contact_solver.delete_group(group_uuid=self._uuid)
+
+    def __repr__(self):
+        try:
+            group = self._get_group()
+            name = group.name or "unnamed"
+            return f"Group({name!r}, uuid={self._uuid!r})"
+        except ValueError:
+            return f"Group(deleted, uuid={self._uuid!r})"

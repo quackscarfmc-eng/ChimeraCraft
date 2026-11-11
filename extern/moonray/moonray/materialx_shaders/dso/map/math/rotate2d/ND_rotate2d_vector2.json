@@ -1,0 +1,28 @@
+{
+    "attributes" :
+    {
+        "amountAttr" :
+        {
+            "comment" : "the amount to rotate, specified in degrees, with positive values rotating the incoming vector counterclockwise",
+            "default" : "0.0f",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "amount",
+            "type" : "Float"
+        },
+        "disableAttr" :
+        {
+            "default" : 0,
+            "name" : "disable",
+            "type" : "Bool"
+        },
+        "inAttr" :
+        {
+            "default" : "Vec2f(0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "name" : "in",
+            "type" : "Vec2f"
+        }
+    },
+    "name" : "ND_rotate2d_vector2",
+    "type" : "Map"
+}

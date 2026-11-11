@@ -1,0 +1,40 @@
+mtllib "materials.mtl"
+
+v -1.0 -1.0 1.0
+v -1.0 1.0 1.0
+v 1.0 1.0 1.0
+v 1.0 -1.0 1.0
+v -1.0 -1.0 -1.0
+v -1.0 1.0 -1.0
+# whitespace after keyword
+v    1.0 1.0 -1.0
+# indented keyword
+    v 1.0 -1.0 -1.0
+
+g default
+usemtl no_textures_red
+f 4 3 2 1
+usemtl four_maps
+f 1 2 6 5
+usemtl Clay
+f 7 6 2 3
+usemtl Hat
+f 4 8 7 3 
+# whitespace after keyword
+f     5 8 4 1  
+# indented keyword
+    f 5 6 7 8
+
+o ObjMtlAfter
+usemtl no_textures_red
+v 3 0 0
+v 4 0 2
+v 5 0 0
+f -3 -2 -1
+
+usemtl Clay
+o ObjMtlBefore
+v 6 0 0
+v 7 0 2
+v 8 0 0
+f -3 -2 -1

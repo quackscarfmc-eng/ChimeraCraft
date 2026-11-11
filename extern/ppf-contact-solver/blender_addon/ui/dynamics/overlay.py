@@ -1,0 +1,877 @@
+# File: overlay.py
+# Code: Claude Code and Codex
+# Review: Ryoichi Ando (ryoichi.ando@zozo.com)
+# License: GPL-3.0-or-later
+import bpy  # pyright: ignore
+import gpu  # pyright: ignore
+
+from gpu_extras.batch import batch_for_shader  # pyright: ignore
+from mathutils import Vector  # pyright: ignore
+
+from ..state import iterate_active_object_groups
+from ...models.groups import get_addon_data
+
+from .overlay_geometry import (
+    DirectionPreviewManager,
+    _build_collider_batches,
+    _build_operation_batches,
+    _build_pdrd_hinge_batches,
+    _build_pin_data,
+    _build_rod_batches,
+    _build_rotation_lock_batches,
+    _build_snap_batches,
+    _build_translation_lock_batches,
+    _build_violation_batches,
+    _build_velocity_arrow_batches,
+    _resolve_scene_dyn_params,
+)
+from .overlay_labels import draw_overlay_labels
+
+# Global overlay handler
+overlay_handler = None
+
+# Module-level cache for overlay draw data
+_overlay_cache = {
+    "version": -1,
+    "frame": -1,
+    # Per-builder cache keys for the three scene-topology builders (rod, pin,
+    # snap). Each promotes its OWN key, so one builder cannot force the other
+    # two to rebuild every redraw. See ``_rebuild_cached`` for why a FAILING
+    # builder promotes its key too.
+    "rod_key": None,
+    "pin_key": None,
+    "snap_key": None,
+    # builder name -> repr of the last reported exception, so a persistent
+    # failure is reported once rather than once per frame.
+    "failures": {},
+    # Keys used by view-distance-dependent builders. Stored separately so a
+    # zoom-only change only rebuilds the view-scaled batches, not the
+    # scene-topology batches.
+    "view_distance": 0.0,
+    "view_version": -1,
+    "view_frame": -1,
+    "rod_batches": [],
+    "snap_batches": [],
+    "snap_points": [],
+    "pin_data": [],
+    "direction_labels": [],
+    "direction_batches": [],
+    "op_batches": [],
+    "op_labels": [],
+    "collider_batches": [],
+    "velocity_batches": [],
+    "velocity_labels": [],
+    # The force field's Visualize arrows and the key they were built for
+    # (`overlay_geometry.force_field.force_field_key` plus the view scale).
+    "force_field_key": None,
+    "force_field_batches": [],
+    "translation_lock_batches": [],
+    "rotation_lock_batches": [],
+    "violation_batches": [],
+    "violation_labels": [],
+    "violation_version": -1,
+    "exemption_batches": [],
+    "exemption_labels": [],
+    "exemption_version": None,
+}
+
+def exemptions_to_draw(scene, exemptions):
+    """The Allow Existing Intersections records to draw on this frame.
+
+    All of them on the frame the simulation starts from, and none on any
+    other: the records are START-POSE geometry, so on a later frame the cloth
+    has moved and the highlight would float where it used to be. The one rule
+    the draw handler applies, kept apart from it so it can be checked without a
+    GPU context.
+    """
+    from ...core.encoder import resolve_start_frame_or_default
+    if not exemptions:
+        return []
+    if scene.frame_current != resolve_start_frame_or_default(scene):
+        return []
+    return exemptions
+
+
+# Zoom delta that triggers rebuild of view-scaled batches.
+_VIEW_DISTANCE_TOL = 0.05
+
+# On-screen point sizes for the POINTS overlays drawn at the uniform draw site.
+# These tuples intentionally carry no per-point size, so the size is applied
+# here via the shader uniform.
+_OP_POINT_SIZE = 8.0
+_VIOLATION_POINT_SIZE = 16.0
+
+_direction_manager = DirectionPreviewManager()
+
+
+def _rebuild_cached(name, key, build, *, force=False):
+    """Run one scene-topology overlay builder at most once per *key*.
+
+    Returns True when *build* ran and succeeded on this call.
+
+    A builder that RAISES still promotes its key, which is the load-bearing
+    part. Re-running a builder over unchanged scene state cannot change the
+    outcome, but it does re-pay the full build cost, and these builders are
+    expensive: ``_build_pin_data`` resolves pin vertex groups through
+    ``get_vertices_in_group``, an O(verts x groups) walk that costs a few
+    hundred milliseconds on a rigged character (70 vertex groups over 6.4k
+    vertices). Retrying it on every viewport draw is therefore a permanent
+    frame cost for as long as the failing condition holds, and since that
+    condition typically lives in the saved scene, reopening the file does not
+    clear it. A builder is retried only when the scene state changes, the one
+    circumstance under which the outcome can differ.
+
+    The condition to expect is an edit that changes a mesh's vertex count.
+    Blender maintains its own vertex groups across such an edit, so the pin
+    groups stay valid, but the addon's derived per-vertex caches do not: a PC2
+    display cache and a captured STATIC deformation are both sized for the old
+    vertex count, and the pin builder reads them.
+
+    Each failure is reported ONCE per distinct (builder, exception) rather than
+    once per frame, so a persistent fault is visible without flooding the
+    console.
+    """
+    key_name = name + "_key"
+    if not force and _overlay_cache[key_name] == key:
+        return False
+    try:
+        build()
+    except Exception as exc:
+        signature = repr(exc)
+        if _overlay_cache["failures"].get(name) != signature:
+            _overlay_cache["failures"][name] = signature
+            print(
+                f"[ppf] overlay builder '{name}' failed: {signature}. "
+                f"Skipping it until the scene changes, so it cannot rebuild "
+                f"every redraw. If this followed an edit that changed a "
+                f"vertex count, that object's display cache and captured "
+                f"deformation are sized for the old count: clear them and "
+                f"re-run Transfer."
+            )
+        _overlay_cache[key_name] = key
+        return False
+    _overlay_cache["failures"].pop(name, None)
+    _overlay_cache[key_name] = key
+    return True
+
+
+def draw_overlay_callback():
+    """Draw overlay for ROD objects and pin vertices"""
+    context = bpy.context
+    scene = context.scene
+    if context.screen is None:
+        return
+    view_3d = None
+
+    for area in context.screen.areas:
+        if area.type == "VIEW_3D":
+            view_3d = area
+            break
+
+    if not view_3d:
+        return
+
+    try:
+        vis_state = get_addon_data(scene).state
+    except Exception:
+        vis_state = None
+    hide_pins = bool(getattr(vis_state, "hide_pins", False))
+    hide_arrows = bool(getattr(vis_state, "hide_arrows", False))
+    hide_overlay_colors = bool(getattr(vis_state, "hide_overlay_colors", False))
+    hide_snaps = bool(getattr(vis_state, "hide_snaps", False))
+    hide_pin_operations = bool(getattr(vis_state, "hide_pin_operations", False))
+
+    # NOTE: previous versions of this draw callback forced
+    # ``space.shading.color_type = "OBJECT"`` whenever any group had
+    # ``show_overlay_color`` on, so users picking Material / Random /
+    # Vertex / Texture / Single in Solid shading would have their
+    # choice snapped back on the next redraw. The per-object overlay
+    # tint (``obj.color = group.color`` in ``apply_object_overlays``)
+    # is still applied, but the viewport shading mode is now the
+    # user's decision: if they want to see the overlay tints they
+    # pick Solid + Object themselves.
+
+    # Get matrices
+    region = view_3d.spaces.active.region_3d
+
+    # Get view and projection matrices
+    view_matrix = region.view_matrix
+    projection_matrix = region.window_matrix
+
+    # --- Cache invalidation ---
+    try:
+        version = get_addon_data(scene).state.overlay_version
+    except Exception:
+        version = 0
+    frame = scene.frame_current
+    view_distance = region.view_distance
+    cached_view_distance = _overlay_cache["view_distance"]
+    # An object in Edit Mode owns its vertex positions via BMesh; the
+    # object-mode mesh data and the overlay_version are not updated
+    # for live vertex drags. Force a per-redraw rebuild while any
+    # pinned mesh is being edited so the pin overlay tracks the drag
+    # in real time. Cost is bounded by ``_build_pin_data`` over the
+    # active groups, which is the same cost as a normal frame change.
+    # Iterate the objects actually in Edit Mode (``objects_in_mode`` is
+    # usually empty, occasionally one, never the whole scene) and test
+    # membership against the assigned set, rather than walking every
+    # assigned object and resolving it per redraw. A quiet redraw on a
+    # large scene then pays O(objects-in-edit) instead of O(assigned),
+    # which is the difference between a free check and ~46ms on a
+    # 1.6k-object net.
+    any_pin_obj_in_edit = False
+    try:
+        edited = [
+            ob for ob in getattr(context, "objects_in_mode", ())
+            if ob.type == "MESH" and ob.mode == "EDIT"
+        ]
+        if edited:
+            from ...core.uuid_registry import get_object_uuid
+            pinned_uuids = {
+                obj_ref.uuid
+                for grp in iterate_active_object_groups(scene)
+                if grp.object_type != "STATIC"
+                for obj_ref in grp.assigned_objects
+                if obj_ref.included and obj_ref.uuid
+            }
+            any_pin_obj_in_edit = any(
+                get_object_uuid(ob) in pinned_uuids for ob in edited
+            )
+    except Exception:
+        any_pin_obj_in_edit = False
+    # One key shared by the three scene-topology builders, compared per
+    # builder so a failure in one does not drag the others into a per-redraw
+    # rebuild (see ``_rebuild_cached``).
+    scene_key = (version, frame)
+    rod_needs_rebuild = (
+        any_pin_obj_in_edit
+        or _overlay_cache["rod_key"] != scene_key
+        or _overlay_cache["pin_key"] != scene_key
+        or _overlay_cache["snap_key"] != scene_key
+    )
+    # View-scaled batches also need to refresh on zoom.
+    view_needs_rebuild = (
+        rod_needs_rebuild
+        or version != _overlay_cache["view_version"]
+        or frame != _overlay_cache["view_frame"]
+        or cached_view_distance <= 0.0
+        or abs(view_distance - cached_view_distance)
+           > _VIEW_DISTANCE_TOL * cached_view_distance
+    )
+    # Fetched lazily by the first rebuild block that needs it and reused by
+    # the later ones, so a quiet redraw (no rebuild fires) makes zero calls
+    # while a rebuild frame fetches the (identical) depsgraph exactly once.
+    depsgraph = None
+    if rod_needs_rebuild:
+        if depsgraph is None:
+            depsgraph = context.evaluated_depsgraph_get()
+
+        def _rebuild_rod():
+            _overlay_cache["rod_batches"] = _build_rod_batches(scene, depsgraph)
+
+        def _rebuild_pin():
+            _overlay_cache["pin_data"] = _build_pin_data(scene, depsgraph)
+
+        def _rebuild_snap():
+            # Snap batches: prefer the PC2 cache, else sample the evaluated
+            # mesh (via depsgraph) so stitch endpoints track modifier
+            # deformation instead of drawing at the rest/bind pose.
+            (
+                _overlay_cache["snap_batches"],
+                _overlay_cache["snap_points"],
+            ) = _build_snap_batches(scene, depsgraph)
+
+        # Each builder promotes its own key, so a failure in one does not force
+        # the other two to rebuild on every redraw. An edit-mode drag forces
+        # all three, since BMesh positions do not bump overlay_version.
+        _rebuild_cached("rod", scene_key, _rebuild_rod, force=any_pin_obj_in_edit)
+        _rebuild_cached("pin", scene_key, _rebuild_pin, force=any_pin_obj_in_edit)
+        _rebuild_cached("snap", scene_key, _rebuild_snap, force=any_pin_obj_in_edit)
+
+        # Kept in step for any reader that inspects the legacy shared key.
+        _overlay_cache["version"] = version
+        _overlay_cache["frame"] = frame
+
+    rod_batches = _overlay_cache["rod_batches"]
+    snap_batches = _overlay_cache["snap_batches"]
+    snap_points = _overlay_cache["snap_points"]
+
+    if rod_batches:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
+
+        for batch, color in rod_batches:
+            shader.bind()
+            shader.uniform_float("color", color)
+            batch.draw(shader)
+
+        gpu.state.blend_set("NONE")
+
+    if snap_batches and not hide_snaps:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
+
+        for batch, color in snap_batches:
+            shader.bind()
+            shader.uniform_float("color", color)
+            batch.draw(shader)
+
+        gpu.state.blend_set("NONE")
+
+    if snap_points and not hide_snaps:
+        # POINT_UNIFORM_COLOR (not UNIFORM_COLOR + point_size_set): Metal
+        # has no fixed-function point size, so on Blender 5.x macOS the
+        # state setter is a no-op and points render at 1 px. The point
+        # shader writes gl_PointSize from its `size` uniform on both
+        # backends.
+        shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(False)
+        gpu.state.program_point_size_set(True)
+
+        grouped: dict[tuple, list] = {}
+        for vertex, size, color in snap_points:
+            # Clip only points behind the camera (ndc.w <= 0), matching the
+            # pin_data block. Without this, snap markers behind the camera
+            # render as oversized degenerate dots under program_point_size.
+            clip = (
+                projection_matrix
+                @ view_matrix
+                @ Vector((vertex[0], vertex[1], vertex[2], 1.0))
+            )
+            if clip.w <= 0:
+                continue
+            grouped.setdefault((float(size), tuple(color)), []).append(vertex)
+        for (size, color), verts in grouped.items():
+            batch = batch_for_shader(shader, "POINTS", {"pos": verts})
+            shader.bind()
+            shader.uniform_float("color", color)
+            shader.uniform_float("size", size)
+            batch.draw(shader)
+
+        gpu.state.program_point_size_set(False)
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+
+    pin_data = _overlay_cache["pin_data"]
+
+    if pin_data and not hide_pins:
+        # POINT_UNIFORM_COLOR (see snap_points block): Metal needs the
+        # shader to write gl_PointSize, since fixed-function point size
+        # is unsupported.
+        shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(False)
+        gpu.state.program_point_size_set(True)
+
+        grouped: dict[tuple, list] = {}
+        for vertex, size, color in pin_data:
+            # Clip only points behind the camera (ndc.w <= 0 in OpenGL convention).
+            # The GPU handles frustum clipping for points that are in front but
+            # outside the XY viewport, so we intentionally do NOT reject on
+            # |ndc.xy| > 1 or on ndc.z, Blender's window_matrix is OpenGL-style
+            # with ndc.z in [-1, 1], and a [0, 1] range would silently drop any
+            # pin in the front half of the frustum.
+            clip = (
+                projection_matrix
+                @ view_matrix
+                @ Vector((vertex[0], vertex[1], vertex[2], 1.0))
+            )
+            if clip.w <= 0:
+                continue
+            grouped.setdefault((float(size), tuple(color)), []).append(vertex)
+
+        for (size, color), verts in grouped.items():
+            batch = batch_for_shader(shader, "POINTS", {"pos": verts})
+            shader.bind()
+            shader.uniform_float("color", color)
+            shader.uniform_float("size", size)
+            batch.draw(shader)
+
+        gpu.state.program_point_size_set(False)
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+
+    # --- Direction previews (gravity, wind, etc.) ---
+    try:
+        if view_needs_rebuild:
+            state = get_addon_data(scene).state
+            _direction_manager.clear()
+            current_frame = scene.frame_current
+
+            gravity, wind_dir, wind_strength = _resolve_scene_dyn_params(
+                state, current_frame,
+            )
+
+            if state.preview_gravity_direction and not hide_arrows:
+                vec = Vector(gravity)
+                if vec.length > 1e-6:
+                    _direction_manager.add(
+                        "Gravity", vec.normalized(), (0.3, 0.5, 1.0),
+                        label="Gravity", strength=vec.length, unit="m/s\u00b2",
+                        raw_direction=vec.normalized(),
+                    )
+            if state.preview_wind_direction and not hide_arrows:
+                vec = Vector(wind_dir)
+                if vec.length > 1e-6 and wind_strength > 1e-6:
+                    _direction_manager.add(
+                        "Wind", vec.normalized(), (0.3, 1.0, 0.5),
+                        label="Wind", strength=wind_strength, unit="m/s",
+                        raw_direction=vec.normalized(),
+                    )
+            # Scale sphere to a fixed fraction of the view distance
+            view_radius = view_distance * 0.08
+            _overlay_cache["direction_batches"] = (
+                _direction_manager.build_batches(radius=view_radius) or []
+            )
+        preview_batches = _overlay_cache["direction_batches"]
+        if preview_batches:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("NONE")
+            gpu.state.depth_mask_set(False)
+
+            for data in preview_batches:
+                # Filled sphere background (semi-transparent)
+                shader.bind()
+                shader.uniform_float("color", data["fill_color"])
+                data["fill_batch"].draw(shader)
+
+                # Sphere wireframe (triangle-based thickness)
+                shader.bind()
+                shader.uniform_float("color", data["sphere_color"])
+                data["sphere_batch"].draw(shader)
+
+                # Arrow shaft (triangle-based thickness)
+                shader.bind()
+                shader.uniform_float("color", data["arrow_color"])
+                data["shaft_batch"].draw(shader)
+
+                # Arrow cone head
+                shader.bind()
+                shader.uniform_float("color", data["arrow_color"])
+                data["cone_batch"].draw(shader)
+
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.depth_mask_set(True)
+            gpu.state.blend_set("NONE")
+
+        # Store label data for 2D text handler
+        _overlay_cache["direction_labels"] = preview_batches or []
+
+    except Exception:
+        _overlay_cache["direction_labels"] = []
+
+    # --- Operation overlays (spin circle, move_by/scale trajectories) ---
+    if view_needs_rebuild:
+        try:
+            if hide_pin_operations:
+                op_batches, op_labels = [], []
+            else:
+                if depsgraph is None:
+                    depsgraph = context.evaluated_depsgraph_get()
+                op_batches, op_labels = _build_operation_batches(
+                    scene, depsgraph, view_distance,
+                )
+            # PDRD hinge axle gizmos. Drawn at the same TRIS site as pin
+            # operations but independent of `hide_pin_operations`: a hinge is
+            # a structural joint, not a pin op.
+            try:
+                if depsgraph is None:
+                    depsgraph = context.evaluated_depsgraph_get()
+                h_batches, h_labels = _build_pdrd_hinge_batches(
+                    scene, depsgraph, view_distance,
+                )
+                op_batches = op_batches + h_batches
+                op_labels = op_labels + h_labels
+            except Exception:
+                pass
+            _overlay_cache["op_batches"] = op_batches
+            _overlay_cache["op_labels"] = op_labels
+        except Exception:
+            _overlay_cache["op_batches"] = []
+            _overlay_cache["op_labels"] = []
+
+    op_batches = _overlay_cache["op_batches"]
+    if op_batches:
+        # Two shaders: TRIS use UNIFORM_COLOR, POINTS use
+        # POINT_UNIFORM_COLOR (Metal point-size, see snap_points block).
+        tri_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        point_shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("NONE")
+        gpu.state.depth_mask_set(False)
+        gpu.state.program_point_size_set(True)
+
+        for batch, prim_type, color in op_batches:
+            if prim_type == "POINTS":
+                point_shader.bind()
+                point_shader.uniform_float("color", color)
+                point_shader.uniform_float("size", _OP_POINT_SIZE)
+                batch.draw(point_shader)
+            else:
+                tri_shader.bind()
+                tri_shader.uniform_float("color", color)
+                batch.draw(tri_shader)
+
+        gpu.state.program_point_size_set(False)
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+
+    # --- Invisible collider previews ---
+    if view_needs_rebuild:
+        try:
+            _overlay_cache["collider_batches"] = _build_collider_batches(view_distance)
+        except Exception:
+            _overlay_cache["collider_batches"] = []
+
+    collider_batches = _overlay_cache["collider_batches"]
+    if collider_batches:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(False)
+
+        for batch, color in collider_batches:
+            shader.bind()
+            shader.uniform_float("color", color)
+            batch.draw(shader)
+
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+
+    # --- Violation highlights ---
+    try:
+        from ...core.facade import communicator as _com
+        v_list = _com.info.violations
+        v_ver = id(v_list) if v_list else -1
+        if v_ver != _overlay_cache["violation_version"]:
+            _overlay_cache["violation_version"] = v_ver
+            if v_list:
+                if depsgraph is None:
+                    depsgraph = context.evaluated_depsgraph_get()
+                vb, vl = _build_violation_batches(scene, depsgraph, v_list)
+                _overlay_cache["violation_batches"] = vb
+                _overlay_cache["violation_labels"] = vl
+            else:
+                _overlay_cache["violation_batches"] = []
+                _overlay_cache["violation_labels"] = []
+    except Exception:
+        pass
+
+    # --- Allow Existing Intersections: what the build exempted ---
+    #
+    # The pairs are START-POSE geometry, so they are drawn only while the
+    # timeline sits on the frame the simulation starts from; on any other
+    # frame the cloth has moved and the highlight would float where it used
+    # to be. Keyed on the list's first record and on that frame test, so a
+    # poll returning the same exemptions rebuilds nothing.
+    try:
+        from ...core.facade import communicator as _com
+        e_list = exemptions_to_draw(scene, _com.info.exemptions)
+        e_ver = (id(e_list[0]) if e_list else None, len(e_list))
+        if e_ver != _overlay_cache["exemption_version"]:
+            _overlay_cache["exemption_version"] = e_ver
+            if e_list:
+                if depsgraph is None:
+                    depsgraph = context.evaluated_depsgraph_get()
+                eb, el = _build_violation_batches(scene, depsgraph, e_list)
+                _overlay_cache["exemption_batches"] = eb
+                _overlay_cache["exemption_labels"] = el
+            else:
+                _overlay_cache["exemption_batches"] = []
+                _overlay_cache["exemption_labels"] = []
+    except Exception:
+        pass
+
+    violation_batches = (_overlay_cache["violation_batches"]
+                         + _overlay_cache["exemption_batches"])
+    if violation_batches:
+        # Two shaders: TRIS use UNIFORM_COLOR, POINTS use
+        # POINT_UNIFORM_COLOR (Metal point-size, see snap_points block).
+        tri_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        point_shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
+        gpu.state.blend_set("ALPHA")
+        gpu.state.depth_test_set("NONE")
+        gpu.state.depth_mask_set(False)
+        gpu.state.program_point_size_set(True)
+
+        for batch, prim_type, color in violation_batches:
+            if prim_type == "POINTS":
+                point_shader.bind()
+                point_shader.uniform_float("color", color)
+                point_shader.uniform_float("size", _VIOLATION_POINT_SIZE)
+                batch.draw(point_shader)
+            else:
+                tri_shader.bind()
+                tri_shader.uniform_float("color", color)
+                batch.draw(tri_shader)
+
+        gpu.state.program_point_size_set(False)
+        gpu.state.depth_test_set("LESS_EQUAL")
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+
+    # --- Per-object initial velocity arrows ---
+    if view_needs_rebuild:
+        try:
+            if hide_arrows:
+                vel_batches, vel_labels, lock_batches, rot_lock_batches = [], [], [], []
+            else:
+                vel_batches, vel_labels = _build_velocity_arrow_batches(
+                    scene, view_distance,
+                )
+                lock_batches = _build_translation_lock_batches(
+                    scene, view_distance,
+                )
+                rot_lock_batches = _build_rotation_lock_batches(
+                    scene, view_distance,
+                )
+            _overlay_cache["velocity_batches"] = vel_batches
+            _overlay_cache["velocity_labels"] = vel_labels
+            _overlay_cache["translation_lock_batches"] = lock_batches
+            _overlay_cache["rotation_lock_batches"] = rot_lock_batches
+        except Exception:
+            _overlay_cache["velocity_batches"] = []
+            _overlay_cache["velocity_labels"] = []
+            _overlay_cache["translation_lock_batches"] = []
+            _overlay_cache["rotation_lock_batches"] = []
+        # Promote the view-cache key last, so a failed builder retries next
+        # frame rather than freezing stale/empty cached batches.
+        _overlay_cache["view_distance"] = view_distance
+        _overlay_cache["view_version"] = version
+        _overlay_cache["view_frame"] = frame
+    # --- Force field arrows (Visualize) ---
+    # Keyed on everything the arrows depend on rather than on the overlay
+    # version, because moving a field object in the viewport changes the field
+    # without touching any addon state.
+    try:
+        from .overlay_geometry.force_field import (
+            build_force_field_batches,
+            force_field_key,
+        )
+
+        ff_state = get_addon_data(scene).state
+        ff_key = force_field_key(scene, ff_state)
+        if ff_key is not None:
+            ff_key = ff_key + (round(view_distance, 1),)
+        if ff_key != _overlay_cache["force_field_key"]:
+            _overlay_cache["force_field_key"] = ff_key
+            _overlay_cache["force_field_batches"] = (
+                build_force_field_batches(scene, ff_state, view_distance)
+                if ff_key is not None else []
+            )
+        ff_batches = _overlay_cache["force_field_batches"]
+        if ff_batches and not hide_arrows:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("LESS_EQUAL")
+            for batch, color in ff_batches:
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            gpu.state.blend_set("NONE")
+    except Exception as exc:
+        signature = repr(exc)
+        if _overlay_cache["failures"].get("force_field") != signature:
+            _overlay_cache["failures"]["force_field"] = signature
+            print(f"[ppf] overlay builder 'force_field' failed: {signature}")
+        _overlay_cache["force_field_batches"] = []
+
+    try:
+        vel_batches = _overlay_cache["velocity_batches"]
+        if vel_batches:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("NONE")
+            gpu.state.depth_mask_set(False)
+            for batch, color in vel_batches:
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.depth_mask_set(True)
+            gpu.state.blend_set("NONE")
+    except Exception:
+        _overlay_cache["velocity_labels"] = []
+    try:
+        lock_batches = _overlay_cache["translation_lock_batches"]
+        if lock_batches:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("NONE")
+            gpu.state.depth_mask_set(False)
+            for batch, color in lock_batches:
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.depth_mask_set(True)
+            gpu.state.blend_set("NONE")
+    except Exception:
+        _overlay_cache["translation_lock_batches"] = []
+    try:
+        rot_lock_batches = _overlay_cache["rotation_lock_batches"]
+        if rot_lock_batches:
+            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+            gpu.state.blend_set("ALPHA")
+            gpu.state.depth_test_set("NONE")
+            gpu.state.depth_mask_set(False)
+            for batch, color in rot_lock_batches:
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch.draw(shader)
+            gpu.state.depth_test_set("LESS_EQUAL")
+            gpu.state.depth_mask_set(True)
+            gpu.state.blend_set("NONE")
+    except Exception:
+        _overlay_cache["rotation_lock_batches"] = []
+
+
+def _draw_overlay_labels():
+    """Draw text labels for direction previews, operations, and velocity (POST_PIXEL handler)."""
+    draw_overlay_labels(_overlay_cache)
+
+
+# Second handler for 2D text labels
+_text_handler = None
+
+
+def register_overlay():
+    """Register the overlay drawing handlers"""
+    global overlay_handler, _text_handler
+    if overlay_handler is None:
+        overlay_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_overlay_callback, (), "WINDOW", "POST_VIEW"
+        )
+    if _text_handler is None:
+        _text_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_overlay_labels, (), "WINDOW", "POST_PIXEL"
+        )
+
+
+def unregister_overlay():
+    """Unregister the overlay drawing handlers"""
+    global overlay_handler, _text_handler
+    if overlay_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(overlay_handler, "WINDOW")
+        overlay_handler = None
+    if _text_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_text_handler, "WINDOW")
+        _text_handler = None
+
+
+def apply_object_overlays():
+    """Update object colors for addon-managed objects only.
+
+    Previously this walked **every** mesh and curve in the scene and
+    unconditionally wrote ``obj.color = (1, 1, 1, 1)`` before applying
+    group tints. Triggered on every undo/redo and group operation, the
+    reset clobbered colors the user had set on meshes that had nothing
+    to do with the add-on (reference assets, third-party tool color
+    hints). The fix narrows the write set: only objects whose UUID is
+    registered in an active group get their color touched, computed
+    from that group's ``show_overlay_color`` + the assignment's
+    ``included`` flag + the global ``hide_overlay_colors`` toggle.
+
+    Clearing the color of an object that has LEFT a group is done at the
+    point membership ends, by whichever path ends it: the Remove /
+    Delete Group / Delete All Groups operators, the MCP group handlers,
+    and the ``solver.clear()`` scripting entry point all call
+    ``reset_object_display`` on the object while it is still a member.
+    That is the last moment the object is the add-on's to write. Nothing
+    scans the scene afterwards looking for a stray color, because a
+    non-member that the add-on tinted and one the user colored are
+    indistinguishable once the assignment is gone.
+    """
+    from ...models.groups import invalidate_overlays
+    from ...core.uuid_registry import get_object_uuid
+
+    scene = bpy.context.scene
+    try:
+        hide_overlay_colors = bool(get_addon_data(scene).state.hide_overlay_colors)
+    except Exception:
+        hide_overlay_colors = False
+
+    # Build UUID -> target_color from active groups. An object that
+    # appears in multiple groups gets the last group's color (matches
+    # the prior unconditional-overwrite ordering).
+    target_color: dict[str, tuple[float, float, float, float]] = {}
+    for group in iterate_active_object_groups(scene):
+        if (not hide_overlay_colors) and group.show_overlay_color:
+            tint = (
+                float(group.color[0]),
+                float(group.color[1]),
+                float(group.color[2]),
+                float(group.color[3]),
+            )
+        else:
+            tint = (1.0, 1.0, 1.0, 1.0)
+        for obj_ref in group.assigned_objects:
+            uid = obj_ref.uuid
+            if not uid:
+                continue
+            if not obj_ref.included:
+                # included=False means the object isn't participating
+                # in the sim; clear any addon-applied tint on it.
+                target_color[uid] = (1.0, 1.0, 1.0, 1.0)
+            else:
+                target_color[uid] = tint
+
+    # Walk meshes and curves once and write only when the object's
+    # UUID is in the target map. Objects the user hasn't added to any
+    # group (no UUID, or a UUID not in any active group) are not
+    # touched.
+    for obj in bpy.data.objects:
+        if obj.type not in ("MESH", "CURVE", "CURVES"):
+            continue
+        uid = get_object_uuid(obj)
+        if not uid:
+            continue
+        new = target_color.get(uid)
+        if new is None:
+            continue
+        cur = obj.color
+        if (cur[0], cur[1], cur[2], cur[3]) != new:
+            obj.color = new
+
+    # The viewport shading mode is owned by the user. ``obj.color`` is
+    # written above for any object in a group with overlay enabled, but
+    # whether Blender renders that tint depends on the user's Solid
+    # shading ``color_type`` choice. Do not override it here: a prior
+    # version snapped non-OBJECT picks (Material / Random / Vertex)
+    # back to OBJECT on every undo/redo and group operation.
+
+    invalidate_overlays()
+
+
+def _on_undo_redo(scene):
+    apply_object_overlays()
+
+
+def register():
+    register_overlay()
+    # Drop any stale copies left by a previous reload (function identity
+    # changes across reloads so a plain `in` check wouldn't find them).
+    for lst in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        for h in list(lst):
+            if getattr(h, "__name__", "") == "_on_undo_redo":
+                lst.remove(h)
+    bpy.app.handlers.undo_post.append(_on_undo_redo)
+    bpy.app.handlers.redo_post.append(_on_undo_redo)
+
+
+def unregister():
+    for h in list(bpy.app.handlers.redo_post):
+        if getattr(h, "__name__", "") == "_on_undo_redo":
+            bpy.app.handlers.redo_post.remove(h)
+    for h in list(bpy.app.handlers.undo_post):
+        if getattr(h, "__name__", "") == "_on_undo_redo":
+            bpy.app.handlers.undo_post.remove(h)
+    unregister_overlay()

@@ -1,0 +1,23 @@
+{
+    "attributes" : 
+    {
+        "in1Attr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "in1",
+            "name" : "in1",
+            "type" : "Vec3f"
+        },
+        "in2Attr" : 
+        {
+            "default" : "Vec3f(0.0f, 0.0f, 0.0f)",
+            "flags" : "FLAGS_BINDABLE",
+            "label" : "in2",
+            "name" : "in2",
+            "type" : "Vec3f"
+        }
+    },
+    "name" : "ND_distance_vector3",
+    "type" : "Map"
+}

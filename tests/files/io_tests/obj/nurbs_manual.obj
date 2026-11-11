@@ -1,0 +1,52 @@
+# Manually produced obj file, with various curves,
+# surfaces and their configurations.
+
+# Curve with uniform U parameter spacing
+o Curve_Uniform_Parm
+v -2 0 -2
+v -2 0 2
+v 2 0 2
+# test multi-line, with spaces after some backslashes
+v \   
+	2 0 \       
+			-2
+g The_Curve
+cstype bspline
+# multi-line
+deg      \
+				3
+# use both negative and positive vertex indices for test coverage
+curv 0.0 1.0     \
+	2 3 4 -4 -3 \
+
+parm u 0.0 0.2 0.4 0.6 0.8 1.0
+end
+
+# Curve with non-uniform U parameter spacing - really
+# ignored by Blender
+o Curve_NonUniform_Parm
+g The_Curve
+cstype bspline
+deg 3
+# refer to exact same vertices, just with different positive/negative indices
+curv 0.0 1.0 -3 -2 -1 1 2
+parm u 0.0 0.1 0.15 0.2 0.3 0.5 0.6 0.9 1.0
+end
+
+# Curve that goes up to the endpoints
+o Curve_Endpoints
+g The_Curve
+cstype bspline
+deg 3
+curv 0.0 1.0 2 3 4 1 3
+parm u 0 0 0 0 1 1 1 1
+end
+
+# Curve that is cyclic
+o Curve_Cyclic
+g The_Curve
+cstype bspline
+deg 3
+curv 0.0 1.0 2 3 4 1 2 3 4
+parm u 0.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0
+end
